@@ -1,0 +1,17 @@
+# Dependencies and local logs
+node_modules/
+.env
+.env.*
+!.env.example
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+.vscode/
+
+# Local backup copies
+data/backup/
+
