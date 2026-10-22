@@ -26,3 +26,22 @@ Para desarrollo local, copia `.env.example` como `.env` y agrega la cadena priva
 La aplicación usa la variable de entorno `PORT` que Render proporciona automáticamente.
 
 > Actualmente los cambios se guardan en archivos JSON. El almacenamiento en disco de Render no es persistente; la migración a una base de datos se hará en la siguiente etapa.
+
+## Actualizar Data local
+
+El botón **Actualizar Data** ejecuta un proceso independiente del repositorio `BOT-123`:
+
+1. Entra a POSCO con las credenciales locales.
+2. Descarga el reporte de órdenes activas usando el mismo rango y filtros del bot Pegar Data.
+3. Reordena y normaliza las columnas del reporte.
+4. Actualiza únicamente la hoja web `PegarData`, incluyendo `Table2` y las fórmulas `S:W`.
+
+Para habilitarlo localmente, copia `.env.example` a `.env` y completa:
+
+```env
+POSCO_USER=usuario@email.com
+POSCO_PASSWORD=tu_contraseña
+POSCO_BROWSER_CHANNEL=msedge
+```
+
+Después inicia el sistema con `npm start` y usa el botón **Actualizar Data**. El navegador Edge debe estar instalado; también se puede indicar una ruta directa con `POSCO_BROWSER_EXECUTABLE_PATH`.

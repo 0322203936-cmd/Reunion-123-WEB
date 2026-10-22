@@ -260,6 +260,41 @@
     }, 300);
   }
 
+  async function actualizarDataDesdePosco() {
+    const button = document.getElementById('btnActualizarData');
+    if (!button || button.disabled) return;
+    const originalText = button.textContent;
+    button.disabled = true;
+    button.textContent = 'Actualizando Data…';
+    showToast('Descargando POSCO y actualizando PegarData…');
+    try {
+      // Conserva antes cualquier edición local pendiente de guardar.
+      saveWorkbookState();
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await saving;
+
+      const response = await fetch('/api/actualizar-data?wb=reunion', { method: 'POST' });
+      const result = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(result.error || `Error ${response.status}`);
+
+      const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
+      if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
+      workbook = await workbookResponse.json();
+      activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
+      engine = new window.FormulaEngine(workbook);
+      engine.recalculateAll();
+      renderSheetTabs();
+      renderSheet();
+      selectCell('A1', false);
+      showToast(`PegarData actualizada: ${result.rows} filas.`, false);
+    } catch (error) {
+      showToast(`Actualizar Data falló: ${error.message}`, true);
+    } finally {
+      button.disabled = false;
+      button.textContent = originalText;
+    }
+  }
+
   const FONT_FAMILY_WHITELIST = new Set(['Aptos Narrow', 'Aptos', 'Calibri', 'Arial', 'Georgia', 'Times New Roman', 'Courier New', 'Verdana']);
 
   function formatCellDisplay(rawVal, s) {
@@ -3243,6 +3278,7 @@
     document.getElementById('btnUndo').addEventListener('click', undo);
     document.getElementById('btnRedo').addEventListener('click', redo);
     document.getElementById('btnExportCsv').addEventListener('click', exportActiveSheetCsv);
+    document.getElementById('btnActualizarData')?.addEventListener('click', actualizarDataDesdePosco);
 
     document.getElementById('btnResetWorkbook')?.addEventListener('click', async () => {
       if (!confirm('Clear and reset workbook to blank?')) return;
