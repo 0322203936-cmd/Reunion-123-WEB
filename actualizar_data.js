@@ -40,6 +40,21 @@ function numberValue(value) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
+function excelSerial(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  if (value instanceof Date && !Number.isNaN(value.getTime())) {
+    return (Date.UTC(value.getFullYear(), value.getMonth(), value.getDate()) - Date.UTC(1899, 11, 30)) / 86400000;
+  }
+  const raw = text(value);
+  const iso = /^(\d{4})-(\d{2})-(\d{2})/.exec(raw);
+  const us = /^(\d{1,2})\/(\d{1,2})\/(\d{4})$/.exec(raw);
+  const year = iso ? Number(iso[1]) : us ? Number(us[3]) : null;
+  const month = iso ? Number(iso[2]) : us ? Number(us[1]) : null;
+  const day = iso ? Number(iso[3]) : us ? Number(us[2]) : null;
+  if (!year || !month || !day) return value;
+  return (Date.UTC(year, month - 1, day) - Date.UTC(1899, 11, 30)) / 86400000;
+}
+
 function localToday() {
   const parts = new Intl.DateTimeFormat('en-US', {
     timeZone: 'America/Tijuana', year: 'numeric', month: '2-digit', day: '2-digit'
@@ -250,6 +265,10 @@ function formatReport(reportPath) {
     // y después elimina S, por lo que el resultado web queda en A:R.
     const reordered = row.slice(0, 13).concat(row.slice(14, 18), [row[13]]);
     if (rowIndex === 0) return reordered;
+
+    // Reunion compara las fechas con seriales Excel, no con textos ISO.
+    reordered[7] = excelSerial(reordered[7]);
+    reordered[14] = excelSerial(reordered[14]);
 
     const flower = text(reordered[4]).toUpperCase();
     const category = text(reordered[3]).toUpperCase();
