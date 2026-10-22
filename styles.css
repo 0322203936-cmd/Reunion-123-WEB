@@ -116,6 +116,29 @@ html, body {
   background: rgba(255, 255, 255, 0.26);
 }
 
+.top-util-btn.is-running,
+.top-util-btn.is-running:hover {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  cursor: wait;
+  background: rgba(255, 255, 255, 0.24);
+}
+
+.top-util-btn.is-running::before {
+  content: '';
+  width: 12px;
+  height: 12px;
+  border: 2px solid rgba(255, 255, 255, 0.55);
+  border-top-color: #ffffff;
+  border-radius: 50%;
+  animation: actualizarDataSpin 0.8s linear infinite;
+}
+
+@keyframes actualizarDataSpin {
+  to { transform: rotate(360deg); }
+}
+
 .top-util-btn.danger-subtle:hover {
   background: #dc2626;
   border-color: #ef4444;

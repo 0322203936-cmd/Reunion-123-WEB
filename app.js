@@ -80,6 +80,9 @@
   const WB_KEY = new URLSearchParams(location.search).get('wb') === 'cosecha' ? 'cosecha' : 'reunion';
   const API_Q = `?wb=${WB_KEY}`;
   const BACKUP_KEY = WB_KEY === 'reunion' ? 'reunion123_workbook_backup' : `${WB_KEY}_workbook_backup`;
+  let actualizarDataPollTimer = null;
+  let actualizarDataPollInFlight = false;
+  const actualizarDataNoticeKey = 'reunion123_actualizar_data_notice';
 
   async function init() {
     document.querySelectorAll('.wb-switch [data-wb]').forEach(a => a.classList.toggle('active', a.dataset.wb === WB_KEY));
@@ -126,6 +129,7 @@
     sheetTabsList.querySelector('.sheet-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     bindEvents();
     updateStatusMetrics();
+    pollActualizarData();
   }
 
   // Undo history stores only the sheets an action touches (big workbooks would not fit otherwise)
@@ -260,12 +264,66 @@
     }, 300);
   }
 
+  function setActualizarDataButtonState(state) {
+    const button = document.getElementById('btnActualizarData');
+    if (!button) return;
+    const running = state && state.status === 'running';
+    button.disabled = running;
+    button.classList.toggle('is-running', running);
+    button.setAttribute('aria-busy', running ? 'true' : 'false');
+    button.textContent = running ? 'Actualizando Data…' : 'Actualizar Data';
+  }
+
+  async function reloadWorkbookAfterActualizarData() {
+    const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
+    if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
+    workbook = await workbookResponse.json();
+    activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
+    engine = new window.FormulaEngine(workbook);
+    engine.recalculateAll();
+    renderSheetTabs();
+    renderSheet();
+    selectCell('A1', false);
+  }
+
+  async function pollActualizarData() {
+    if (WB_KEY !== 'reunion' || actualizarDataPollInFlight) return;
+    clearTimeout(actualizarDataPollTimer);
+    actualizarDataPollTimer = null;
+    actualizarDataPollInFlight = true;
+    try {
+      const response = await fetch('/api/actualizar-data?wb=reunion', { cache: 'no-store' });
+      const state = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(state.error || `Error ${response.status}`);
+      setActualizarDataButtonState(state);
+
+      if (state.status === 'running') {
+        actualizarDataPollTimer = setTimeout(pollActualizarData, 2000);
+        return;
+      }
+
+      const noticeId = state.finishedAt || '';
+      const lastNotice = localStorage.getItem(actualizarDataNoticeKey) || '';
+      if (noticeId && noticeId !== lastNotice && state.status === 'succeeded') {
+        await reloadWorkbookAfterActualizarData();
+        localStorage.setItem(actualizarDataNoticeKey, noticeId);
+        showToast(`PegarData actualizada: ${state.rows} filas.`, false);
+      } else if (noticeId && noticeId !== lastNotice && state.status === 'failed') {
+        localStorage.setItem(actualizarDataNoticeKey, noticeId);
+        showToast(`Actualizar Data falló: ${state.error || 'error desconocido'}`, true);
+      }
+    } catch (error) {
+      setActualizarDataButtonState({ status: 'idle' });
+      showToast(`No se pudo consultar Actualizar Data: ${error.message}`, true);
+    } finally {
+      actualizarDataPollInFlight = false;
+    }
+  }
+
   async function actualizarDataDesdePosco() {
     const button = document.getElementById('btnActualizarData');
     if (!button || button.disabled) return;
-    const originalText = button.textContent;
-    button.disabled = true;
-    button.textContent = 'Actualizando Data…';
+    setActualizarDataButtonState({ status: 'running' });
     showToast('Descargando POSCO y actualizando PegarData…');
     try {
       // Conserva antes cualquier edición local pendiente de guardar.
@@ -274,24 +332,12 @@
       await saving;
 
       const response = await fetch('/api/actualizar-data?wb=reunion', { method: 'POST' });
-      const result = await response.json().catch(() => ({}));
-      if (!response.ok) throw new Error(result.error || `Error ${response.status}`);
-
-      const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
-      if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
-      workbook = await workbookResponse.json();
-      activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
-      engine = new window.FormulaEngine(workbook);
-      engine.recalculateAll();
-      renderSheetTabs();
-      renderSheet();
-      selectCell('A1', false);
-      showToast(`PegarData actualizada: ${result.rows} filas.`, false);
+      const state = await response.json().catch(() => ({}));
+      if (!response.ok && response.status !== 202) throw new Error(state.error || `Error ${response.status}`);
+      await pollActualizarData();
     } catch (error) {
+      setActualizarDataButtonState({ status: 'idle' });
       showToast(`Actualizar Data falló: ${error.message}`, true);
-    } finally {
-      button.disabled = false;
-      button.textContent = originalText;
     }
   }
 

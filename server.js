@@ -66,6 +66,48 @@ let pool = null;
 const caches = {}; // wbKey -> full workbook kept in memory; PATCH merges into it
 const gzCache = {}; // wbKey -> gzipped JSON of the cached workbook (dropped on every change)
 let actualizarDataRunning = false;
+const actualizarDataState = {
+  status: 'idle',
+  startedAt: null,
+  finishedAt: null,
+  rows: null,
+  lastRow: null,
+  range: null,
+  dateRange: null,
+  error: null
+};
+
+function publicActualizarDataState() {
+  return { ...actualizarDataState, ok: actualizarDataState.status === 'succeeded' };
+}
+
+async function runActualizarDataInBackground() {
+  try {
+    console.log(' Iniciando Actualizar Data local: POSCO -> PegarData...');
+    const currentWorkbook = await loadWorkbook('reunion');
+    const result = await runActualizarData(currentWorkbook);
+    await saveWholeWorkbook('reunion', result.workbook);
+    delete gzCache.reunion;
+    actualizarDataState.status = 'succeeded';
+    actualizarDataState.finishedAt = new Date().toISOString();
+    actualizarDataState.rows = result.rows;
+    actualizarDataState.lastRow = result.lastRow;
+    actualizarDataState.range = `A1:W${result.lastRow}`;
+    actualizarDataState.dateRange = {
+      start: result.dateRange.start.toISOString().slice(0, 10),
+      end: result.dateRange.end.toISOString().slice(0, 10)
+    };
+    actualizarDataState.error = null;
+    console.log(` Actualizar Data completado: ${result.rows} filas en PegarData.`);
+  } catch (error) {
+    actualizarDataState.status = 'failed';
+    actualizarDataState.finishedAt = new Date().toISOString();
+    actualizarDataState.error = error.message || 'No se pudo actualizar PegarData.';
+    console.error(' Actualizar Data falló:', error);
+  } finally {
+    actualizarDataRunning = false;
+  }
+}
 
 function readJson(filePath, fallback) {
   try {
@@ -305,33 +347,24 @@ async function handleRequest(req, res) {
     return sendJson(res, 200, Object.entries(WORKBOOKS).map(([k, c]) => ({ key: k, name: c.name })));
   }
 
-  if (pathname === '/api/actualizar-data' && req.method === 'POST') {
+  if (pathname === '/api/actualizar-data' && (req.method === 'GET' || req.method === 'POST')) {
     if (key !== 'reunion') return sendJson(res, 400, { error: 'Actualizar Data solo está disponible para Reunion.' });
-    if (actualizarDataRunning) return sendJson(res, 409, { error: 'Actualizar Data ya se está ejecutando.' });
+    if (req.method === 'GET') return sendJson(res, 200, publicActualizarDataState());
+    if (actualizarDataRunning) return sendJson(res, 202, publicActualizarDataState());
+
     actualizarDataRunning = true;
-    try {
-      console.log(' Iniciando Actualizar Data local: POSCO -> PegarData...');
-      const currentWorkbook = await loadWorkbook('reunion');
-      const result = await runActualizarData(currentWorkbook);
-      await saveWholeWorkbook('reunion', result.workbook);
-      delete gzCache.reunion;
-      console.log(` Actualizar Data completado: ${result.rows} filas en PegarData.`);
-      return sendJson(res, 200, {
-        ok: true,
-        rows: result.rows,
-        lastRow: result.lastRow,
-        range: `A1:W${result.lastRow}`,
-        dateRange: {
-          start: result.dateRange.start.toISOString().slice(0, 10),
-          end: result.dateRange.end.toISOString().slice(0, 10)
-        }
-      });
-    } catch (error) {
-      console.error(' Actualizar Data falló:', error);
-      return sendJson(res, 500, { error: error.message || 'No se pudo actualizar PegarData.' });
-    } finally {
-      actualizarDataRunning = false;
-    }
+    Object.assign(actualizarDataState, {
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      rows: null,
+      lastRow: null,
+      range: null,
+      dateRange: null,
+      error: null
+    });
+    void runActualizarDataInBackground();
+    return sendJson(res, 202, publicActualizarDataState());
   }
 
   if (pathname === '/api/workbook' && req.method === 'GET') {
