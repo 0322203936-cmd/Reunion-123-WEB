@@ -77,17 +77,22 @@
   const btnClearFormat = document.getElementById('btnClearFormat');
 
   // Which "apartado" (workbook) this page shows: ?wb=cosecha, default Reunion
-  const WB_KEY = new URLSearchParams(location.search).get('wb') === 'cosecha' ? 'cosecha' : 'reunion';
+  const WB_KEY = ['cosecha', 'rvp'].includes(new URLSearchParams(location.search).get('wb')) ? new URLSearchParams(location.search).get('wb') : 'reunion';
   const API_Q = `?wb=${WB_KEY}`;
   const BACKUP_KEY = WB_KEY === 'reunion' ? 'reunion123_workbook_backup' : `${WB_KEY}_workbook_backup`;
   let actualizarDataPollTimer = null;
   let actualizarDataPollInFlight = false;
   const actualizarDataNoticeKey = 'reunion123_actualizar_data_notice';
+  let actualizarInventarioPollTimer = null;
+  let actualizarInventarioPollInFlight = false;
+  const actualizarInventarioNoticeKey = 'reunion123_actualizar_inventario_notice';
 
   async function init() {
     document.querySelectorAll('.wb-switch [data-wb]').forEach(a => a.classList.toggle('active', a.dataset.wb === WB_KEY));
     const btnActualizarData = document.getElementById('btnActualizarData');
     if (btnActualizarData) btnActualizarData.hidden = WB_KEY !== 'reunion'; // only in Reunion
+    const btnActualizarInventario = document.getElementById('btnActualizarInventario');
+    if (btnActualizarInventario) btnActualizarInventario.hidden = WB_KEY !== 'reunion'; // only in Reunion
     try {
       let res = await fetch(`/api/workbook${API_Q}`);
       if (!res.ok) {
@@ -130,6 +135,7 @@
     bindEvents();
     updateStatusMetrics();
     pollActualizarData();
+    pollActualizarInventario();
   }
 
   // Undo history stores only the sheets an action touches (big workbooks would not fit otherwise)
@@ -338,6 +344,82 @@
     } catch (error) {
       setActualizarDataButtonState({ status: 'idle' });
       showToast(`Actualizar Data falló: ${error.message}`, true);
+    }
+  }
+
+  function setActualizarInventarioButtonState(state) {
+    const button = document.getElementById('btnActualizarInventario');
+    if (!button) return;
+    const running = state && state.status === 'running';
+    button.disabled = running;
+    button.classList.toggle('is-running', running);
+    button.setAttribute('aria-busy', running ? 'true' : 'false');
+    button.textContent = running ? 'Actualizando Inventario…' : 'Actualizar Inventario';
+  }
+
+  async function reloadWorkbookAfterActualizarInventario() {
+    const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
+    if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro con el inventario actualizado.');
+    workbook = await workbookResponse.json();
+    activeSheet = workbook.sheets.Inventario && !workbook.sheets.Inventario.hidden ? 'Inventario' : activeSheet;
+    engine = new window.FormulaEngine(workbook);
+    engine.recalculateAll();
+    renderSheetTabs();
+    renderSheet();
+    selectCell('A1', false);
+  }
+
+  async function pollActualizarInventario() {
+    if (WB_KEY !== 'reunion' || actualizarInventarioPollInFlight) return;
+    clearTimeout(actualizarInventarioPollTimer);
+    actualizarInventarioPollTimer = null;
+    actualizarInventarioPollInFlight = true;
+    try {
+      const response = await fetch('/api/actualizar-inventario?wb=reunion', { cache: 'no-store' });
+      const state = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(state.error || `Error ${response.status}`);
+      setActualizarInventarioButtonState(state);
+
+      if (state.status === 'running') {
+        actualizarInventarioPollTimer = setTimeout(pollActualizarInventario, 2000);
+        return;
+      }
+
+      const noticeId = state.finishedAt || '';
+      const lastNotice = localStorage.getItem(actualizarInventarioNoticeKey) || '';
+      if (noticeId && noticeId !== lastNotice && state.status === 'succeeded') {
+        await reloadWorkbookAfterActualizarInventario();
+        localStorage.setItem(actualizarInventarioNoticeKey, noticeId);
+        showToast(`Inventario actualizado: ${state.rows} filas.`, false);
+      } else if (noticeId && noticeId !== lastNotice && state.status === 'failed') {
+        localStorage.setItem(actualizarInventarioNoticeKey, noticeId);
+        showToast(`Actualizar Inventario falló: ${state.error || 'error desconocido'}`, true);
+      }
+    } catch (error) {
+      setActualizarInventarioButtonState({ status: 'idle' });
+      showToast(`No se pudo consultar Actualizar Inventario: ${error.message}`, true);
+    } finally {
+      actualizarInventarioPollInFlight = false;
+    }
+  }
+
+  async function actualizarInventarioDesdePosco() {
+    const button = document.getElementById('btnActualizarInventario');
+    if (!button || button.disabled) return;
+    setActualizarInventarioButtonState({ status: 'running' });
+    showToast('Descargando POSCO y actualizando Inventario…');
+    try {
+      saveWorkbookState();
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await saving;
+
+      const response = await fetch('/api/actualizar-inventario?wb=reunion', { method: 'POST' });
+      const state = await response.json().catch(() => ({}));
+      if (!response.ok && response.status !== 202) throw new Error(state.error || `Error ${response.status}`);
+      await pollActualizarInventario();
+    } catch (error) {
+      setActualizarInventarioButtonState({ status: 'idle' });
+      showToast(`Actualizar Inventario falló: ${error.message}`, true);
     }
   }
 
@@ -773,6 +855,7 @@
       }
       closeFilterMenu();
       recomputeFilterHidden(sheet);
+      engine.recalculateAll(); // SUBTOTAL / AGGREGATE skip the rows the filter hides
       renderSheet();
       updateStatusMetrics();
       saveWorkbookState();
@@ -895,14 +978,16 @@
       visCols.push(c);
       colLeft[c] = left;
       colPx[c] = colWidthPx(sheet, colStr);
+      if (window.MauriReq) colPx[c] = Math.max(colPx[c], window.MauriReq.minColPx(activeSheet, sheet, c));
       left += colPx[c];
     }
     const fr = sheet.freeze ? sheet.freeze.rows || 0 : 0;
     const fc = sheet.freeze ? sheet.freeze.cols || 0 : 0;
     const colIdx = new Map(visCols.map((c, i) => [c, i]));
+    const rowIdx = new Map(visRows.map((r, i) => [r, i]));
     const nFrozenCols = visCols.filter(c => c <= fc).length;
     Object.assign(view, {
-      sheetName: activeSheet, visRows, offsets, visCols, colLeft, colPx, colIdx, nFrozenCols,
+      sheetName: activeSheet, visRows, offsets, visCols, colLeft, colPx, colIdx, rowIdx, nFrozenCols,
       totalWidth: left,
       colVirtual: visCols.length > COL_VIRTUAL_THRESHOLD,
       frozenRows: visRows.filter(r => r <= fr).length,
@@ -951,12 +1036,28 @@
       // Plan de cosecha: Flor in light red while its combination is not homologated (homolog.js)
       const hm = window.MauriHomolog && window.MauriHomolog.cellStyle(activeSheet, r, colStr, sheet);
       if (hm) cond = { ...(cond || {}), ...hm };
+      // Requerimiento Vs Proyeccion: highlight negative pivot values only in
+      // the Weeks x FechaProduccion table. Keep the warning local to the cell.
+      if (
+        activeSheet === 'Weeks x FechaProduccion' &&
+        cellObj && typeof cellObj.v === 'number' && cellObj.v < 0 &&
+        window.MauriPivot && window.MauriPivot.pivotAt &&
+        window.MauriPivot.pivotAt(activeSheet, coord)
+      ) {
+        cond = { ...(cond || {}), bg: '#fde2e2', color: '#b91c1c' };
+      }
       const merged = cond ? { ...(style || {}), ...cond } : style;
       // cells draw their own borders (separate model, so sticky panes keep them): a shared edge is drawn
-      // once, as the bottom/right of the cell before it, except on the first visible row/column
+      // once, as the bottom/right of the visible cell before it. When hidden rows/columns sit in between,
+      // that cell only knows its own bottom/right, so this cell keeps the line otherwise.
       const edge = getEffectiveBorder(sheet, c, r, span ? span.rowspan : 1, span ? span.colspan : 1);
-      if (r !== view.visRows[0]) edge.top = false;
-      if (c !== view.visCols[0]) edge.left = false;
+      const bOf = (cc, rr) => { const st = styleAt(sheet, rr, cc); return (st && st.border) || {}; };
+      const prevRow = view.visRows[view.rowIdx.get(r) - 1];
+      if (prevRow === r - 1) edge.top = false;
+      else if (prevRow !== undefined && edge.top && (bOf(c, prevRow).bottom || bOf(c, prevRow + 1).top)) edge.top = false;
+      const prevCol = view.visCols[view.colIdx.get(c) - 1];
+      if (prevCol === c - 1) edge.left = false;
+      else if (prevCol !== undefined && edge.left && (bOf(prevCol, r).right || bOf(prevCol + 1, r).left)) edge.left = false;
       let styleAttr = buildCellStyleAttr(merged, edge);
       const extra = [];
       if (disp.color && !(cond && cond.color)) extra.push(`color:${disp.color}`);
@@ -978,7 +1079,12 @@
       const af = view.filterHeaders && view.filterHeaders.get(coord);
       const afBtn = af ? `<button type="button" class="af-btn${af.active ? ' active' : ''}" data-af="${af.fi}:${af.colId}" title="Filtro">${af.active ? '⏷' : '▾'}</button>` : '';
       if (af) cls.push('af-header');
-      tr += `<td data-coord="${coord}"${spanAttrs}${cls.length ? ` class="${cls.join(' ')}"` : ''}${styleAttr}>${escapeHtml(disp.text)}${afBtn}</td>`;
+      // Plan de cosecha: small Req box from Reunion inside day / week cells (reqbadges.js)
+      const reqBadge = (window.MauriPivot && window.MauriPivot.cellExtra ? window.MauriPivot.cellExtra(activeSheet, r, c) : '') // pivot +/-
+        + (window.MauriReq ? window.MauriReq.cellExtra(activeSheet, r, c, sheet) : '')
+        + (window.MauriCorMarks ? window.MauriCorMarks.cellExtra(activeSheet, r, c, sheet) : ''); // Reunion: Cor changed in Plan de cosecha
+      if (reqBadge) cls.push('has-req');
+      tr += `<td data-coord="${coord}"${spanAttrs}${cls.length ? ` class="${cls.join(' ')}"` : ''}${styleAttr}>${reqBadge}${escapeHtml(disp.text)}${afBtn}</td>`;
     }
     if (cw.rightPad > 0) tr += `<td class="h-spacer" style="width:${cw.rightPad}px"></td>`;
     return tr + '</tr>';
@@ -1313,6 +1419,7 @@
     updateStatusMetrics();
     updateFormatToolbarState();
     if (window.MauriPivot) window.MauriPivot.onSelectionChange(activeSheet, selectedCoord);
+    if (window.MauriCorMarks) window.MauriCorMarks.onSelect(activeSheet, selectedCoord);
   }
 
   const NUM_FMT_LABELS = { general: 'General', number: 'Número', currency: 'Moneda', percent: 'Porcentaje' };
@@ -1489,6 +1596,11 @@
   }
 
   function applyCellValueRaw(sheetName, coord, rawInput) {
+    writeCellValue(sheetName, coord, rawInput);
+    if (window.MauriCorMarks && window.MauriCorMarks.onUserEdit) window.MauriCorMarks.onUserEdit(sheetName, coord);
+  }
+
+  function writeCellValue(sheetName, coord, rawInput) {
     const sheet = workbook.sheets[sheetName];
     if (!sheet) return;
     const trimmed = String(rawInput ?? '').trim();
@@ -2262,10 +2374,95 @@
   }
 
   // Row / Column Insert & Delete
+  // ---- Excel-like row insert / delete: every reference to the moved rows follows them
+  //   op = { sheet, at, n } inserts n rows before `at`; op = { sheet, d1, d2 } deletes rows d1..d2.
+  //   Applies to the formulas of every sheet (unqualified refs of the same sheet, or Sheet!refs),
+  //   and to the sheet's merges, row heights, hidden rows, filters, conditional-format ranges, pivots and tables.
+  const RANGE_REF_RE = /(?<![A-Za-z0-9_.$!])((?:'(?:[^']|'')+'|[A-Za-z_][\w.]*)!)?(\$?[A-Za-z]{1,3}\$?)(\d+)(?::(\$?[A-Za-z]{1,3}\$?)(\d+))?(?![\w(])/g;
+  const unquoteSheet = prefix => {
+    const n = prefix.slice(0, -1);
+    return n.startsWith("'") ? n.slice(1, -1).replace(/''/g, "'") : n;
+  };
+  function mapRowRange(r1, r2, op) {
+    if (op.n) return [r1 >= op.at ? r1 + op.n : r1, r2 >= op.at ? r2 + op.n : r2];
+    const n = op.d2 - op.d1 + 1;
+    if (r1 >= op.d1 && r2 <= op.d2) return null; // the whole range was deleted
+    const a = r1 < op.d1 ? r1 : (r1 > op.d2 ? r1 - n : op.d1);
+    const b = r2 < op.d1 ? r2 : (r2 > op.d2 ? r2 - n : op.d1 - 1);
+    return [a, b];
+  }
+  function adjustRowRefs(text, homeSheet, op) {
+    if (!text) return text;
+    return String(text).split(/("[^"]*")/).map(part => {
+      if (part.startsWith('"')) return part;
+      return part.replace(RANGE_REF_RE, (m, prefix, c1, r1, c2, r2) => {
+        const target = prefix ? unquoteSheet(prefix) : homeSheet;
+        if (target !== op.sheet) return m;
+        if (c2 === undefined) {
+          const res = mapRowRange(Number(r1), Number(r1), op);
+          return res ? `${prefix || ''}${c1}${res[0]}` : '#REF!';
+        }
+        const res = mapRowRange(Number(r1), Number(r2), op);
+        return res ? `${prefix || ''}${c1}${res[0]}:${c2}${res[1]}` : '#REF!';
+      });
+    }).join('');
+  }
+  // sheets whose formulas mention `sheetName` (for the undo snapshot)
+  function sheetsReferencing(sheetName) {
+    const names = new Set([sheetName]);
+    for (const [name, sh] of Object.entries(workbook.sheets)) {
+      if (names.has(name)) continue;
+      for (const cell of Object.values(sh.cells || {})) {
+        if (cell.f && cell.f.includes(sheetName)) { names.add(name); break; }
+      }
+    }
+    return [...names];
+  }
+  function applyRowOp(op) {
+    // 1) formulas everywhere (by their old positions)
+    for (const [name, sh] of Object.entries(workbook.sheets)) {
+      let changed = false;
+      for (const cell of Object.values(sh.cells || {})) {
+        if (!cell.f) continue;
+        const f = adjustRowRefs(cell.f, name, op);
+        if (f !== cell.f) { cell.f = f; changed = true; }
+      }
+      if (changed) markSheetDirty(name);
+    }
+    const sheet = workbook.sheets[op.sheet];
+    const mapRow = r => { const res = mapRowRange(r, r, op); return res ? res[0] : null; };
+    // 2) structures of the sheet itself
+    const adjustList = list => (list || []).map(ref => adjustRowRefs(ref, op.sheet, op)).filter(ref => ref && !ref.includes('#REF!'));
+    if (sheet.merges) sheet.merges = adjustList(sheet.merges);
+    if (sheet.filters) sheet.filters.forEach(f => { if (f.ref) f.ref = adjustRowRefs(f.ref, op.sheet, op); });
+    if (sheet.condFormats) {
+      sheet.condFormats.forEach(cf => { cf.ranges = adjustList(cf.ranges); });
+      sheet.condFormats = sheet.condFormats.filter(cf => cf.ranges.length);
+    }
+    for (const key of ['hiddenRows', 'filterHiddenRows']) {
+      if (sheet[key]) sheet[key] = sheet[key].map(mapRow).filter(r => r !== null);
+    }
+    if (sheet.rowHeights) {
+      const h = {};
+      for (const [r, v] of Object.entries(sheet.rowHeights)) { const nr = mapRow(Number(r)); if (nr !== null) h[nr] = v; }
+      sheet.rowHeights = h;
+    }
+    if (sheet.styleBounds) {
+      const b = sheet.styleBounds.rows;
+      sheet.styleBounds.rows = op.n ? (b >= op.at ? b + op.n : b) : (b > op.d2 ? b - (op.d2 - op.d1 + 1) : Math.min(b, op.d1 - 1));
+    }
+    for (const t of Object.values(workbook.tables || {})) if (t.sheet === op.sheet && t.ref) t.ref = adjustRowRefs(t.ref, op.sheet, op);
+    for (const pv of workbook.pivots || []) {
+      if (pv.source && pv.source.sheet === op.sheet && pv.source.ref) pv.source.ref = adjustRowRefs(pv.source.ref, op.sheet, op);
+      if (pv.sheet === op.sheet) for (const k of ['location', 'area', 'anchor']) if (pv[k]) pv[k] = adjustRowRefs(pv[k], op.sheet, op);
+    }
+  }
+
   function insertRowsAt(insertRow, count = 1) {
     const sheet = workbook.sheets[activeSheet];
     if (!sheet || count < 1) return;
-    pushUndoState();
+    pushUndoState(sheetsReferencing(activeSheet));
+    applyRowOp({ sheet: activeSheet, at: insertRow, n: count });
 
     const maxR = Math.max(sheet.maxRow || 100, getLastRealRow(activeSheet) + 5);
     for (let r = maxR; r >= insertRow; r--) {
@@ -2295,7 +2492,8 @@
     const { minRow, maxRow } = getSelectionBounds();
     const count = maxRow - minRow + 1;
 
-    pushUndoState();
+    pushUndoState(sheetsReferencing(activeSheet));
+    applyRowOp({ sheet: activeSheet, d1: minRow, d2: maxRow });
     const maxR = Math.max(sheet.maxRow || 100, getLastRealRow(activeSheet) + 5);
     for (let r = minRow; r <= maxR; r++) {
       for (let c = 1; c <= (sheet.maxCol || 20); c++) {
@@ -2455,6 +2653,8 @@
     if (activeSheet === oldName) activeSheet = trimmed;
     markSheetDirty(oldName);
     markSheetDirty(trimmed);
+    // "P Cosecha YYWW": title and week columns follow the new name (weeks.js)
+    if (window.MauriWeeks) window.MauriWeeks.onSheetRenamed(oldName, trimmed);
     engine.recalculateAll();
     renderSheetTabs();
     renderSheet();
@@ -2529,8 +2729,13 @@
     let numericCount = 0;
     let numericSum = 0;
 
+    // like Excel's status bar, only visible cells count (filtered / hidden rows and columns are skipped)
+    const hiddenR = view.sheetName === activeSheet && view.hiddenRows ? view.hiddenRows : new Set();
+    const hiddenC = view.sheetName === activeSheet && view.hiddenCols ? view.hiddenCols : new Set();
     for (let r = bounds.minRow; r <= bounds.maxRow; r++) {
+      if (hiddenR.has(r)) continue;
       for (let c = bounds.minCol; c <= bounds.maxCol; c++) {
+        if (hiddenC.has(indexToCol(c))) continue;
         const val = sheet?.cells[`${indexToCol(c)}${r}`]?.v;
         if (val !== undefined && val !== null && String(val).trim() !== '') {
           nonEmptyCount++;
@@ -3325,6 +3530,7 @@
     document.getElementById('btnRedo').addEventListener('click', redo);
     document.getElementById('btnExportCsv').addEventListener('click', exportActiveSheetCsv);
     document.getElementById('btnActualizarData')?.addEventListener('click', actualizarDataDesdePosco);
+    document.getElementById('btnActualizarInventario')?.addEventListener('click', actualizarInventarioDesdePosco);
 
     document.getElementById('btnResetWorkbook')?.addEventListener('click', async () => {
       if (!confirm('Clear and reset workbook to blank?')) return;

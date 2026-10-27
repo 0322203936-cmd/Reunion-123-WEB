@@ -197,5 +197,53 @@
     toggle(btn.getAttribute('data-wk'));
   }, true);
 
-  window.MauriWeeks = { orderColumns, headerHtml, toggle, dayLabels, weekSaturday };
+  // ---------------------------------------------------------------- renaming a sheet to "P Cosecha YYWW"
+  // updates its title (the YYWW cell at the top) and its week columns: WW, WW+1, WW+2...
+  function weeksInYear(year) {
+    const dec28 = new Date(Date.UTC(year, 11, 28));
+    const thursday = new Date(dec28); thursday.setUTCDate(dec28.getUTCDate() + 3 - ((dec28.getUTCDay() + 6) % 7));
+    const jan1 = new Date(Date.UTC(thursday.getUTCFullYear(), 0, 1));
+    return Math.ceil(((thursday - jan1) / 86400000 + 1) / 7);
+  }
+  function onSheetRenamed(oldName, newName) {
+    const sheet = App().getWorkbook().sheets[newName];
+    const yw = sheetYearWeek(newName);
+    if (!sheet || !isWeekSheet(newName) || !yw) return false;
+    const code = Number(String(yw.year).slice(2) + String(yw.week).padStart(2, '0'));
+    const old = sheetYearWeek(oldName);
+    const oldCode = old ? Number(String(old.year).slice(2) + String(old.week).padStart(2, '0')) : null;
+    // title: the YYWW number in the top rows (e.g. C2 = 2644)
+    for (const [coord, cell] of Object.entries(sheet.cells)) {
+      const m = /^([A-Z]+)([1-3])$/.exec(coord);
+      if (!m || cell.f) continue;
+      const v = Number(cell.v);
+      if (Number.isInteger(v) && v >= 1000 && v <= 9999 && (v === oldCode || Math.floor(v / 100) === yw.year % 100)) cell.v = code;
+    }
+    // week columns: the first gets the sheet's week, the next ones follow (wrapping into next year)
+    const cols = weekColumns(sheet);
+    const max = weeksInYear(yw.year);
+    let week = yw.week, year = yw.year;
+    const plan = cols.map(w => {
+      const out = { colStr: w.colStr, week, year };
+      week++;
+      if (week > max) { week = 1; year++; }
+      return out;
+    });
+    for (const p of plan) {
+      sheet.cells[`${p.colStr}${HEADER_ROW}`].v = p.week;
+      const g = sheet.weekDays && sheet.weekDays.groups[p.colStr];
+      if (g) {
+        g.week = p.week;
+        g.year = p.year;
+        dayLabels(p.year, p.week).forEach((label, i) => {
+          const cell = sheet.cells[`${g.cols[i]}${HEADER_ROW}`] || (sheet.cells[`${g.cols[i]}${HEADER_ROW}`] = {});
+          cell.v = label;
+        });
+      }
+    }
+    App().toast(`Semanas de ${newName.trim()}: ${plan.map(p => p.week).join(', ')}`);
+    return true;
+  }
+
+  window.MauriWeeks = { orderColumns, headerHtml, toggle, dayLabels, weekSaturday, onSheetRenamed };
 })();

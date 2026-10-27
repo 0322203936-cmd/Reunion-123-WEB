@@ -2452,3 +2452,90 @@ body.pv-panel-open .spreadsheet-viewport {
 .sheet-tab.dragging { opacity: 0.45; }
 .sheet-tab.drop-before { box-shadow: inset 3px 0 0 var(--excel-green); }
 .sheet-tab.drop-after { box-shadow: inset -3px 0 0 var(--excel-green); }
+
+/* Plan de cosecha: Req of Reunion shown in a small box inside day / week cells */
+.req-badge {
+  /* pinned to the left edge, the number keeps the rest of the cell; the editor covers it while typing */
+  float: left; margin: 1px 4px 0 -2px;
+  padding: 0 3px; border-radius: 3px;
+  font-size: 9.5px; line-height: 12px; font-weight: 700;
+  color: #1d4ed8; background: #dbeafe; border: 1px solid #bfdbfe;
+  pointer-events: none; white-space: nowrap;
+}
+.req-badge::before { content: 'R '; font-weight: 600; color: #3b82f6; }
+/* week total in yellow, a single day in blue; a week Reunion only partly covers gets a dashed border */
+.req-badge.week { color: #854d0e; background: #fef08a; border-color: #facc15; }
+.req-badge.week::before { color: #a16207; }
+.req-badge.partial { border-style: dashed; }
+
+/* Reunion: Cor changed in Plan de cosecha (corner mark, the cell format stays as is) */
+.cor-mark {
+  position: absolute; top: 0; right: 0; width: 0; height: 0;
+  border-top: 7px solid #dc2626; border-left: 7px solid transparent;
+  pointer-events: none;
+}
+.cor-panel {
+  position: fixed; right: 16px; z-index: 900;
+  max-width: min(760px, calc(100vw - 32px));
+  background: #ffffff; border: 1px solid #cbd5e1; border-left: 3px solid #dc2626; border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(15, 23, 42, 0.15);
+  padding: 6px 10px; font-size: 12px; color: #1f2937;
+}
+.cor-panel .cm-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.cor-panel .cm-hist { margin-top: 4px; font-size: 11.5px; color: #475569; gap: 4px; }
+.cor-panel .cm-title { color: #0f172a; }
+.cor-panel .cm-muted { color: #94a3b8; font-size: 11.5px; }
+.cor-panel .cm-spacer { flex: 1; }
+.cor-panel .cm-up { color: #15803d; }
+.cor-panel .cm-down { color: #dc2626; }
+.cor-panel .cm-pt small { color: #94a3b8; }
+.cor-panel .cm-pt.cur { font-weight: 700; color: #0f172a; }
+.cor-panel .cm-arrow { color: #cbd5e1; }
+.cor-panel button {
+  border: 1px solid #cbd5e1; background: #f8fafc; border-radius: 4px;
+  font-size: 11.5px; padding: 2px 8px; cursor: pointer; color: #1f2937;
+}
+.cor-panel button:hover { background: #ecfdf5; border-color: #86efac; }
+.cor-panel .cm-x { border: none; background: transparent; color: #64748b; }
+
+/* pivot tables: expand / collapse buttons */
+.pv-toggle {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 12px; height: 12px; margin-right: 4px; padding: 0;
+  font-size: 11px; line-height: 10px; font-weight: 700;
+  border: 1px solid #94a3b8; border-radius: 2px; background: #ffffff; color: #334155;
+  cursor: pointer; vertical-align: 0;
+}
+.pv-toggle:hover { background: #e2e8f0; }
+
+/* Excel-style page-filter arrow shown beside values such as "(Todas)". */
+.pv-page-filter {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 14px; height: 14px; margin-right: 4px; padding: 0;
+  border: 1px solid #94a3b8; border-radius: 2px;
+  background: #ffffff; color: #334155; cursor: pointer;
+  font-size: 10px; line-height: 12px; vertical-align: 0;
+}
+.pv-page-filter:hover { background: #dbeafe; border-color: #2563eb; color: #1d4ed8; }
+
+/* pivot field panel: where a dragged field will land inside a zone */
+.pv-chip.drop-before { box-shadow: 0 -3px 0 var(--excel-green); }
+.pv-chip.drop-after { box-shadow: 0 3px 0 var(--excel-green); }
+
+/* pivot: ▾ filter button in "Etiquetas de fila / columna" and page filters, and its menu */
+.pv-filter-cell {
+  float: right; margin-left: 4px; padding: 0 3px; height: 14px; line-height: 12px;
+  font-size: 10px; border: 1px solid #94a3b8; border-radius: 2px; background: #ffffff; color: #334155; cursor: pointer;
+}
+.pv-filter-cell:hover { background: #e2e8f0; }
+.pv-filter-cell.active { background: #dcfce7; border-color: var(--excel-green); color: var(--excel-green); }
+.pv-field-menu { width: 270px; }
+.pv-menu-field { display: flex; flex-direction: column; gap: 3px; font-size: 11.5px; color: #475569; margin-bottom: 6px; }
+.pv-menu-field select { height: 26px; border: 1px solid #cbd5e1; border-radius: 4px; font-size: 12px; }
+.pv-menu-sort { display: flex; flex-direction: column; gap: 2px; margin-bottom: 4px; }
+.pv-menu-sort button, .pv-menu-clear {
+  text-align: left; border: none; background: transparent; padding: 4px 6px; font-size: 12px; border-radius: 4px; cursor: pointer; color: #1f2937;
+}
+.pv-menu-sort button:hover, .pv-menu-clear:hover { background: #ecfdf5; }
+.pv-menu-sort button.on { font-weight: 700; color: var(--excel-green); }
+.pv-menu-clear { color: #64748b; margin-bottom: 4px; }

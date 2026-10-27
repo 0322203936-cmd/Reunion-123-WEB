@@ -416,6 +416,23 @@ class FormulaEngine {
   // ---- cell access
   sheetOf(name) { return this.workbook.sheets[name]; }
 
+  // rows hidden by an autofilter (and, when asked, rows hidden by hand)
+  isRowHidden(sheetName, r, includeManual) {
+    const sh = this.sheetOf(sheetName);
+    if (!sh) return false;
+    const cache = this._hiddenCache || (this._hiddenCache = new WeakMap());
+    const setOf = list => {
+      if (!list || !list.length) return null;
+      let set = cache.get(list);
+      if (!set) { set = new Set(list); cache.set(list, set); }
+      return set;
+    };
+    const f = setOf(sh.filterHiddenRows);
+    if (f && f.has(r)) return true;
+    const m = includeManual ? setOf(sh.hiddenRows) : null;
+    return !!(m && m.has(r));
+  }
+
   usedMaxRow(sheetName) {
     if (this.usedRows.has(sheetName)) return this.usedRows.get(sheetName);
     const sheet = this.sheetOf(sheetName);
@@ -679,7 +696,7 @@ class FormulaEngine {
     const v = this.evalAst(node, sheet, row, col);
     if (v instanceof RangeRef) {
       for (let r = v.r1; r <= v.r2; r++) {
-        for (let c = v.c1; c <= v.c2; c++) yield { v: this.cellValue(v.sheet, r, c), fromRange: true };
+        for (let c = v.c1; c <= v.c2; c++) yield { v: this.cellValue(v.sheet, r, c), fromRange: true, rs: v.sheet, r };
       }
     } else if (Array.isArray(v)) {
       for (const x of v) yield { v: x, fromRange: true };
@@ -688,10 +705,11 @@ class FormulaEngine {
     }
   }
 
-  numbersOf(args, sheet, row, col, { ignoreErrors = false } = {}) {
+  numbersOf(args, sheet, row, col, { ignoreErrors = false, skipRow = null } = {}) {
     const out = [];
     for (const a of args) {
-      for (const { v, fromRange } of this.iterValues(a, sheet, row, col)) {
+      for (const { v, fromRange, rs, r } of this.iterValues(a, sheet, row, col)) {
+        if (skipRow && fromRange && skipRow(rs, r)) continue;
         if (isErr(v)) { if (ignoreErrors) continue; throw v; }
         if (fromRange) { if (typeof v === 'number') out.push(v); continue; }
         if (isBlank(v)) { if (a.k !== 'missing') out.push(0); continue; }
@@ -920,18 +938,23 @@ class FormulaEngine {
           let fn = N(args[0]);
           let ignoreErrors = false;
           let refs = args.slice(1);
+          // rows hidden by a filter never count; manually hidden rows don't count for 101-111 / AGGREGATE 1,3,5,7
+          let skipManual = false;
           if (name === 'AGGREGATE') {
             const opt = arg(1) ? N(args[1]) : 0;
             ignoreErrors = [2, 3, 6, 7].includes(opt);
+            skipManual = [1, 3, 5, 7].includes(opt);
             refs = args.slice(2);
-          } else if (fn > 100) fn -= 100;
-          const xs = this.numbersOf(refs, sheet, row, col, { ignoreErrors });
+          } else if (fn > 100) { fn -= 100; skipManual = true; }
+          const skipRow = (sh, r) => this.isRowHidden(sh, r, skipManual);
+          const xs = this.numbersOf(refs, sheet, row, col, { ignoreErrors, skipRow });
           switch (fn) {
             case 1: return xs.length ? xs.reduce((s, x) => s + x, 0) / xs.length : ERR.DIV0;
             case 2: return xs.length;
             case 3: {
               let n = 0;
-              for (const a of refs) for (const { v } of this.iterValues(a, sheet, row, col)) {
+              for (const a of refs) for (const { v, fromRange, rs, r } of this.iterValues(a, sheet, row, col)) {
+                if (fromRange && skipRow(rs, r)) continue;
                 if (isErr(v) && ignoreErrors) continue;
                 if (!(v === null || v === undefined)) n++;
               }
@@ -1038,6 +1061,17 @@ class FormulaEngine {
         case 'MID': { const s = T(args[0]); const st = N(args[1]); const n = N(args[2]); return st < 1 ? ERR.VALUE : s.substr(st - 1, n); }
         case 'FIND': case 'SEARCH': {
           const find = T(args[0]); const within = T(args[1]); const start = arg(2) ? N(args[2]) : 1;
+          if (name === 'SEARCH' && /[*?~]/.test(find)) {
+            // SEARCH understands wildcards: * any text, ? one character, ~ escapes
+            let re = '';
+            for (let k = 0; k < find.length; k++) {
+              const ch = find[k];
+              if (ch === '~' && k + 1 < find.length) { re += find[++k].replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); continue; }
+              re += ch === '*' ? '[\\s\\S]*?' : ch === '?' ? '[\\s\\S]' : ch.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+            }
+            const m = new RegExp(re, 'i').exec(within.slice(start - 1));
+            return m ? m.index + start : ERR.VALUE;
+          }
           const i = name === 'FIND' ? within.indexOf(find, start - 1) : within.toLowerCase().indexOf(find.toLowerCase(), start - 1);
           return i < 0 ? ERR.VALUE : i + 1;
         }
@@ -1057,6 +1091,22 @@ class FormulaEngine {
           if (name === 'MONTH') return d.getUTCMonth() + 1;
           if (name === 'DAY') return d.getUTCDate();
           return d.getUTCDay() + 1;
+        }
+        // WEEKNUM(date, type): 1/17 Sunday, 2/11 Monday ... 16 Saturday start; 21 = ISO week
+        case 'WEEKNUM': {
+          const serial = Math.floor(N(args[0]));
+          const type = arg(1) ? N(args[1]) : 1;
+          const d = new Date(Date.UTC(1899, 11, 30) + serial * 86400000);
+          if (type === 21) {
+            const t = new Date(d); t.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7));
+            const jan1 = Date.UTC(t.getUTCFullYear(), 0, 1);
+            return Math.floor((t - jan1) / 86400000 / 7) + 1;
+          }
+          const startDow = { 1: 0, 2: 1, 11: 1, 12: 2, 13: 3, 14: 4, 15: 5, 16: 6, 17: 0 }[type];
+          if (startDow === undefined) return ERR.NUM;
+          const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
+          const offset = (new Date(jan1).getUTCDay() - startDow + 7) % 7;
+          return Math.floor((Math.round((d - jan1) / 86400000) + offset) / 7) + 1;
         }
 
         default: return ERR.NAME;

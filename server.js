@@ -5,6 +5,10 @@ const path = require('path');
 const zlib = require('zlib');
 const { Pool } = require('pg');
 const { runActualizarData } = require('./actualizar_data');
+const { runActualizarInventario } = require('./actualizar_inventario');
+const CosechaCor = require('./cosechaCor');
+const AppendBuilder = require('./appendBuilder');
+const crypto = require('crypto');
 
 function loadLocalEnv() {
   const envPath = path.join(__dirname, '.env');
@@ -46,6 +50,13 @@ const WORKBOOKS = {
     state: path.join(DATA_DIR, 'cosecha_workbook_state.json'),
     homolog: path.join(DATA_DIR, 'cosecha_homologaciones.json'),
     prefix: 'cosecha'
+  },
+  rvp: {
+    name: 'Requerimiento Vs Proyeccion',
+    initial: path.join(DATA_DIR, 'rvp_initial_workbook.json'),
+    state: path.join(DATA_DIR, 'rvp_workbook_state.json'),
+    homolog: path.join(DATA_DIR, 'rvp_homologaciones.json'),
+    prefix: 'rvp'
   }
 };
 const DEFAULT_WB = 'reunion';
@@ -66,6 +77,7 @@ let pool = null;
 const caches = {}; // wbKey -> full workbook kept in memory; PATCH merges into it
 const gzCache = {}; // wbKey -> gzipped JSON of the cached workbook (dropped on every change)
 let actualizarDataRunning = false;
+let actualizarInventarioRunning = false;
 const actualizarDataState = {
   status: 'idle',
   startedAt: null,
@@ -77,8 +89,87 @@ const actualizarDataState = {
   error: null
 };
 
+const actualizarInventarioState = {
+  status: 'idle',
+  startedAt: null,
+  finishedAt: null,
+  rows: null,
+  lastRow: null,
+  error: null
+};
+
 function publicActualizarDataState() {
   return { ...actualizarDataState, ok: actualizarDataState.status === 'succeeded' };
+}
+
+function publicActualizarInventarioState() {
+  return { ...actualizarInventarioState, ok: actualizarInventarioState.status === 'succeeded' };
+}
+
+// ---------------------------------------------------------------- Plan de cosecha -> Cor de Reunion (real time)
+// Whenever either book changes, the Cor of Reunion is rewritten from the last P Cosecha tab
+// and every open Reunion page is told right away (server-sent events).
+const corClients = new Set();
+let corFeed = null;
+let corTimer = null;
+// change history of the Cor (last 5 changes per product + date), kept in data/cor_history.json
+const COR_HISTORY_FILE = path.join(DATA_DIR, 'cor_history.json');
+let corHistory = null;
+let corHistoryTimer = null;
+function loadCorHistory() {
+  if (!corHistory) corHistory = readJson(COR_HISTORY_FILE, null) || { source: null, baseline: null, entries: {} };
+  return corHistory;
+}
+function saveCorHistorySoon() {
+  clearTimeout(corHistoryTimer);
+  corHistoryTimer = setTimeout(() => {
+    const tmp = `${COR_HISTORY_FILE}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(corHistory), 'utf8');
+    fs.renameSync(tmp, COR_HISTORY_FILE);
+  }, 300);
+}
+function publicCorFeed() {
+  const h = loadCorHistory();
+  return { ...corFeed, history: { source: h.source, entries: h.entries } };
+}
+function broadcastCor() {
+  const msg = `event: cor\ndata: ${JSON.stringify(publicCorFeed())}\n\n`;
+  for (const res of corClients) res.write(msg);
+}
+function scheduleCorSync(delay = 150) {
+  clearTimeout(corTimer);
+  corTimer = setTimeout(() => { syncCor().catch(err => console.error('Sync Cor:', err)); }, delay);
+}
+async function syncCor() {
+  const cosecha = await loadWorkbook('cosecha');
+  const reunion = await loadWorkbook('reunion');
+  const feed = CosechaCor.computeFeed(cosecha);
+  const changed = CosechaCor.applyFeed(reunion, feed);
+  if (changed) await patchWorkbook('reunion', { sheets: { Reunion: reunion.sheets.Reunion } });
+  const feedChanged = !corFeed || corFeed.sig !== feed.sig;
+  corFeed = feed;
+  if (CosechaCor.trackChanges(loadCorHistory(), feed, new Date().toISOString())) saveCorHistorySoon();
+  if (changed || feedChanged) broadcastCor();
+  await syncAppend(reunion, cosecha);
+}
+
+// Requerimiento Vs Proyeccion: sheet "Append" rebuilt from PegarData + Plan de cosecha
+let appendSig = null;
+async function syncAppend(reunion, cosecha) {
+  const rvp = await loadWorkbook('rvp');
+  const { sheet } = AppendBuilder.buildAppendSheet(reunion, cosecha, rvp);
+  const md5 = obj => crypto.createHash('md5').update(JSON.stringify(obj)).digest('hex');
+  const sig = md5(sheet.cells);
+  // nothing new, and nobody overwrote it with an older copy
+  if (sig === appendSig && rvp.sheets.Append && md5(rvp.sheets.Append.cells) === sig) return;
+  const order = rvp.sheetOrder || [];
+  const meta = order.includes('Append') ? {} : { sheetOrder: [...order, 'Append'] };
+  const prev = rvp.sheets.Append;
+  if (prev && prev.colWidths) sheet.colWidths = { ...sheet.colWidths, ...prev.colWidths }; // keep widths set by hand
+  appendSig = sig;
+  await patchWorkbook('rvp', { meta, sheets: { Append: sheet } });
+  const msg = `event: append\ndata: ${JSON.stringify({ sig })}\n\n`;
+  for (const res of corClients) res.write(msg);
 }
 
 async function runActualizarDataInBackground() {
@@ -88,6 +179,7 @@ async function runActualizarDataInBackground() {
     const result = await runActualizarData(currentWorkbook);
     await saveWholeWorkbook('reunion', result.workbook);
     delete gzCache.reunion;
+    scheduleCorSync();
     actualizarDataState.status = 'succeeded';
     actualizarDataState.finishedAt = new Date().toISOString();
     actualizarDataState.rows = result.rows;
@@ -106,6 +198,32 @@ async function runActualizarDataInBackground() {
     console.error(' Actualizar Data falló:', error);
   } finally {
     actualizarDataRunning = false;
+  }
+}
+
+async function runActualizarInventarioInBackground() {
+  try {
+    console.log(' Iniciando Actualizar Inventario local: POSCO -> Inventario...');
+    const currentWorkbook = await loadWorkbook('reunion');
+    const result = await runActualizarInventario(currentWorkbook);
+    // the day the inventory was taken: its week (Sat..Fri) is the week the stock counts in Requerimiento Vs Proyeccion
+    if (result.workbook.sheets && result.workbook.sheets.Inventario) result.workbook.sheets.Inventario.updatedAt = new Date().toISOString();
+    await saveWholeWorkbook('reunion', result.workbook);
+    delete gzCache.reunion;
+    scheduleCorSync();
+    actualizarInventarioState.status = 'succeeded';
+    actualizarInventarioState.finishedAt = new Date().toISOString();
+    actualizarInventarioState.rows = result.rows;
+    actualizarInventarioState.lastRow = result.lastRow;
+    actualizarInventarioState.error = null;
+    console.log(` Actualizar Inventario completado: ${result.rows} filas en Inventario.`);
+  } catch (error) {
+    actualizarInventarioState.status = 'failed';
+    actualizarInventarioState.finishedAt = new Date().toISOString();
+    actualizarInventarioState.error = error.message || 'No se pudo actualizar Inventario.';
+    console.error(' Actualizar Inventario falló:', error);
+  } finally {
+    actualizarInventarioRunning = false;
   }
 }
 
@@ -367,6 +485,24 @@ async function handleRequest(req, res) {
     return sendJson(res, 202, publicActualizarDataState());
   }
 
+  if (pathname === '/api/actualizar-inventario' && (req.method === 'GET' || req.method === 'POST')) {
+    if (key !== 'reunion') return sendJson(res, 400, { error: 'Actualizar Inventario solo está disponible para Reunion.' });
+    if (req.method === 'GET') return sendJson(res, 200, publicActualizarInventarioState());
+    if (actualizarInventarioRunning) return sendJson(res, 202, publicActualizarInventarioState());
+
+    actualizarInventarioRunning = true;
+    Object.assign(actualizarInventarioState, {
+      status: 'running',
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      rows: null,
+      lastRow: null,
+      error: null
+    });
+    void runActualizarInventarioInBackground();
+    return sendJson(res, 202, publicActualizarInventarioState());
+  }
+
   if (pathname === '/api/workbook' && req.method === 'GET') {
     const workbook = await loadWorkbook(key);
     if (String(req.headers['accept-encoding'] || '').includes('gzip')) {
@@ -382,6 +518,7 @@ async function handleRequest(req, res) {
       const parsed = JSON.parse(await readRequestBody(req, 300 * 1024 * 1024));
       if (!parsed || typeof parsed !== 'object' || !parsed.sheets) throw new Error('bad workbook');
       await saveWholeWorkbook(key, parsed);
+      scheduleCorSync();
       return sendJson(res, 200, { ok: true });
     } catch (error) {
       return sendJson(res, 400, { error: 'JSON de libro inválido' });
@@ -397,7 +534,66 @@ async function handleRequest(req, res) {
       return sendJson(res, 400, { error: 'Cambio inválido' });
     }
     await patchWorkbook(key, parsed);
+    scheduleCorSync();
     return sendJson(res, 200, { ok: true });
+  }
+
+  // Cor of Reunion coming from Plan de cosecha: current feed + live updates
+  if (pathname === '/api/cor-feed' && req.method === 'GET') {
+    if (!corFeed) await syncCor();
+    return sendJson(res, 200, publicCorFeed());
+  }
+  // "✓ Visto": { keys: [...] } or { all: true } removes the change marks (the history stays)
+  if (pathname === '/api/cor-history/seen' && req.method === 'POST') {
+    let parsed;
+    try { parsed = JSON.parse(await readRequestBody(req, 1024 * 1024)); } catch (e) { return sendJson(res, 400, { error: 'JSON inválido' }); }
+    const h = loadCorHistory();
+    const keys = parsed && parsed.all ? Object.keys(h.entries) : (Array.isArray(parsed && parsed.keys) ? parsed.keys : []);
+    for (const k of keys) if (h.entries[k]) h.entries[k].unseen = false;
+    saveCorHistorySoon();
+    broadcastCor();
+    return sendJson(res, 200, { ok: true });
+  }
+  // Cor typed in Reunion: { writes: [{ product, serial, value }] } goes to Plan de cosecha (finca Isabela)
+  if (pathname === '/api/cor-write' && req.method === 'POST') {
+    let parsed;
+    try { parsed = JSON.parse(await readRequestBody(req, 1024 * 1024)); } catch (e) { return sendJson(res, 400, { error: 'JSON inválido' }); }
+    const cosecha = await loadWorkbook('cosecha');
+    const errors = [];
+    const changed = {};
+    let sheetName = null;
+    for (const w of (parsed && Array.isArray(parsed.writes) ? parsed.writes : [])) {
+      const r = CosechaCor.writeCor(cosecha, CosechaCor.norm(w.product), Number(w.serial), Number(w.value) || 0);
+      if (r.error) { errors.push(r.error); continue; }
+      sheetName = r.sheet;
+      Object.assign(changed, r.cells);
+    }
+    if (sheetName) {
+      await patchWorkbook('cosecha', { sheets: { [sheetName]: cosecha.sheets[sheetName] } });
+      const msg = `event: cosecha
+data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
+
+`;
+      for (const client of corClients) client.write(msg);
+      clearTimeout(corTimer);
+      await syncCor();
+    }
+    return sendJson(res, 200, { ok: !errors.length, errors });
+  }
+  // one sheet of a book (used to refresh "Append" without reloading the whole page)
+  if (pathname === '/api/sheet' && req.method === 'GET') {
+    const workbook = await loadWorkbook(key);
+    const sheet = workbook.sheets[urlObj.searchParams.get('name') || ''];
+    if (!sheet) return sendJson(res, 404, { error: 'Hoja no encontrada' });
+    return sendJson(res, 200, sheet);
+  }
+  if (pathname === '/api/events' && req.method === 'GET') {
+    res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
+    res.write(': ok\n\n');
+    corClients.add(res);
+    const ping = setInterval(() => res.write(': ping\n\n'), 25000);
+    req.on('close', () => { clearInterval(ping); corClients.delete(res); });
+    return;
   }
 
   if (pathname === '/api/homologations' && req.method === 'GET') {
@@ -453,6 +649,7 @@ async function start() {
   try {
     await initDatabase();
     await loadWorkbook(DEFAULT_WB);
+    await syncCor();
     const server = http.createServer((req, res) => {
       handleRequest(req, res).catch(error => {
         console.error('Request error:', error);

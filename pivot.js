@@ -40,8 +40,46 @@
   const rangeStr = g => `${indexToCol(g.c1)}${g.r1}:${indexToCol(g.c2)}${g.r2}`;
 
   // ---------------------------------------------------------------- source data
+  // used area of a sheet: header row 1, columns up to the last header, rows up to the last value in column A
+  function autoRange(sheetName) {
+    const sheet = wb().sheets[sheetName];
+    if (!sheet) return null;
+    let lastC = 0, lastR = 1;
+    for (const [coord, cell] of Object.entries(sheet.cells)) {
+      const pc = parseCoord(coord);
+      if (!pc) continue;
+      if (pc.row === 1 && cell.v !== undefined && cell.v !== '') lastC = Math.max(lastC, pc.col);
+      if (pc.col === 1 && pc.row > lastR && cell.v !== undefined && cell.v !== '') lastR = pc.row;
+    }
+    return lastC ? { r1: 1, c1: 1, r2: lastR, c2: lastC } : null;
+  }
+
+  // calculated field formula like 'Total Tallos 1'-'Total de tallos 2' (field names in quotes, numbers, + - * / and parentheses)
+  function calcFieldFn(formula) {
+    const tokens = String(formula).replace(/^=/, '').match(/'(?:[^']|'')*'|\d+(?:\.\d+)?|[-+*/()]|\S/g) || [];
+    let i = 0;
+    const peek = () => tokens[i];
+    const expr = () => { let node = term(); while (peek() === '+' || peek() === '-') { const op = tokens[i++]; node = { op, a: node, b: term() }; } return node; };
+    const term = () => { let node = factor(); while (peek() === '*' || peek() === '/') { const op = tokens[i++]; node = { op, a: node, b: factor() }; } return node; };
+    const factor = () => {
+      const t = tokens[i++];
+      if (t === '(') { const node = expr(); i++; return node; }
+      if (t === '-') return { op: '-', a: { num: 0 }, b: factor() };
+      if (t && t[0] === "'") return { field: t.slice(1, -1).replace(/''/g, "'") };
+      return { num: Number(t) || 0 };
+    };
+    const tree = expr();
+    const run = (n, rec) => {
+      if ('num' in n) return n.num;
+      if ('field' in n) { const v = rec[n.field]; return typeof v === 'number' ? v : Number(v) || 0; }
+      const a = run(n.a, rec), b = run(n.b, rec);
+      return n.op === '+' ? a + b : n.op === '-' ? a - b : n.op === '*' ? a * b : (b ? a / b : 0);
+    };
+    return rec => run(tree, rec);
+  }
+
   function readSource(p) {
-    const g = parseRange(p.source.ref);
+    const g = p.source.ref === 'auto' ? autoRange(p.source.sheet) : parseRange(p.source.ref);
     const engine = App().getEngine();
     if (!g || !wb().sheets[p.source.sheet]) throw new Error(`No se encontró el origen ${p.source.sheet}!${p.source.ref}`);
     const fields = [];
@@ -60,6 +98,11 @@
         rec[f] = v;
       });
       if (any) records.push(rec);
+    }
+    for (const cf of p.calcFields || []) {
+      const fn = calcFieldFn(cf.formula);
+      for (const rec of records) rec[cf.name] = fn(rec);
+      if (!fields.includes(cf.name)) fields.push(cf.name);
     }
     return { fields, records };
   }
@@ -88,7 +131,32 @@
     }
   }
 
+  // Excel WEEKNUM(date, 16): Saturday..Friday weeks
+  function weeknum16(serial) {
+    const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(serial) * 86400000);
+    const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
+    const offset = (new Date(jan1).getUTCDay() - 6 + 7) % 7;
+    return Math.floor((Math.round((d - jan1) / 86400000) + offset) / 7) + 1;
+  }
+  function currentWeek() {
+    const now = new Date();
+    return weeknum16(Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(1899, 11, 30)) / 86400000));
+  }
+
   function passesFilters(p, rec) {
+    // keep only some items of a field: { field: { values: [...] } } or { field: { prefix: 'GALLERIA' } }
+    for (const [field, rule] of Object.entries(p.include || {})) {
+      if (!(field in rec)) continue;
+      const v = rec[field];
+      if (rule.values && !rule.values.some(x => itemKey(x) === itemKey(v))) return false;
+      if (rule.prefix && !String(v ?? '').trim().toUpperCase().startsWith(String(rule.prefix).toUpperCase())) return false;
+    }
+    if (p.weekFrom && p.weekFrom.field in rec) {
+      // only the current week and the next ones (small numbers right after week 52/53 belong to next year)
+      const w = Number(rec[p.weekFrom.field]);
+      const cw = currentWeek();
+      if (Number.isFinite(w) && w < cw && cw - w < 26) return false;
+    }
     for (const [field, list] of Object.entries(p.hidden || {})) {
       if (!list || !list.length || !(field in rec)) continue;
       const k = itemKey(rec[field]);
@@ -137,7 +205,22 @@
     return root;
   }
 
-  const isCollapsed = (p, field, value) => ((p.collapsed || {})[field] || []).some(v => itemKey(v) === itemKey(value));
+  // an item is collapsed when listed in p.collapsed, or, for fields in p.collapseAll, unless listed in p.expanded
+  // date fields (p.dateFields) show as "Mié 28-oct"
+  const DIAS = ['Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie', 'Sáb'];
+  const MESES = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sep', 'oct', 'nov', 'dic'];
+  function labelOf(p, field, v) {
+    if (typeof v === 'number' && (p.dateFields || []).includes(field)) {
+      const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(v) * 86400000);
+      return `${DIAS[d.getUTCDay()]} ${String(d.getUTCDate()).padStart(2, '0')}-${MESES[d.getUTCMonth()]}`;
+    }
+    return itemLabel(v);
+  }
+
+  const isCollapsed = (p, field, value) => {
+    if (p.collapseAll && p.collapseAll[field]) return !((p.expanded || {})[field] || []).some(v => itemKey(v) === itemKey(value));
+    return ((p.collapsed || {})[field] || []).some(v => itemKey(v) === itemKey(value));
+  };
 
   // label of a page filter: (Todas), the single visible item, or (Varios elementos)
   function filterLabel(p, f, records) {
@@ -169,14 +252,14 @@
     const valuesInRows = (p.rows || []).includes(VALUES) && values.length > 1 && compact;
     const lab = compact ? 1 : Math.max(1, rowFields.length); // columns used by row labels
     const grid = []; // rows of {v, s}
-    const put = (r, c, v, s) => { (grid[r] = grid[r] || [])[c] = { v, s }; };
+    const put = (r, c, v, s, toggle) => { (grid[r] = grid[r] || [])[c] = toggle ? { v, s, toggle } : { v, s }; };
     const indentStyle = (base, depth) => (depth ? { ...base, indent: depth } : { ...base });
 
     // ---- filters block (above the table)
     let r0 = 0;
     for (const f of p.filters || []) {
       put(r0, 0, f.field, STYLE.filterLabel);
-      put(r0, 1, filterLabel(p, f, records), STYLE.item);
+      put(r0, 1, filterLabel(p, f, records), STYLE.item, { kind: 'filter', axis: 'filters', field: f.field });
       r0++;
     }
     if ((p.filters || []).length) r0++; // blank row between filters and table
@@ -187,7 +270,14 @@
     const colLeaves = [];
     const walkCols = (node, path) => {
       if (!node.list.length || path.length === colFields.length) { colLeaves.push({ path, records: node.records }); return; }
-      node.list.forEach(ch => walkCols(ch, path.concat([ch.value])));
+      const depth = path.length;
+      node.list.forEach(ch => {
+        const childPath = path.concat([ch.value]);
+        const parent = depth < colFields.length - 1;
+        if (parent && isCollapsed(p, colFields[depth], ch.value)) { colLeaves.push({ path: childPath, records: ch.records, collapsed: true }); return; }
+        walkCols(ch, childPath);
+        if (parent) colLeaves.push({ path: childPath, records: ch.records, subtotal: true }); // "Total 44"
+      });
     };
     if (colFields.length) walkCols(colTree, []); else colLeaves.push({ path: [], records: data });
     const valueList = values.length ? values : [];
@@ -205,14 +295,14 @@
       else valueList.forEach(v => columns.push({ leaf: { path: null, records: data }, value: v, grand: true }));
     }
     const rowHeader = rr => {
-      if (compact || !rowFields.length) put(rr, 0, T.rowLabels, STYLE.header);
+      if (compact || !rowFields.length) put(rr, 0, T.rowLabels, STYLE.header, rowFields.length ? { kind: 'filter', axis: 'rows' } : null);
       else rowFields.forEach((f, i) => put(rr, i, f, STYLE.header));
     };
 
     if (colFields.length) {
       put(tableTop, 0, valueList.length === 1 ? valueList[0].name : '', STYLE.header);
       for (let c = 1; c < lab; c++) put(tableTop, c, '', STYLE.header);
-      put(tableTop, lab, compact ? T.colLabels : colFields[0], STYLE.header);
+      put(tableTop, lab, compact ? T.colLabels : colFields[0], STYLE.header, { kind: 'filter', axis: 'cols' });
       for (let c = lab + 1; c < lab + columns.length; c++) put(tableTop, c, '', STYLE.header);
       colFields.forEach((f, level) => {
         const rr = tableTop + 1 + level;
@@ -221,9 +311,16 @@
         let prev = null;
         columns.forEach((col, i) => {
           if (col.grand) { put(rr, lab + i, level === 0 ? (multiValuesCols ? `${T.total} ${col.value.name}` : T.grand) : '', STYLE.header); return; }
-          const label = itemLabel(col.leaf.path[level]);
-          const key = col.leaf.path.slice(0, level + 1).map(itemKey).join('|');
-          put(rr, lab + i, key !== prev || !multiValuesCols ? label : '', STYLE.header);
+          const path = col.leaf.path;
+          if (level >= path.length) { put(rr, lab + i, '', STYLE.header); prev = null; return; }
+          if (col.leaf.subtotal && level === path.length - 1) { put(rr, lab + i, `${T.total} ${labelOf(p, colFields[level], path[level])}`, STYLE.header); prev = null; return; }
+          const key = path.slice(0, level + 1).map(itemKey).join('|');
+          const isParentLevel = level < colFields.length - 1;
+          const show = key !== prev || (!multiValuesCols && !isParentLevel);
+          const toggle = show && isParentLevel && !col.leaf.subtotal
+            ? { axis: 'col', field: colFields[level], value: path[level], open: !col.leaf.collapsed }
+            : null;
+          put(rr, lab + i, show ? labelOf(p, colFields[level], path[level]) : '', STYLE.header, toggle);
           prev = key;
         });
       });
@@ -257,9 +354,10 @@
         const isLeaf = depth === rowFields.length - 1;
         const open = !isLeaf && !isCollapsed(p, rowFields[depth], ch.value);
         const style = isLeaf ? { ...STYLE.item } : { ...STYLE.subtotal };
-        const label = itemLabel(ch.value);
-        if (compact) put(rr, 0, label, indentStyle(style, depth));
-        else put(rr, depth, label, style);
+        const label = labelOf(p, rowFields[depth], ch.value);
+        const toggle = isLeaf ? null : { axis: 'row', field: rowFields[depth], value: ch.value, open };
+        if (compact) put(rr, 0, label, indentStyle(style, depth), toggle);
+        else put(rr, depth, label, style, toggle);
         if (valuesInRows) {
           rr++;
           valueList.forEach(v => {
@@ -322,19 +420,24 @@
     const clearArea = old || { r1: Math.max(1, top), r2: loc ? loc.r2 : top, c1: left, c2: loc ? loc.c2 : left };
     const gapRow = (p.filters || []).length ? top + p.filters.length : null; // not part of the pivot: user text there stays
     for (let r = clearArea.r1; r <= clearArea.r2; r++) {
-      if (r === gapRow) continue;
+      // The spacer row belongs to the pivot's generated layout. Clear it too
+      // so a removed page filter can never remain visible above the table.
       for (let c = clearArea.c1; c <= clearArea.c2; c++) delete sheet.cells[`${indexToCol(c)}${r}`];
     }
     let maxC = 0;
+    p.toggles = {};
     grid.forEach((row, i) => {
       if (!row) return;
       row.forEach((cell, j) => {
         if (!cell) return;
         maxC = Math.max(maxC, j);
         const coord = `${indexToCol(left + j)}${top + i}`;
+        if (cell.toggle) p.toggles[coord] = cell.toggle;
         const entry = {};
         if (cell.v !== null && cell.v !== undefined && cell.v !== '') entry.v = cell.v;
         if (cell.s && Object.keys(cell.s).length) entry.s = JSON.parse(JSON.stringify(cell.s));
+        // negatives: the whole cell in red (Excel's light red fill with dark red text)
+        if (typeof cell.v === 'number' && cell.v < 0) entry.s = { ...(entry.s || {}), bg: '#ffc7ce', color: '#9c0006' };
         if (Object.keys(entry).length) sheet.cells[coord] = entry;
       });
     });
@@ -580,6 +683,16 @@
     ensureValuesPseudoField(p);
   }
 
+  // put `field` at position `index` of a zone (rows, cols, filters or values)
+  function moveInZone(p, zone, field, index) {
+    const list = zone === 'filters' ? p.filters : zone === 'values' ? p.values : p[zone];
+    const keyOf = x => (zone === 'filters' || zone === 'values' ? x.field : x);
+    const from = zone === 'values' ? list.map(keyOf).lastIndexOf(field) : list.findIndex(x => keyOf(x) === field);
+    if (from < 0) return;
+    const [item] = list.splice(from, 1);
+    list.splice(Math.max(0, Math.min(index, list.length)), 0, item);
+  }
+
   function addField(p, zone, field, isNumeric) {
     if (field === VALUES) {
       p.rows = p.rows.filter(f => f !== VALUES); p.cols = p.cols.filter(f => f !== VALUES);
@@ -651,7 +764,11 @@
     }));
     panel.querySelectorAll('[data-filter]').forEach(btn => btn.addEventListener('click', e => {
       e.stopPropagation();
-      openItemFilter(btn, btn.dataset.filter, btn.closest('.pv-chip').dataset.zone);
+      const chip = btn.closest('.pv-chip');
+      const zone = chip.dataset.zone;
+      // Use the same field menu as the buttons rendered inside the pivot so
+      // page filters, row labels and column labels share one apply/clear path.
+      openFieldMenu(btn, p, zone, zone === 'filters' ? btn.dataset.filter : null);
     }));
     panel.querySelector('[data-refresh]').addEventListener('click', () => {
       const pv = currentPivot();
@@ -683,21 +800,38 @@
       e.dataTransfer.setData('text/plain', drag.field);
       e.dataTransfer.effectAllowed = 'move';
     });
+    // position inside a zone where the field would land (chips above the pointer come first)
+    const dropIndex = (zoneEl, y) => {
+      const chips = [...zoneEl.querySelectorAll('.pv-chip')].filter(c => !(drag && c.dataset.zone === drag.from && c.dataset.field === drag.field));
+      let i = 0;
+      for (const c of chips) { const r = c.getBoundingClientRect(); if (y > r.top + r.height / 2) i++; }
+      return { index: i, chips };
+    };
+    const clearMarks = () => panel.querySelectorAll('.pv-chip.drop-before, .pv-chip.drop-after').forEach(c => c.classList.remove('drop-before', 'drop-after'));
     panel.querySelectorAll('.pv-zone').forEach(zoneEl => {
-      zoneEl.addEventListener('dragover', e => { e.preventDefault(); zoneEl.classList.add('over'); });
-      zoneEl.addEventListener('dragleave', () => zoneEl.classList.remove('over'));
+      zoneEl.addEventListener('dragover', e => {
+        e.preventDefault();
+        zoneEl.classList.add('over');
+        clearMarks();
+        const { index, chips } = dropIndex(zoneEl, e.clientY);
+        if (chips.length) (index < chips.length ? chips[index] : chips[chips.length - 1]).classList.add(index < chips.length ? 'drop-before' : 'drop-after');
+      });
+      zoneEl.addEventListener('dragleave', e => { if (!zoneEl.contains(e.relatedTarget)) { zoneEl.classList.remove('over'); clearMarks(); } });
       zoneEl.addEventListener('drop', e => {
         e.preventDefault();
         zoneEl.classList.remove('over');
+        clearMarks();
         if (!drag) return;
         const to = zoneEl.dataset.zone;
         const { field, from } = drag;
+        const { index } = dropIndex(zoneEl, e.clientY);
         drag = null;
-        if (from === to) return;
         change(pv => {
+          if (from === to) { moveInZone(pv, to, field, index); return; } // reorder inside the zone
           if (from) removeField(pv, from, field);
           if (field === VALUES && to !== 'rows' && to !== 'cols') return;
           addField(pv, to, field, to === 'values' ? isNumericField(pv, field) : false);
+          moveInZone(pv, to, field, index);
         });
       });
     });
@@ -803,5 +937,231 @@
     if (pv) openPanel(pv);
   });
 
-  window.MauriPivot = { onSelectionChange, onSheetRenamed, onSheetDeleted, renderPivot, computeGrid, pivotAt, openCreateDialog };
+  // +/- inside the pivot cells that can expand or collapse (drawn by app.js through cellExtra)
+  function cellExtra(sheetName, r, c) {
+    const list = (wb() && wb().pivots) || [];
+    if (!list.length) return '';
+    const coord = `${indexToCol(c)}${r}`;
+    for (const p of list) {
+      if (p.sheet !== sheetName) continue;
+      if (p.toggles) {
+        const t = p.toggles[coord];
+      if (t && t.kind === 'filter') {
+        const fieldsOf = t.axis === 'rows' ? p.rows : t.axis === 'cols' ? p.cols : [t.field];
+        const active = fieldsOf.some(f => ((p.hidden || {})[f] || []).length) || (t.axis === 'filters' && (p.filters.find(x => x.field === t.field) || {}).selected);
+        return `<button type="button" class="pv-filter-cell${active ? ' active' : ''}" data-pv="${escapeHtml(p.id)}" data-coord="${coord}" title="Filtrar y ordenar">${active ? '⏷' : '▾'}</button>`;
+      }
+      if (t) return `<button type="button" class="pv-toggle" data-pv="${escapeHtml(p.id)}" data-coord="${coord}" title="${t.open ? 'Contraer' : 'Expandir'}">${t.open ? '−' : '+'}</button>`;
+      }
+      const anchor = p.anchor ? parseCoord(p.anchor) : null;
+      const loc = p.location ? parseRange(p.location) : null;
+      if (!p.filters?.length || (!anchor && !loc)) continue;
+      const top = anchor ? anchor.row : loc.r1 - p.filters.length - 1;
+      const left = anchor ? anchor.col : loc.c1;
+      for (let i = 0; i < p.filters.length; i += 1) {
+        if (coord === `${indexToCol(left + 1)}${top + i}`) {
+          return `<button type="button" class="pv-page-filter" data-pv="${escapeHtml(p.id)}" data-coord="${coord}" title="Abrir filtro de ${escapeHtml(p.filters[i].field)}">▾</button>`;
+        }
+      }
+    }
+    return '';
+  }
+  function toggleItem(p, t) {
+    const listKey = (p.collapseAll && p.collapseAll[t.field]) ? 'expanded' : 'collapsed';
+    const store = p[listKey] = p[listKey] || {};
+    const list = store[t.field] = store[t.field] || [];
+    const i = list.findIndex(v => itemKey(v) === itemKey(t.value));
+    if (i >= 0) list.splice(i, 1); else list.push(t.value);
+  }
+  document.addEventListener('mousedown', e => {
+    const fbtn = e.target.closest && e.target.closest('.pv-filter-cell, .pv-page-filter');
+    if (fbtn) {
+      e.preventDefault();
+      e.stopImmediatePropagation(); // no other handler may open a second menu
+      const p = pivots().find(x => x.id === fbtn.dataset.pv);
+      if (!p) return;
+      const t = p.toggles && p.toggles[fbtn.dataset.coord];
+      if (t && t.kind === 'filter') { openFieldMenu(fbtn, p, t.axis, t.axis === 'filters' ? t.field : null); return; }
+      // page filter button: the field is the one written in the cell to its left
+      const pc = parseCoord(fbtn.dataset.coord);
+      const label = pc && ((wb().sheets[p.sheet].cells[`${indexToCol(pc.col - 1)}${pc.row}`] || {}).v);
+      const f = p.filters.find(x => x.field === label) || p.filters[0];
+      if (f) openFieldMenu(fbtn, p, 'filters', f.field);
+      return;
+    }
+    // Make the complete pivot header cell clickable as well as its small
+    // arrow. This matches Excel's behavior and avoids missed clicks on the
+    // text "Etiquetas de fila", "Etiquetas de columna" or the filter label.
+    const cell = e.target.closest && e.target.closest('.excel-grid td[data-coord]');
+    if (cell) {
+      const sheetName = App().getActiveSheet();
+      const p = pivots().find(x => x.sheet === sheetName);
+      const t = p && p.toggles && p.toggles[cell.dataset.coord];
+      if (t && t.kind === 'filter') {
+        e.preventDefault();
+        e.stopImmediatePropagation();
+        openFieldMenu(cell, p, t.axis, t.axis === 'filters' ? t.field : null);
+        return;
+      }
+    }
+    const btn = e.target.closest && e.target.closest('.pv-toggle');
+    if (!btn) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const p = pivots().find(x => x.id === btn.dataset.pv);
+    const t = p && p.toggles && p.toggles[btn.dataset.coord];
+    if (!t) return;
+    toggleItem(p, t);
+    const vp = document.getElementById('spreadsheetViewport');
+    const { scrollTop, scrollLeft } = vp;
+    renderPivot(p);
+    App().markDirty(p.sheet);
+    App().save();
+    App().recalcAndRender();
+    vp.scrollTop = scrollTop;
+    vp.scrollLeft = scrollLeft;
+  }, true);
+
+  // Excel-style page filters: clicking the filter value itself (for example,
+  // "(Todas)" in the Distribuidor row) opens the checklist.
+  document.addEventListener('mousedown', e => {
+    const cell = e.target.closest && e.target.closest('.excel-grid td[data-coord]');
+    if (!cell) return;
+    const sheetName = App().getActiveSheet();
+    const coord = cell.dataset.coord;
+    for (const p of pivots()) {
+      if (p.sheet !== sheetName || !p.filters?.length) continue;
+      const anchor = p.anchor ? parseCoord(p.anchor) : null;
+      const loc = p.location ? parseRange(p.location) : null;
+      if (!anchor && !loc) continue;
+      const top = anchor ? anchor.row : loc.r1 - p.filters.length - 1;
+      const left = anchor ? anchor.col : loc.c1;
+      const index = p.filters.findIndex((f, i) => coord === `${indexToCol(left + 1)}${top + i}`);
+      if (index < 0) continue;
+      e.preventDefault();
+      e.stopPropagation();
+      openFieldMenu(cell, p, 'filters', p.filters[index].field);
+      return;
+    }
+  }, true);
+
+  // Excel-like filter menu of "Etiquetas de fila / columna" (and of page filters): pick the field, sort, check items
+  function openFieldMenu(anchor, p, axis, onlyField) {
+    closeItemFilter();
+    const axisFields = axis === 'rows' ? p.rows.filter(f => f !== VALUES) : axis === 'cols' ? p.cols.filter(f => f !== VALUES) : [onlyField];
+    if (!axisFields.length) return;
+    let field = onlyField || p._menuField && axisFields.includes(p._menuField) && p._menuField || axisFields[0];
+    let records;
+    try { records = readSource(p).records; } catch (err) { App().toast(err.message, true); return; }
+
+    const build = () => {
+      const map = new Map();
+      for (const r of records) { const k = itemKey(r[field]); if (!map.has(k)) map.set(k, r[field]); }
+      const items = [...map.values()].sort(compareItems);
+      const hidden = new Set(((p.hidden || {})[field] || []).map(itemKey));
+      const filterDef = axis === 'filters' ? p.filters.find(f => f.field === field) : null;
+      const selected = filterDef && filterDef.selected ? new Set(filterDef.selected.map(itemKey)) : null;
+      // "keep only" rules (p.include) count too, so the checklist shows what is really visible
+      const inc = (p.include || {})[field];
+      const included = v => !inc || ((!inc.values || inc.values.some(x => itemKey(x) === itemKey(v))) && (!inc.prefix || String(v ?? '').trim().toUpperCase().startsWith(String(inc.prefix).toUpperCase())));
+      const isOn = v => !hidden.has(itemKey(v)) && (!selected || selected.has(itemKey(v))) && included(v);
+      const dir = (p.sort || {})[field];
+      itemMenu.innerHTML = `
+        ${axisFields.length > 1 ? `<label class="pv-menu-field">Seleccionar campo:
+          <select data-field>${axisFields.map(f => `<option value="${escapeHtml(f)}"${f === field ? ' selected' : ''}>${escapeHtml(f)}</option>`).join('')}</select></label>` : `<div class="pv-item-title">${escapeHtml(field)}</div>`}
+        ${axis !== 'filters' ? `<div class="pv-menu-sort">
+          <button type="button" data-sort="ascending" class="${dir === 'ascending' ? 'on' : ''}">↑ Ordenar de A a Z</button>
+          <button type="button" data-sort="descending" class="${dir === 'descending' ? 'on' : ''}">↓ Ordenar de Z a A</button>
+        </div>` : ''}
+        <button type="button" class="pv-menu-clear" data-clear>✕ Borrar filtro de "${escapeHtml(field)}"</button>
+        <input type="search" class="af-search" placeholder="Buscar" />
+        <div class="af-list">
+          <label class="af-item af-all"><input type="checkbox" data-all /> (Seleccionar todo)</label>
+          ${items.map((v, i) => `<label class="af-item" data-text="${escapeHtml(String(labelOf(p, field, v)).toLowerCase())}"><input type="checkbox" data-i="${i}" ${isOn(v) ? 'checked' : ''} /> ${escapeHtml(labelOf(p, field, v))}</label>`).join('')}
+        </div>
+        <div class="af-footer">
+          <button type="button" class="af-ok" data-ok>Aceptar</button>
+          <button type="button" class="af-cancel" data-cancel>Cancelar</button>
+        </div>`;
+      const boxes = () => [...itemMenu.querySelectorAll('[data-i]')];
+      const all = itemMenu.querySelector('[data-all]');
+      const visibleBoxes = () => boxes().filter(b => b.closest('.af-item')?.style.display !== 'none');
+      const sync = () => { all.checked = boxes().every(b => b.checked); all.indeterminate = !all.checked && boxes().some(b => b.checked); };
+      sync();
+      all.addEventListener('change', () => { boxes().forEach(b => { if (b.closest('.af-item').style.display !== 'none') b.checked = all.checked; }); sync(); });
+      itemMenu.querySelector('.af-list').addEventListener('change', ev => { if (!ev.target.matches('[data-all]')) sync(); });
+      itemMenu.querySelector('.af-search').addEventListener('input', ev => {
+        const q = ev.target.value.trim().toLowerCase();
+        itemMenu.querySelectorAll('.af-item:not(.af-all)').forEach(el => { el.style.display = !q || el.dataset.text.includes(q) ? '' : 'none'; });
+      });
+      const sel = itemMenu.querySelector('[data-field]');
+      if (sel) sel.addEventListener('change', () => { field = sel.value; p._menuField = field; build(); });
+      const apply = fn => {
+        closeItemFilter();
+        App().pushUndo([p.sheet]);
+        fn();
+        commit(p);
+        if (panel && panelPivotId === p.id) openPanel(p);
+      };
+      itemMenu.querySelectorAll('[data-sort]').forEach(b => b.addEventListener('click', () => apply(() => {
+        p.sort = p.sort || {};
+        p.sort[field] = b.dataset.sort;
+      })));
+      itemMenu.querySelector('[data-clear]').addEventListener('click', () => apply(() => {
+        if (p.hidden) delete p.hidden[field];
+        if (p.include) delete p.include[field];
+        const f = p.filters.find(x => x.field === field);
+        if (f) f.selected = null;
+      }));
+      itemMenu.querySelector('[data-cancel]').addEventListener('click', closeItemFilter);
+      itemMenu.querySelector('[data-ok]').addEventListener('click', () => {
+        const query = itemMenu.querySelector('.af-search').value.trim();
+        // When searching, apply the visible results as the selected set. This
+        // prevents hidden items from silently cancelling a search-based filter.
+        const selectedBoxes = query ? visibleBoxes().filter(b => b.checked) : boxes().filter(b => b.checked);
+        const selectedKeys = new Set(selectedBoxes.map(b => itemKey(items[Number(b.dataset.i)])));
+        const on = selectedBoxes.map(b => items[Number(b.dataset.i)]);
+        const off = query
+          ? boxes().filter(b => !selectedKeys.has(itemKey(items[Number(b.dataset.i)]))).map(b => items[Number(b.dataset.i)])
+          : boxes().filter(b => !b.checked).map(b => items[Number(b.dataset.i)]);
+        if (!on.length) { App().toast('Elige al menos un elemento', true); return; }
+        apply(() => {
+          p.hidden = p.hidden || {};
+          if (p.include) delete p.include[field]; // from now on the checklist decides
+          if (axis === 'filters') {
+            const f = p.filters.find(x => x.field === field);
+            delete p.hidden[field];
+            if (f) f.selected = off.length ? on : null;
+          } else if (off.length) p.hidden[field] = off;
+          else delete p.hidden[field];
+        });
+      });
+    };
+
+    itemMenu = document.createElement('div');
+    itemMenu.className = 'af-menu pv-item-menu pv-field-menu no-print';
+    document.body.appendChild(itemMenu);
+    build();
+    const rect = anchor.getBoundingClientRect();
+    itemMenu.style.left = `${Math.max(8, Math.min(window.innerWidth - 290, rect.left - 20))}px`;
+    itemMenu.style.top = `${Math.max(8, Math.min(window.innerHeight - 480, rect.bottom + 4))}px`;
+    setTimeout(() => {
+      const away = ev => { if (itemMenu && !itemMenu.contains(ev.target)) { closeItemFilter(); document.removeEventListener('mousedown', away, true); } };
+      document.addEventListener('mousedown', away, true);
+    }, 0);
+  }
+
+  // re-render every pivot fed by `sourceSheet` (the source changed)
+  function refreshAll(sourceSheet) {
+    let n = 0;
+    for (const p of pivots()) {
+      if (sourceSheet && p.source.sheet !== sourceSheet) continue;
+      if (!wb().sheets[p.sheet]) continue;
+      try { renderPivot(p); App().markDirty(p.sheet); n++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
+    }
+    if (n) { App().recalcAndRender(); App().save(); }
+    return n;
+  }
+
+  window.MauriPivot = { onSelectionChange, onSheetRenamed, onSheetDeleted, renderPivot, computeGrid, pivotAt, openCreateDialog, cellExtra, refreshAll };
 })();
