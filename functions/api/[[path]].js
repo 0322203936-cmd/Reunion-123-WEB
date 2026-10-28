@@ -61,7 +61,13 @@ async function loadSheet(sql, book, name) {
   ]);
   const sheetRow = rowsOf(sheetResult)[0];
   if (!sheetRow) return null;
-  return { ...(sheetRow.data || {}), cells: rowsOf(cellsResult)[0]?.cells || {} };
+  // Some workbooks were migrated with cells embedded in the sheet JSON,
+  // while newer imports use the normalized workbook_cells table. Preserve
+  // both representations; replacing the embedded cells with an empty object
+  // made Plan de cosecha and Inventario appear blank.
+  const embeddedCells = (sheetRow.data && sheetRow.data.cells) || {};
+  const normalizedCells = rowsOf(cellsResult)[0]?.cells || {};
+  return { ...(sheetRow.data || {}), cells: { ...embeddedCells, ...normalizedCells } };
 }
 function splitWorkbook(workbook) { const { sheets = {}, ...meta } = workbook || {}; return { meta, sheets }; }
 function withoutCells(sheet) { if (!sheet || typeof sheet !== 'object') return sheet; const { cells, ...rest } = sheet; return rest; }
