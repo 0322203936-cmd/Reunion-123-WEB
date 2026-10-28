@@ -306,6 +306,27 @@
     window.dispatchEvent(new CustomEvent('mauri:workbook-switch', { detail: { key: WB_KEY } }));
   }
 
+  async function hydrateVisibleSheetIfEmpty(key, expectedWorkbook = workbook, expectedSheet = activeSheet) {
+    const sheet = expectedWorkbook?.sheets?.[expectedSheet];
+    if (!sheet || sheet.hidden || Object.keys(sheet.cells || {}).length > 0) return;
+    if ((sheet.maxRow || 0) <= 1 && (sheet.maxCol || 0) <= 1) return;
+    try {
+      const loaded = await loadSheetFromNeon(key, expectedSheet);
+      if (workbook !== expectedWorkbook || WB_KEY !== key || activeSheet !== expectedSheet) return;
+      expectedWorkbook.sheets[expectedSheet] = loaded;
+      workbookCache.set(key, expectedWorkbook);
+      rememberSyncedWorkbook(key, expectedWorkbook);
+      workbookEngineCache.delete(key);
+      engine = new window.FormulaEngine(expectedWorkbook);
+      engine.recalculateAll();
+      renderSheetTabs();
+      renderSheet();
+      selectCell(selectedCoord || 'A1', false);
+    } catch (error) {
+      showToast(`No se pudo cargar ${expectedSheet} desde Neon: ${error.message}`, true);
+    }
+  }
+
   let workbookEventSource = null;
   function applyIncomingCellPatch(target, payload) {
     if (!target || !payload) return false;
@@ -363,6 +384,7 @@
     try {
       const loaded = await fetchWorkbookForKey(WB_KEY);
       activateWorkbook(loaded, WB_KEY, { deferRecalc: true });
+      void hydrateVisibleSheetIfEmpty(WB_KEY, workbook, activeSheet);
     } catch (err) {
       // Keep the UI explicit about a database outage instead of opening a
       // stale local workbook that could be mistaken for current Neon data.
@@ -560,6 +582,15 @@
         continue;
       }
       const current = savedWorkbook.sheets[n];
+      const baseline = baselines.get(n);
+      // A transient failed load can leave a metadata-only PegarData sheet in
+      // memory. Never turn that temporary empty view into a real replacement
+      // of the populated sheet in Neon.
+      if (savedWbKey === 'reunion' && n === 'PegarData'
+        && Object.keys(current.cells || {}).length === 0
+        && Object.keys(baseline?.cells || {}).length > 0) {
+        continue;
+      }
       const tracked = capturedCoords.get(n);
       let change;
       if (tracked && tracked.size && baselines.get(n)) {
