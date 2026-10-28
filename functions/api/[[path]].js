@@ -41,8 +41,10 @@ function splitWorkbook(workbook) { const { sheets = {}, ...meta } = workbook || 
 function withoutCells(sheet) { if (!sheet || typeof sheet !== 'object') return sheet; const { cells, ...rest } = sheet; return rest; }
 function cellRows(sheetName, sheet) { return Object.entries((sheet && sheet.cells) || {}).map(([coord, cell]) => ({ sheet_name: sheetName, coord, cell })); }
 async function upsertCells(sql, table, rows) {
-  for (let i = 0; i < rows.length; i += 1000) {
-    const batch = rows.slice(i, i + 1000);
+  // Keep the total Neon subrequests below Cloudflare's Worker invocation
+  // limit when importing a large workbook.
+  for (let i = 0; i < rows.length; i += 10000) {
+    const batch = rows.slice(i, i + 10000);
     await sql.query(`INSERT INTO ${table} (sheet_name, coord, cell)
       SELECT sheet_name, coord, cell
       FROM jsonb_to_recordset($1::jsonb) AS x(sheet_name text, coord text, cell jsonb)
