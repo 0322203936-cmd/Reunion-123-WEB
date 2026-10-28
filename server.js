@@ -82,6 +82,7 @@ let pool = null;
 // snapshot and do not cache it over the database-backed workbook.
 let persistenceReady = !DATABASE_URL;
 const caches = {}; // wbKey -> full workbook kept in memory; PATCH merges into it
+const workbookLoads = {}; // wbKey -> shared in-flight Neon read
 const gzCache = {}; // wbKey -> gzipped JSON of the cached workbook (dropped on every change)
 const gzPending = {};
 const workbookGeneration = {};
@@ -512,6 +513,15 @@ async function writeWholeWorkbookToDb(key, workbook) {
 // ---------------------------------------------------------------- workbook persistence
 async function loadWorkbook(key) {
   if (caches[key] && persistenceReady) return caches[key];
+  if (workbookLoads[key]) return workbookLoads[key];
+  workbookLoads[key] = loadWorkbookUncached(key).finally(() => {
+    delete workbookLoads[key];
+  });
+  return workbookLoads[key];
+}
+
+async function loadWorkbookUncached(key) {
+  if (caches[key] && persistenceReady) return caches[key];
   if (!pool || !persistenceReady) {
     const localWorkbook = caches[key] || readJson(cfg(key).state, null) || initialWorkbook(key);
     if (persistenceReady) caches[key] = localWorkbook;
@@ -519,6 +529,10 @@ async function loadWorkbook(key) {
   }
   const p = cfg(key).prefix;
   try {
+    // A stalled Neon connection must not leave the browser request hanging.
+    // The local snapshot is only a recovery path; Neon remains the source
+    // whenever this read completes normally.
+    const dbLoad = (async () => {
     const metaRes = await pool.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`);
     const sheetRes = await pool.query(`SELECT name, data FROM ${p}_workbook_sheets`);
     const cellRes = await pool.query(`SELECT sheet_name, coord, cell FROM ${p}_workbook_cells`);
@@ -531,6 +545,11 @@ async function loadWorkbook(key) {
     }
     caches[key] = { ...meta, sheets };
     return caches[key];
+    })();
+    return await Promise.race([
+      dbLoad,
+      new Promise((_, reject) => setTimeout(() => reject(new Error('Neon tardó demasiado en responder')), 20000))
+    ]);
   } catch (error) {
     // A temporary Neon failure must not leave the workbook request pending.
     // The local snapshot is the safe read fallback; the next request can try
