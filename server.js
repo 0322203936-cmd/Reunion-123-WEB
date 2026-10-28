@@ -398,6 +398,14 @@ async function migrateWorkbookCells(key) {
   const done = await pool.query(`SELECT 1 FROM ${marker} WHERE name = 'cells-v1'`);
   if (done.rowCount) return;
 
+  // A workbook created by the new writer already has normalized cell rows.
+  // Never delete those rows just because the migration marker is missing.
+  const existingCells = await pool.query(`SELECT 1 FROM ${p}_workbook_cells LIMIT 1`);
+  if (existingCells.rowCount) {
+    await pool.query(`INSERT INTO ${marker} (name) VALUES ('cells-v1') ON CONFLICT (name) DO NOTHING`);
+    return;
+  }
+
   const sheetRes = await pool.query(`SELECT name, data FROM ${p}_workbook_sheets`);
   const rows = [];
   for (const row of sheetRes.rows) rows.push(...sheetCellRows(row.name, row.data));
@@ -469,7 +477,6 @@ async function initDatabase() {
     if (existing.rowCount === 0) {
       await writeWholeWorkbookToDb(key, readJson(cfg(key).state, initialWorkbook(key)));
     }
-    await migrateWorkbookCells(key);
     await pool.query(
       `INSERT INTO ${p}_homologations (id, state) VALUES (1, $1::jsonb) ON CONFLICT (id) DO NOTHING`,
       [JSON.stringify(initialHomologations(key))]
@@ -477,6 +484,16 @@ async function initDatabase() {
   }
 
   console.log(' Persistencia activa: Neon PostgreSQL');
+}
+
+async function migrateAllWorkbookCellsInBackground() {
+  for (const key of Object.keys(WORKBOOKS)) {
+    try {
+      await migrateWorkbookCells(key);
+    } catch (error) {
+      console.error(`Migración Neon ${key} pendiente:`, error.message);
+    }
+  }
 }
 
 async function writeWholeWorkbookToDb(key, workbook) {
@@ -538,7 +555,11 @@ async function loadWorkbookUncached(key) {
     const cellRes = await pool.query(`SELECT sheet_name, coord, cell FROM ${p}_workbook_cells`);
     const meta = metaRes.rows[0]?.meta || splitWorkbook(initialWorkbook(key)).meta;
     const sheets = {};
-    for (const row of sheetRes.rows) sheets[row.name] = { ...row.data, cells: {} };
+    for (const row of sheetRes.rows) {
+      // During the one-time migration, the legacy JSONB may still contain
+      // cells. Keep them as a temporary fallback and overlay normalized rows.
+      sheets[row.name] = { ...row.data, cells: { ...((row.data && row.data.cells) || {}) } };
+    }
     for (const row of cellRes.rows) {
       if (!sheets[row.sheet_name]) sheets[row.sheet_name] = { cells: {} };
       sheets[row.sheet_name].cells[row.coord] = row.cell;
@@ -1002,6 +1023,8 @@ async function start() {
   try {
     await initDatabase();
     persistenceReady = true;
+    // Do not delay the web service while the one-time cell migration runs.
+    void migrateAllWorkbookCellsInBackground();
     await loadWorkbook(DEFAULT_WB);
     // Cor is initialized at startup, but Append does not need to be rebuilt
     // until a source workbook changes. Avoid competing with the first edits.
