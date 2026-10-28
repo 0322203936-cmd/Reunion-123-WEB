@@ -231,7 +231,7 @@
     return request;
   }
 
-  function activateWorkbook(nextWorkbook, key) {
+  function activateWorkbook(nextWorkbook, key, options = {}) {
     setWorkbookKey(key);
     workbook = workbookReady(nextWorkbook, key);
     workbookCache.set(WB_KEY, workbook);
@@ -244,8 +244,25 @@
     const firstVisible = visibleSheets()[0] || workbook.sheetOrder[0] || 'Sheet1';
     activeSheet = workbook.activeSheet && workbook.sheets[workbook.activeSheet] && !workbook.sheets[workbook.activeSheet].hidden
       ? workbook.activeSheet : firstVisible;
-    engine = workbookEngineCache.get(WB_KEY) || new window.FormulaEngine(workbook);
-    if (!workbookEngineCache.has(WB_KEY)) engine.recalculateAll();
+    const cachedEngine = workbookEngineCache.get(WB_KEY);
+    engine = cachedEngine || new window.FormulaEngine(workbook);
+    if (!cachedEngine) {
+      const recalc = () => {
+        // The first paint must not wait for every formula in every sheet.
+        // Visible formulas are evaluated lazily by the grid; the complete
+        // pass runs only after the browser is idle.
+        if (engine !== engineRef || workbook !== engineRef.workbook) return;
+        engineRef.recalculateAll();
+        if (WB_KEY === key) renderSheet();
+      };
+      const engineRef = engine;
+      if (options.deferRecalc) {
+        if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(recalc, { timeout: 1500 });
+        else setTimeout(recalc, 0);
+      } else {
+        recalc();
+      }
+    }
     renderSheetTabs();
     renderSheet();
     selectCell('A1', false);
@@ -301,7 +318,7 @@
           const ready = workbookReady(fresh, key);
           workbookCache.set(key, ready);
           rememberSyncedWorkbook(key, ready);
-          if (key === WB_KEY && !dirtySheets.size) activateWorkbook(ready, key);
+          if (key === WB_KEY && !dirtySheets.size) activateWorkbook(ready, key, { deferRecalc: true });
         }).catch(() => {});
       } catch (error) { /* reconnect/background refresh will recover */ }
     });
@@ -319,7 +336,7 @@
       const cached = await readCachedWorkbook(WB_KEY);
       const loaded = cached || await fetchWorkbookForKey(WB_KEY);
       usedFastCache = !!cached;
-      activateWorkbook(loaded, WB_KEY);
+      activateWorkbook(loaded, WB_KEY, { deferRecalc: true });
     } catch (err) {
       const localBackup = localStorage.getItem(BACKUP_KEY);
       if (localBackup) {
@@ -348,7 +365,7 @@
       void fetchWorkbookForKey(key).then(fresh => {
         if (WB_KEY !== key || dirtySheets.size) return;
         rememberSyncedWorkbook(key, fresh);
-        activateWorkbook(fresh, key);
+        activateWorkbook(fresh, key, { deferRecalc: true });
       }).catch(() => {});
     }
 
