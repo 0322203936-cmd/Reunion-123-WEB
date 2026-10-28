@@ -210,6 +210,20 @@
     return ready;
   }
 
+  // Paint the two operational Reunion tabs immediately. This is only a visual
+  // loading shell: it never writes to Neon and is replaced as soon as the
+  // workbook index and the requested sheet arrive from the database.
+  function bootstrapWorkbookForKey(key) {
+    if (key !== 'reunion') return null;
+    const placeholder = () => ({ maxRow: 2, maxCol: 2, cells: {} });
+    return {
+      workbookName: 'Reunion 123',
+      activeSheet: 'Reunion',
+      sheetOrder: ['Reunion', 'PegarData'],
+      sheets: { Reunion: placeholder(), PegarData: placeholder() }
+    };
+  }
+
   // PegarData is hidden in the source Excel because it is an import sheet.
   // In the web system it is the audit view for the POSCO import, so it must
   // be available as a normal tab. Other hidden/veryHidden sheets stay hidden.
@@ -242,7 +256,7 @@
     setWorkbookKey(key);
     workbook = workbookReady(nextWorkbook, key);
     workbookCache.set(WB_KEY, workbook);
-    if (!syncedSheetSnapshots.has(WB_KEY)) rememberSyncedWorkbook(WB_KEY, workbook);
+    if (!options.bootstrap && !syncedSheetSnapshots.has(WB_KEY)) rememberSyncedWorkbook(WB_KEY, workbook);
     if (workbook.workbookName) document.title = workbook.workbookName;
 
     const statusInfo = document.getElementById('statusFormulaInfo');
@@ -360,6 +374,8 @@
 
   async function init() {
     clearLegacyBrowserWorkbookCache();
+    const bootstrap = bootstrapWorkbookForKey(WB_KEY);
+    if (bootstrap) activateWorkbook(bootstrap, WB_KEY, { deferRecalc: true, bootstrap: true });
     try {
       const loaded = await fetchWorkbookForKey(WB_KEY);
       activateWorkbook(loaded, WB_KEY, { deferRecalc: true });

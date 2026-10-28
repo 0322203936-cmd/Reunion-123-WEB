@@ -41,7 +41,15 @@ async function loadWorkbookIndex(sql, book) {
   const p = BOOKS[book].prefix;
   const [meta, sheets] = await Promise.all([
     sql.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`),
-    sql.query(`SELECT name, data FROM ${p}_workbook_sheets`)
+    // The workbook index is used only to paint the sheet tabs. Returning each
+    // sheet's cells, styles, and row/column definitions here made the first
+    // screen wait for a multi-megabyte response. The full definition is read
+    // only by /api/sheet when that sheet is actually needed.
+    sql.query(`SELECT name, jsonb_strip_nulls(jsonb_build_object(
+      'hidden', data->'hidden',
+      'maxRow', data->'maxRow',
+      'maxCol', data->'maxCol'
+    )) AS data FROM ${p}_workbook_sheets`)
   ]);
   return mergeWorkbook(rowsOf(meta), rowsOf(sheets), []);
 }
