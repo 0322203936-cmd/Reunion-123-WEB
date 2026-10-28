@@ -83,6 +83,8 @@ let pool = null;
 let persistenceReady = !DATABASE_URL;
 const caches = {}; // wbKey -> full workbook kept in memory; PATCH merges into it
 const gzCache = {}; // wbKey -> gzipped JSON of the cached workbook (dropped on every change)
+const gzPending = {};
+const workbookGeneration = {};
 let actualizarDataRunning = false;
 let actualizarInventarioRunning = false;
 const actualizarDataState = {
@@ -116,8 +118,32 @@ function publicActualizarInventarioState() {
 function resetWorkbookCaches() {
   for (const key of Object.keys(WORKBOOKS)) {
     delete caches[key];
-    delete gzCache[key];
+    invalidateGzip(key);
   }
+}
+
+function invalidateGzip(key) {
+  delete gzCache[key];
+  workbookGeneration[key] = (workbookGeneration[key] || 0) + 1;
+}
+
+async function compressedWorkbook(key, workbook) {
+  if (gzCache[key]) return gzCache[key];
+  const generation = workbookGeneration[key] || 0;
+  if (!gzPending[key] || gzPending[key].generation !== generation) {
+    const json = JSON.stringify(workbook);
+    const promise = new Promise((resolve, reject) => {
+      // Level 1 is intentionally used here: the response is only slightly
+      // larger, while the free Render instance spends far less CPU after an edit.
+      zlib.gzip(json, { level: 1 }, (error, data) => error ? reject(error) : resolve(data));
+    });
+    gzPending[key] = { generation, promise };
+  }
+  const entry = gzPending[key];
+  const data = await entry.promise;
+  if ((workbookGeneration[key] || 0) === entry.generation) gzCache[key] = data;
+  if (gzPending[key] === entry) delete gzPending[key];
+  return data;
 }
 
 function stateForOperation(operation) {
@@ -252,7 +278,7 @@ async function runActualizarDataInBackground() {
     const currentWorkbook = await loadWorkbook('reunion');
     const result = await runActualizarData(currentWorkbook);
     await saveWholeWorkbook('reunion', result.workbook);
-    delete gzCache.reunion;
+    invalidateGzip('reunion');
     scheduleCorSync();
     actualizarDataState.status = 'succeeded';
     actualizarDataState.finishedAt = new Date().toISOString();
@@ -283,7 +309,7 @@ async function runActualizarInventarioInBackground() {
     // the day the inventory was taken: its week (Sat..Fri) is the week the stock counts in Requerimiento Vs Proyeccion
     if (result.workbook.sheets && result.workbook.sheets.Inventario) result.workbook.sheets.Inventario.updatedAt = new Date().toISOString();
     await saveWholeWorkbook('reunion', result.workbook);
-    delete gzCache.reunion;
+    invalidateGzip('reunion');
     scheduleCorSync();
     actualizarInventarioState.status = 'succeeded';
     actualizarInventarioState.finishedAt = new Date().toISOString();
@@ -444,14 +470,14 @@ function persistFileSoon(key) {
 
 async function saveWholeWorkbook(key, workbook) {
   caches[key] = workbook;
-  delete gzCache[key];
+  invalidateGzip(key);
   if (!pool) return persistFileSoon(key);
   await writeWholeWorkbookToDb(key, workbook);
 }
 
 async function patchWorkbook(key, patch) {
   const workbook = await loadWorkbook(key);
-  delete gzCache[key];
+  invalidateGzip(key);
   const meta = patch.meta || {};
   for (const k of ['workbookName', 'sheetOrder', 'tables', 'activeSheet', 'pivots']) {
     if (meta[k] !== undefined) workbook[k] = meta[k];
@@ -674,9 +700,9 @@ async function handleRequest(req, res) {
   if (pathname === '/api/workbook' && req.method === 'GET') {
     const workbook = await loadWorkbook(key);
     if (String(req.headers['accept-encoding'] || '').includes('gzip')) {
-      if (!gzCache[key]) gzCache[key] = zlib.gzipSync(JSON.stringify(workbook), { level: 6 });
+      const compressed = await compressedWorkbook(key, workbook);
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-store' });
-      return res.end(gzCache[key]);
+      return res.end(compressed);
     }
     return sendJson(res, 200, workbook);
   }
