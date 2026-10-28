@@ -36,7 +36,7 @@ async function saveCells(client, table, rows) {
   }
 }
 
-async function loadWorkbook(pool, prefix = WORKBOOK_PREFIX) {
+async function loadWorkbook(pool, targetSheet, prefix = WORKBOOK_PREFIX) {
   const [metaResult, sheetsResult] = await Promise.all([
     pool.query(`SELECT meta FROM ${prefix}_workbook_meta WHERE id = 1`),
     pool.query(`SELECT name, data FROM ${prefix}_workbook_sheets`)
@@ -44,6 +44,17 @@ async function loadWorkbook(pool, prefix = WORKBOOK_PREFIX) {
   if (!metaResult.rows[0]) throw new Error(`No existe la configuración de ${prefix} en Neon.`);
   const sheets = {};
   for (const row of sheetsResult.rows) sheets[row.name] = row.data;
+  if (targetSheet) {
+    const cellsResult = await pool.query(
+      `SELECT jsonb_object_agg(coord, cell) AS cells
+       FROM ${prefix}_workbook_cells WHERE sheet_name = $1`,
+      [targetSheet]
+    );
+    sheets[targetSheet] = {
+      ...(sheets[targetSheet] || {}),
+      cells: cellsResult.rows[0]?.cells || {}
+    };
+  }
   return { ...metaResult.rows[0].meta, sheets };
 }
 
@@ -115,11 +126,11 @@ async function run() {
     connectionTimeoutMillis: 15000
   });
   try {
-    const reunion = await loadWorkbook(pool);
+    const targetSheet = OPERATION === 'data' ? 'PegarData' : 'Inventario';
+    const reunion = await loadWorkbook(pool, targetSheet);
     const result = OPERATION === 'data'
       ? await runActualizarData(reunion)
       : await runActualizarInventario(reunion);
-    const targetSheet = OPERATION === 'data' ? 'PegarData' : 'Inventario';
     await saveWorkbookSheets(pool, result.workbook, [targetSheet]);
     await notifyRender({
       operation: OPERATION,
