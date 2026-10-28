@@ -195,13 +195,23 @@
     // Neon is the only source of truth in the deployed app. Do not silently
     // replace a failed database response with a bundled JSON snapshot: that
     // made the interface look healthy while showing stale data.
-    const response = await fetchWithTimeout(`/api/workbook?wb=${key}`, { cache: 'no-store' });
-    if (!response.ok) {
-      const detail = await response.text().catch(() => '');
-      throw new Error(`No se pudo cargar ${key} desde Neon (${response.status}${detail ? `: ${detail.slice(0, 160)}` : ''})`);
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetchWithTimeout(`/api/workbook?wb=${key}`, { cache: 'no-store' });
+        if (response.ok) return await response.json();
+        const detail = await response.text().catch(() => '');
+        lastError = new Error(`No se pudo cargar ${key} desde Neon (${response.status}${detail ? `: ${detail.slice(0, 160)}` : ''})`);
+        // Cloudflare can return a transient 502/503/504 while the large
+        // workbook response is being assembled. Retry Neon, never a snapshot.
+        if (![502, 503, 504].includes(response.status)) break;
+      } catch (error) {
+        lastError = error;
+        if (attempt === 2) throw error;
+      }
+      await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
     }
-    const nextWorkbook = await response.json();
-    return nextWorkbook;
+    throw lastError || new Error(`No se pudo cargar ${key} desde Neon`);
   }
 
   function workbookReady(nextWorkbook, key) {
@@ -598,9 +608,7 @@
   }
 
   async function reloadWorkbookAfterActualizarData() {
-    const workbookResponse = await fetchWithTimeout(`/api/workbook${API_Q}`, { cache: 'no-store' });
-    if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
-    workbook = await workbookResponse.json();
+    workbook = await fetchWorkbookForKey(WB_KEY);
     workbookCache.set(WB_KEY, workbook);
     rememberSyncedWorkbook(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
@@ -678,9 +686,7 @@
   }
 
   async function reloadWorkbookAfterActualizarInventario() {
-    const workbookResponse = await fetchWithTimeout(`/api/workbook${API_Q}`, { cache: 'no-store' });
-    if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro con el inventario actualizado.');
-    workbook = await workbookResponse.json();
+    workbook = await fetchWorkbookForKey(WB_KEY);
     workbookCache.set(WB_KEY, workbook);
     rememberSyncedWorkbook(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
