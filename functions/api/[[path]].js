@@ -63,17 +63,28 @@ async function saveWhole(sql, book, workbook) {
   await sql.query(`INSERT INTO ${p}_workbook_meta (id, meta) VALUES (1, $1::jsonb) ON CONFLICT (id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()`, [JSON.stringify(meta)]);
 }
 async function ensureRuns(sql) {
-  await sql.query(`CREATE TABLE IF NOT EXISTS reunion123_posco_runs (
-    operation TEXT PRIMARY KEY,
-    status TEXT NOT NULL,
-    started_at TIMESTAMPTZ,
-    finished_at TIMESTAMPTZ,
-    rows INTEGER,
-    last_row INTEGER,
-    range TEXT,
-    date_range JSONB,
-    error TEXT
-  )`);
+  // Cloudflare can receive two requests at the same time (for example, a
+  // status poll while a button starts a run). PostgreSQL creates an internal
+  // row type for a table; concurrent CREATE TABLE IF NOT EXISTS calls can
+  // therefore collide on pg_type_typname_nsp_index. Keep initialization
+  // idempotent and swallow only that expected race.
+  try {
+    await sql.query(`CREATE TABLE IF NOT EXISTS reunion123_posco_runs (
+      operation TEXT PRIMARY KEY,
+      status TEXT NOT NULL,
+      started_at TIMESTAMPTZ,
+      finished_at TIMESTAMPTZ,
+      rows INTEGER,
+      last_row INTEGER,
+      range TEXT,
+      date_range JSONB,
+      error TEXT
+    )`);
+  } catch (error) {
+    const message = String(error?.message || error);
+    const isConcurrentCreate = /pg_type_typname_nsp_index|duplicate key value|already exists|duplicate table/i.test(message);
+    if (!isConcurrentCreate) throw error;
+  }
 }
 async function readRun(sql, operation) {
   await ensureRuns(sql);
