@@ -457,10 +457,13 @@ async function patchWorkbook(key, patch) {
   }
   for (const name of deleted) delete workbook.sheets[name];
 
-  // Keep a local snapshot as an immediate recovery path if Neon is slow or
-  // temporarily unavailable on the next page load.
-  persistFileSoon(key);
-  if (!pool) return;
+  // In local mode the snapshot is the persistence layer. When Neon is active,
+  // do not stringify/write the entire workbook on every cell edit; that can
+  // block the event loop and make the next reload appear stuck.
+  if (!pool) {
+    persistFileSoon(key);
+    return;
+  }
 
   const p = cfg(key).prefix;
   const client = await pool.connect();
@@ -496,6 +499,9 @@ async function patchWorkbook(key, patch) {
     await client.query('COMMIT');
   } catch (error) {
     await client.query('ROLLBACK');
+    // Keep a recovery snapshot only when Neon fails, so a transient database
+    // problem does not discard the user's latest local state.
+    persistFileSoon(key);
     throw error;
   } finally {
     client.release();
