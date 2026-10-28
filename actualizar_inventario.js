@@ -3,6 +3,7 @@ const os = require('os');
 const path = require('path');
 const XLSX = require('xlsx');
 const { chromium } = require('playwright');
+const packagedChromium = require('@sparticuz/chromium');
 
 const POSCO_URL = 'http://3.132.9.174/Posco/';
 const SHEET_NAME = 'Inventario';
@@ -27,11 +28,15 @@ async function launchBrowser() {
   const headless = String(process.env.POSCO_HEADLESS || 'true').trim().toLowerCase() !== 'false';
   const executablePath = String(process.env.POSCO_BROWSER_EXECUTABLE_PATH || '').trim();
   // Render does not provide Microsoft Edge. Leave the channel empty there so
-  // Playwright uses its bundled Chromium; local .env can still opt into Edge.
+  // Use the packaged Chromium on Render; local .env can still opt into Edge.
   const channel = String(process.env.POSCO_BROWSER_CHANNEL || '').trim();
   const options = { headless };
   if (executablePath) options.executablePath = executablePath;
   else if (channel) options.channel = channel;
+  else {
+    options.args = packagedChromium.args;
+    options.executablePath = await packagedChromium.executablePath();
+  }
 
   try {
     return await chromium.launch(options);
