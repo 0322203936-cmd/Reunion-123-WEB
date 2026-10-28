@@ -25,9 +25,17 @@ async function loadWorkbook(sql, book) {
   const [meta, sheets, cells] = await Promise.all([
     sql.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`),
     sql.query(`SELECT name, data FROM ${p}_workbook_sheets`),
-    sql.query(`SELECT sheet_name, coord, cell FROM ${p}_workbook_cells`)
+    // Aggregate cells in PostgreSQL instead of sending one result row per
+    // cell to the Worker. The workbook stays Neon-backed, but the Worker does
+    // far less JSON merging and avoids intermittent 503s on large books.
+    sql.query(`SELECT sheet_name, jsonb_object_agg(coord, cell) AS cells FROM ${p}_workbook_cells GROUP BY sheet_name`)
   ]);
-  return mergeWorkbook(rowsOf(meta), rowsOf(sheets), rowsOf(cells));
+  const workbook = mergeWorkbook(rowsOf(meta), rowsOf(sheets), []);
+  for (const row of rowsOf(cells)) {
+    if (!workbook.sheets[row.sheet_name]) workbook.sheets[row.sheet_name] = { cells: {} };
+    workbook.sheets[row.sheet_name].cells = row.cells || {};
+  }
+  return workbook;
 }
 function splitWorkbook(workbook) { const { sheets = {}, ...meta } = workbook || {}; return { meta, sheets }; }
 function withoutCells(sheet) { if (!sheet || typeof sheet !== 'object') return sheet; const { cells, ...rest } = sheet; return rest; }
