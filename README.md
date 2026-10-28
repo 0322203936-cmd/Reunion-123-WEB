@@ -20,7 +20,7 @@ Para desarrollo local, copia `.env.example` como `.env` y agrega la cadena priva
 
 ## Despliegue en Render
 
-- Build command: `npm install`
+- Build command: `npm install && npx playwright install chromium`
 - Start command: `npm start`
 
 La aplicación usa la variable de entorno `PORT` que Render proporciona automáticamente.
@@ -41,7 +41,8 @@ Para habilitarlo localmente, copia `.env.example` a `.env` y completa:
 ```env
 POSCO_USER=usuario@email.com
 POSCO_PASSWORD=tu_contraseña
-POSCO_BROWSER_CHANNEL=msedge
+# Optional locally; Render uses bundled Chromium when this is omitted.
+# POSCO_BROWSER_CHANNEL=msedge
 ```
 
-Después inicia el sistema con `npm start` y usa el botón **Actualizar Data**. El navegador Edge debe estar instalado; también se puede indicar una ruta directa con `POSCO_BROWSER_EXECUTABLE_PATH`.
+Después inicia el sistema con `npm start` y usa el botón **Actualizar Data**. En Render, el build instala Chromium automáticamente; localmente se puede usar Edge con `POSCO_BROWSER_CHANNEL=msedge` o indicar una ruta directa con `POSCO_BROWSER_EXECUTABLE_PATH`.

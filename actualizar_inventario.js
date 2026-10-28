@@ -26,7 +26,9 @@ function cleanValue(value) {
 async function launchBrowser() {
   const headless = String(process.env.POSCO_HEADLESS || 'true').trim().toLowerCase() !== 'false';
   const executablePath = String(process.env.POSCO_BROWSER_EXECUTABLE_PATH || '').trim();
-  const channel = String(process.env.POSCO_BROWSER_CHANNEL || 'msedge').trim();
+  // Render does not provide Microsoft Edge. Leave the channel empty there so
+  // Playwright uses its bundled Chromium; local .env can still opt into Edge.
+  const channel = String(process.env.POSCO_BROWSER_CHANNEL || '').trim();
   const options = { headless };
   if (executablePath) options.executablePath = executablePath;
   else if (channel) options.channel = channel;
