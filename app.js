@@ -643,6 +643,11 @@
 
   async function reloadWorkbookAfterActualizarData() {
     workbook = await fetchWorkbookForKey(WB_KEY);
+    // fetchWorkbookForKey loads only the initial/active sheet for a fast
+    // first paint. After POSCO finishes, explicitly load the sheet that was
+    // replaced; otherwise we would switch the UI to PegarData while it still
+    // contains metadata only and appears completely blank.
+    workbook.sheets.PegarData = await loadSheetFromNeon(WB_KEY, 'PegarData');
     workbookCache.set(WB_KEY, workbook);
     rememberSyncedWorkbook(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
@@ -721,6 +726,9 @@
 
   async function reloadWorkbookAfterActualizarInventario() {
     workbook = await fetchWorkbookForKey(WB_KEY);
+    // Keep the same lazy-loading contract used by the initial workbook load,
+    // but hydrate Inventario before making it the visible sheet.
+    workbook.sheets.Inventario = await loadSheetFromNeon(WB_KEY, 'Inventario');
     workbookCache.set(WB_KEY, workbook);
     rememberSyncedWorkbook(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
