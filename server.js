@@ -363,6 +363,57 @@ function splitWorkbook(workbook) {
   return { meta, sheets };
 }
 
+function sheetWithoutCells(sheet) {
+  if (!sheet || typeof sheet !== 'object') return sheet;
+  const { cells, ...structure } = sheet;
+  return structure;
+}
+
+function sheetCellRows(sheetName, sheet) {
+  return Object.entries((sheet && sheet.cells) || {}).map(([coord, cell]) => ({
+    sheet_name: sheetName,
+    coord,
+    cell
+  }));
+}
+
+async function insertCellRows(client, table, rows) {
+  for (let start = 0; start < rows.length; start += 2000) {
+    const batch = rows.slice(start, start + 2000);
+    if (!batch.length) continue;
+    await client.query(
+      `INSERT INTO ${table} (sheet_name, coord, cell)
+       SELECT sheet_name, coord, cell
+       FROM jsonb_to_recordset($1::jsonb) AS x(sheet_name text, coord text, cell jsonb)
+       ON CONFLICT (sheet_name, coord) DO UPDATE SET cell = EXCLUDED.cell, updated_at = NOW()`,
+      [JSON.stringify(batch)]
+    );
+  }
+}
+
+async function migrateWorkbookCells(key) {
+  const p = cfg(key).prefix;
+  const marker = `${p}_workbook_migrations`;
+  const done = await pool.query(`SELECT 1 FROM ${marker} WHERE name = 'cells-v1'`);
+  if (done.rowCount) return;
+
+  const sheetRes = await pool.query(`SELECT name, data FROM ${p}_workbook_sheets`);
+  const rows = [];
+  for (const row of sheetRes.rows) rows.push(...sheetCellRows(row.name, row.data));
+  const client = await pool.connect();
+  try {
+    await client.query('BEGIN');
+    await client.query(`DELETE FROM ${p}_workbook_cells`);
+    await insertCellRows(client, `${p}_workbook_cells`, rows);
+    await client.query(`INSERT INTO ${marker} (name) VALUES ('cells-v1') ON CONFLICT (name) DO NOTHING`);
+    await client.query('COMMIT');
+    console.log(` Migración Neon ${key}: ${rows.length} celdas.`);
+  } catch (error) {
+    await client.query('ROLLBACK');
+    throw error;
+  } finally { client.release(); }
+}
+
 // ---------------------------------------------------------------- database
 async function initDatabase() {
   if (!DATABASE_URL) return;
@@ -393,6 +444,19 @@ async function initDatabase() {
         updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
       );
 
+      CREATE TABLE IF NOT EXISTS ${p}_workbook_cells (
+        sheet_name TEXT NOT NULL,
+        coord TEXT NOT NULL,
+        cell JSONB NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+        PRIMARY KEY (sheet_name, coord)
+      );
+
+      CREATE TABLE IF NOT EXISTS ${p}_workbook_migrations (
+        name TEXT PRIMARY KEY,
+        completed_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      );
+
       CREATE TABLE IF NOT EXISTS ${p}_homologations (
         id SMALLINT PRIMARY KEY CHECK (id = 1),
         state JSONB NOT NULL,
@@ -404,6 +468,7 @@ async function initDatabase() {
     if (existing.rowCount === 0) {
       await writeWholeWorkbookToDb(key, readJson(cfg(key).state, initialWorkbook(key)));
     }
+    await migrateWorkbookCells(key);
     await pool.query(
       `INSERT INTO ${p}_homologations (id, state) VALUES (1, $1::jsonb) ON CONFLICT (id) DO NOTHING`,
       [JSON.stringify(initialHomologations(key))]
@@ -420,12 +485,16 @@ async function writeWholeWorkbookToDb(key, workbook) {
   try {
     await client.query('BEGIN');
     await client.query(`DELETE FROM ${p}_workbook_sheets`);
+    await client.query(`DELETE FROM ${p}_workbook_cells`);
     for (const [name, data] of Object.entries(sheets)) {
       await client.query(
         `INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)`,
-        [name, JSON.stringify(data)]
+        [name, JSON.stringify(sheetWithoutCells(data))]
       );
     }
+    const cellRows = [];
+    for (const [name, data] of Object.entries(sheets)) cellRows.push(...sheetCellRows(name, data));
+    await insertCellRows(client, `${p}_workbook_cells`, cellRows);
     await client.query(
       `INSERT INTO ${p}_workbook_meta (id, meta) VALUES (1, $1::jsonb)
        ON CONFLICT (id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()`,
@@ -452,9 +521,14 @@ async function loadWorkbook(key) {
   try {
     const metaRes = await pool.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`);
     const sheetRes = await pool.query(`SELECT name, data FROM ${p}_workbook_sheets`);
+    const cellRes = await pool.query(`SELECT sheet_name, coord, cell FROM ${p}_workbook_cells`);
     const meta = metaRes.rows[0]?.meta || splitWorkbook(initialWorkbook(key)).meta;
     const sheets = {};
-    for (const row of sheetRes.rows) sheets[row.name] = row.data;
+    for (const row of sheetRes.rows) sheets[row.name] = { ...row.data, cells: {} };
+    for (const row of cellRes.rows) {
+      if (!sheets[row.sheet_name]) sheets[row.sheet_name] = { cells: {} };
+      sheets[row.sheet_name].cells[row.coord] = row.cell;
+    }
     caches[key] = { ...meta, sheets };
     return caches[key];
   } catch (error) {
@@ -527,28 +601,28 @@ async function patchWorkbook(key, patch) {
       await client.query(
         `INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)
          ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [name, JSON.stringify(data)]
+        [name, JSON.stringify(sheetWithoutCells(data))]
       );
+      await client.query(`DELETE FROM ${p}_workbook_cells WHERE sheet_name = $1`, [name]);
+      await insertCellRows(client, `${p}_workbook_cells`, sheetCellRows(name, data));
     }
-    // Apply individual cells directly inside the sheet JSONB. This keeps a
-    // one-cell edit from serializing and uploading a 10-20 MB sheet.
+    // Apply individual cells directly to Neon rows. A one-cell edit no longer
+    // serializes or rewrites an entire sheet JSON document.
     for (const [name, cellPatch] of Object.entries(cellPatches)) {
       if (!workbook.sheets[name] || changed[name]) continue;
       const set = cellPatch && cellPatch.set && typeof cellPatch.set === 'object'
         ? cellPatch.set : {};
       for (const [coord, cell] of Object.entries(set)) {
         await client.query(
-          `UPDATE ${p}_workbook_sheets
-           SET data = jsonb_set(data, ARRAY['cells', $2]::text[], $3::jsonb, true), updated_at = NOW()
-           WHERE name = $1`,
+          `INSERT INTO ${p}_workbook_cells (sheet_name, coord, cell)
+           VALUES ($1, $2, $3::jsonb)
+           ON CONFLICT (sheet_name, coord) DO UPDATE SET cell = EXCLUDED.cell, updated_at = NOW()`,
           [name, coord, JSON.stringify(cell)]
         );
       }
       for (const coord of (Array.isArray(cellPatch && cellPatch.delete) ? cellPatch.delete : [])) {
         await client.query(
-          `UPDATE ${p}_workbook_sheets
-           SET data = data #- ARRAY['cells', $2]::text[], updated_at = NOW()
-           WHERE name = $1`,
+          `DELETE FROM ${p}_workbook_cells WHERE sheet_name = $1 AND coord = $2`,
           [name, coord]
         );
       }
