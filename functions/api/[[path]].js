@@ -41,7 +41,13 @@ function splitWorkbook(workbook) { const { sheets = {}, ...meta } = workbook || 
 function withoutCells(sheet) { if (!sheet || typeof sheet !== 'object') return sheet; const { cells, ...rest } = sheet; return rest; }
 function cellRows(sheetName, sheet) { return Object.entries((sheet && sheet.cells) || {}).map(([coord, cell]) => ({ sheet_name: sheetName, coord, cell })); }
 async function upsertCells(sql, table, rows) {
-  for (const row of rows) await sql.query(`INSERT INTO ${table} (sheet_name, coord, cell) VALUES ($1, $2, $3::jsonb) ON CONFLICT (sheet_name, coord) DO UPDATE SET cell = EXCLUDED.cell, updated_at = NOW()`, [row.sheet_name, row.coord, JSON.stringify(row.cell)]);
+  for (let i = 0; i < rows.length; i += 1000) {
+    const batch = rows.slice(i, i + 1000);
+    await sql.query(`INSERT INTO ${table} (sheet_name, coord, cell)
+      SELECT sheet_name, coord, cell
+      FROM jsonb_to_recordset($1::jsonb) AS x(sheet_name text, coord text, cell jsonb)
+      ON CONFLICT (sheet_name, coord) DO UPDATE SET cell = EXCLUDED.cell, updated_at = NOW()`, [JSON.stringify(batch)]);
+  }
 }
 async function savePatch(sql, book, patch) {
   const p = BOOKS[book].prefix;
