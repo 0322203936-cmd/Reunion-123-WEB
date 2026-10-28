@@ -1,0 +1,43 @@
+name: POSCO updates
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: Proceso POSCO que se ejecutará
+        required: true
+        type: choice
+        options:
+          - data
+          - inventario
+  repository_dispatch:
+    types: [posco-update]
+
+permissions:
+  contents: read
+
+jobs:
+  update:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      DATABASE_URL: ${{ secrets.DATABASE_URL }}
+      POSCO_USER: ${{ secrets.POSCO_USER }}
+      POSCO_PASSWORD: ${{ secrets.POSCO_PASSWORD }}
+      POSCO_HEADLESS: 'true'
+      REUNION_CALLBACK_URL: ${{ secrets.REUNION_CALLBACK_URL }}
+      REUNION_SYNC_TOKEN: ${{ secrets.REUNION_SYNC_TOKEN }}
+    steps:
+      - name: Descargar repositorio
+        uses: actions/checkout@v4
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - name: Instalar dependencias
+        run: npm ci
+      - name: Ejecutar proceso POSCO
+        env:
+          OPERATION: ${{ github.event.inputs.operation || github.event.client_payload.operation || 'data' }}
+        run: node github_actions_runner.js "$OPERATION"

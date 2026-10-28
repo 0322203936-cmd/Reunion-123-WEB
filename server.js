@@ -33,6 +33,9 @@ const PORT = Number(process.env.PORT || 3070);
 const ROOT_DIR = __dirname;
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const DATABASE_URL = process.env.DATABASE_URL;
+const GITHUB_ACTIONS_TOKEN = String(process.env.GITHUB_ACTIONS_TOKEN || '').trim();
+const GITHUB_REPOSITORY = String(process.env.GITHUB_REPOSITORY || '0322203936-cmd/Reunion-123-WEB').trim();
+const REUNION_SYNC_TOKEN = String(process.env.REUNION_SYNC_TOKEN || '').trim();
 
 // Each workbook ("apartado") has its own files and its own database tables.
 // "reunion" keeps exactly the files/tables it always used.
@@ -104,6 +107,57 @@ function publicActualizarDataState() {
 
 function publicActualizarInventarioState() {
   return { ...actualizarInventarioState, ok: actualizarInventarioState.status === 'succeeded' };
+}
+
+function resetWorkbookCaches() {
+  for (const key of Object.keys(WORKBOOKS)) {
+    delete caches[key];
+    delete gzCache[key];
+  }
+}
+
+function stateForOperation(operation) {
+  return operation === 'inventario' ? actualizarInventarioState : actualizarDataState;
+}
+
+async function dispatchGitHubPosco(operation) {
+  if (!GITHUB_ACTIONS_TOKEN) return false;
+  const response = await fetch(`https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches`, {
+    method: 'POST',
+    headers: {
+      Accept: 'application/vnd.github+json',
+      Authorization: `Bearer ${GITHUB_ACTIONS_TOKEN}`,
+      'X-GitHub-Api-Version': '2022-11-28',
+      'User-Agent': 'reunion-123'
+    },
+    body: JSON.stringify({ event_type: 'posco-update', client_payload: { operation } })
+  });
+  if (!response.ok) throw new Error(`GitHub rechazó el workflow (HTTP ${response.status}).`);
+  return true;
+}
+
+async function receiveGitHubPoscoCallback(payload) {
+  const operation = String(payload?.operation || '').trim().toLowerCase();
+  if (!['data', 'inventario'].includes(operation)) throw new Error('Operación POSCO inválida.');
+  const state = stateForOperation(operation);
+  if (payload.status === 'succeeded') {
+    // GitHub Actions escribió Neon desde fuera del proceso de Render.
+    // Se limpian las cachés para que las pestañas reciban esos datos.
+    resetWorkbookCaches();
+    await syncCor();
+    state.status = 'succeeded';
+    state.rows = Number.isFinite(Number(payload.rows)) ? Number(payload.rows) : null;
+    state.lastRow = Number.isFinite(Number(payload.lastRow)) ? Number(payload.lastRow) : null;
+    state.range = payload.range || null;
+    state.dateRange = payload.dateRange || null;
+    state.error = null;
+  } else {
+    state.status = 'failed';
+    state.error = payload.error || 'GitHub Actions no pudo completar el proceso POSCO.';
+  }
+  state.finishedAt = new Date().toISOString();
+  if (operation === 'inventario') actualizarInventarioRunning = false;
+  else actualizarDataRunning = false;
 }
 
 // ---------------------------------------------------------------- Plan de cosecha -> Cor de Reunion (real time)
@@ -461,6 +515,20 @@ async function handleRequest(req, res) {
   const wbParam = urlObj.searchParams.get('wb');
   const key = WORKBOOKS[wbParam] ? wbParam : DEFAULT_WB;
 
+  if (pathname === '/api/posco-callback' && req.method === 'POST') {
+    if (!REUNION_SYNC_TOKEN || req.headers.authorization !== `Bearer ${REUNION_SYNC_TOKEN}`) {
+      return sendJson(res, 401, { error: 'Callback no autorizado.' });
+    }
+    try {
+      const payload = JSON.parse(await readRequestBody(req, 1024 * 1024));
+      await receiveGitHubPoscoCallback(payload);
+      return sendJson(res, 200, { ok: true });
+    } catch (error) {
+      console.error('Callback POSCO falló:', error);
+      return sendJson(res, 400, { error: error.message || 'Callback inválido.' });
+    }
+  }
+
   if (pathname === '/api/workbooks' && req.method === 'GET') {
     return sendJson(res, 200, Object.entries(WORKBOOKS).map(([k, c]) => ({ key: k, name: c.name })));
   }
@@ -481,6 +549,18 @@ async function handleRequest(req, res) {
       dateRange: null,
       error: null
     });
+    if (GITHUB_ACTIONS_TOKEN) {
+      try {
+        await dispatchGitHubPosco('data');
+      } catch (error) {
+        actualizarDataRunning = false;
+        actualizarDataState.status = 'failed';
+        actualizarDataState.finishedAt = new Date().toISOString();
+        actualizarDataState.error = error.message;
+        return sendJson(res, 502, publicActualizarDataState());
+      }
+      return sendJson(res, 202, publicActualizarDataState());
+    }
     void runActualizarDataInBackground();
     return sendJson(res, 202, publicActualizarDataState());
   }
@@ -499,6 +579,18 @@ async function handleRequest(req, res) {
       lastRow: null,
       error: null
     });
+    if (GITHUB_ACTIONS_TOKEN) {
+      try {
+        await dispatchGitHubPosco('inventario');
+      } catch (error) {
+        actualizarInventarioRunning = false;
+        actualizarInventarioState.status = 'failed';
+        actualizarInventarioState.finishedAt = new Date().toISOString();
+        actualizarInventarioState.error = error.message;
+        return sendJson(res, 502, publicActualizarInventarioState());
+      }
+      return sendJson(res, 202, publicActualizarInventarioState());
+    }
     void runActualizarInventarioInBackground();
     return sendJson(res, 202, publicActualizarInventarioState());
   }
