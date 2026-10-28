@@ -37,6 +37,24 @@ async function loadWorkbook(sql, book) {
   }
   return workbook;
 }
+async function loadWorkbookIndex(sql, book) {
+  const p = BOOKS[book].prefix;
+  const [meta, sheets] = await Promise.all([
+    sql.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`),
+    sql.query(`SELECT name, data FROM ${p}_workbook_sheets`)
+  ]);
+  return mergeWorkbook(rowsOf(meta), rowsOf(sheets), []);
+}
+async function loadSheet(sql, book, name) {
+  const p = BOOKS[book].prefix;
+  const [sheetResult, cellsResult] = await Promise.all([
+    sql.query(`SELECT name, data FROM ${p}_workbook_sheets WHERE name = $1`, [name]),
+    sql.query(`SELECT jsonb_object_agg(coord, cell) AS cells FROM ${p}_workbook_cells WHERE sheet_name = $1`, [name])
+  ]);
+  const sheetRow = rowsOf(sheetResult)[0];
+  if (!sheetRow) return null;
+  return { ...(sheetRow.data || {}), cells: rowsOf(cellsResult)[0]?.cells || {} };
+}
 function splitWorkbook(workbook) { const { sheets = {}, ...meta } = workbook || {}; return { meta, sheets }; }
 function withoutCells(sheet) { if (!sheet || typeof sheet !== 'object') return sheet; const { cells, ...rest } = sheet; return rest; }
 function cellRows(sheetName, sheet) { return Object.entries((sheet && sheet.cells) || {}).map(([coord, cell]) => ({ sheet_name: sheetName, coord, cell })); }
@@ -122,10 +140,12 @@ export async function onRequest(context) {
   try {
     const sql = db(env);
     if (pathname === '/api/workbooks' && request.method === 'GET') return json(Object.entries(BOOKS).map(([key, value]) => ({ key, name: value.name })));
-    if (pathname === '/api/workbook' && request.method === 'GET') return json(await loadWorkbook(sql, book));
+    if (pathname === '/api/workbook' && request.method === 'GET') {
+      return json(url.searchParams.get('index') === '1' ? await loadWorkbookIndex(sql, book) : await loadWorkbook(sql, book));
+    }
     if (pathname === '/api/workbook' && request.method === 'PATCH') { await savePatch(sql, book, await request.json()); return json({ ok: true }); }
     if (pathname === '/api/workbook' && request.method === 'POST') { const workbook = await request.json(); if (!workbook || typeof workbook !== 'object' || !workbook.sheets) return json({ error: 'JSON de libro inválido' }, 400); await saveWhole(sql, book, workbook); return json({ ok: true }); }
-    if (pathname === '/api/sheet' && request.method === 'GET') { const workbook = await loadWorkbook(sql, book); const sheet = workbook.sheets[url.searchParams.get('name') || '']; return sheet ? json(sheet) : json({ error: 'Hoja no encontrada' }, 404); }
+    if (pathname === '/api/sheet' && request.method === 'GET') { const sheet = await loadSheet(sql, book, url.searchParams.get('name') || ''); return sheet ? json(sheet) : json({ error: 'Hoja no encontrada' }, 404); }
     if (pathname === '/api/homologations' && request.method === 'GET') { const p = BOOKS[book].prefix; const result = rowsOf(await sql.query(`SELECT state FROM ${p}_homologations WHERE id = 1`)); return json(result[0]?.state || { version: 1, items: {} }); }
     if (pathname === '/api/homologations' && request.method === 'POST') { const p = BOOKS[book].prefix; await sql.query(`UPDATE ${p}_homologations SET state = $1::jsonb, updated_at = NOW() WHERE id = 1`, [JSON.stringify(await request.json())]); return json({ ok: true }); }
     if (pathname === '/api/actualizar-data' && (request.method === 'GET' || request.method === 'POST')) {

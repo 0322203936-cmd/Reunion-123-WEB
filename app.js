@@ -198,8 +198,19 @@
     let lastError = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       try {
-        const response = await fetchWithTimeout(`/api/workbook?wb=${key}`, { cache: 'no-store' });
-        if (response.ok) return await response.json();
+        const response = await fetchWithTimeout(`/api/workbook?wb=${key}&index=1`, { cache: 'no-store' });
+        if (response.ok) {
+          const index = await response.json();
+          const visible = (index.sheetOrder || Object.keys(index.sheets || {})).filter(name => !index.sheets?.[name]?.hidden);
+          const initialName = index.activeSheet && index.sheets?.[index.activeSheet] && !index.sheets[index.activeSheet].hidden
+            ? index.activeSheet : (visible[0] || Object.keys(index.sheets || {})[0]);
+          if (initialName) {
+            const sheetResponse = await fetchWithTimeout(`/api/sheet?wb=${key}&name=${encodeURIComponent(initialName)}`, { cache: 'no-store' });
+            if (!sheetResponse.ok) throw new Error(`No se pudo cargar la hoja ${initialName} desde Neon (${sheetResponse.status})`);
+            index.sheets[initialName] = await sheetResponse.json();
+          }
+          return index;
+        }
         const detail = await response.text().catch(() => '');
         lastError = new Error(`No se pudo cargar ${key} desde Neon (${response.status}${detail ? `: ${detail.slice(0, 160)}` : ''})`);
         // Cloudflare can return a transient 502/503/504 while the large
@@ -212,6 +223,12 @@
       await new Promise(resolve => setTimeout(resolve, 700 * (attempt + 1)));
     }
     throw lastError || new Error(`No se pudo cargar ${key} desde Neon`);
+  }
+
+  async function loadSheetFromNeon(key, sheetName) {
+    const response = await fetchWithTimeout(`/api/sheet?wb=${key}&name=${encodeURIComponent(sheetName)}`, { cache: 'no-store' });
+    if (!response.ok) throw new Error(`No se pudo cargar la hoja ${sheetName} desde Neon (${response.status})`);
+    return response.json();
   }
 
   function workbookReady(nextWorkbook, key) {
@@ -2939,8 +2956,23 @@
     showToast(`Auto-fill applied (${indexToCol(minC)}${minR}:${indexToCol(maxC)}${maxR})`);
   }
 
-  function switchSheet(sheetName) {
+  async function switchSheet(sheetName) {
     if (!workbook.sheets[sheetName]) return;
+    if (!Object.prototype.hasOwnProperty.call(workbook.sheets[sheetName], 'cells')) {
+      const requestedWorkbook = workbook;
+      const requestedKey = WB_KEY;
+      try {
+        const sheet = await loadSheetFromNeon(requestedKey, sheetName);
+        if (requestedWorkbook !== workbook || requestedKey !== WB_KEY) return;
+        workbook.sheets[sheetName] = sheet;
+        workbookCache.set(WB_KEY, workbook);
+        engine = new window.FormulaEngine(workbook);
+        engine.recalculateAll();
+      } catch (error) {
+        showToast(error.message || `No se pudo cargar ${sheetName}.`, true);
+        return;
+      }
+    }
     activeSheet = sheetName;
     renderSheetTabs();
     renderSheet();
