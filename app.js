@@ -172,8 +172,8 @@
         const response = await fetchWithTimeout(`/api/workbook?wb=${key}&index=1`, { cache: 'no-store' });
         if (response.ok) {
           const index = await response.json();
-          const visible = (index.sheetOrder || Object.keys(index.sheets || {})).filter(name => !index.sheets?.[name]?.hidden);
-          const initialName = index.activeSheet && index.sheets?.[index.activeSheet] && !index.sheets[index.activeSheet].hidden
+          const visible = (index.sheetOrder || Object.keys(index.sheets || {})).filter(name => isSheetVisible(name, index.sheets?.[name], key));
+          const initialName = index.activeSheet && index.sheets?.[index.activeSheet] && isSheetVisible(index.activeSheet, index.sheets[index.activeSheet], key)
             ? index.activeSheet : (visible[0] || Object.keys(index.sheets || {})[0]);
           if (initialName) {
             const sheetResponse = await fetchWithTimeout(`/api/sheet?wb=${key}&name=${encodeURIComponent(initialName)}`, { cache: 'no-store' });
@@ -210,6 +210,13 @@
     return ready;
   }
 
+  // PegarData is hidden in the source Excel because it is an import sheet.
+  // In the web system it is the audit view for the POSCO import, so it must
+  // be available as a normal tab. Other hidden/veryHidden sheets stay hidden.
+  function isSheetVisible(sheetName, sheet = workbook?.sheets?.[sheetName], key = WB_KEY) {
+    return Boolean(sheet) && (!sheet.hidden || (key === 'reunion' && sheetName === 'PegarData'));
+  }
+
   function prefetchWorkbook(key) {
     if (key === WB_KEY || workbookCache.has(key)) return Promise.resolve(workbookCache.get(key));
     if (workbookLoading.has(key)) return workbookLoading.get(key);
@@ -242,7 +249,7 @@
     if (statusInfo) statusInfo.textContent = `${workbook.workbookName || 'Reunion 123'} • Excel Engine Active`;
 
     const firstVisible = visibleSheets()[0] || workbook.sheetOrder[0] || 'Sheet1';
-    activeSheet = workbook.activeSheet && workbook.sheets[workbook.activeSheet] && !workbook.sheets[workbook.activeSheet].hidden
+    activeSheet = workbook.activeSheet && workbook.sheets[workbook.activeSheet] && isSheetVisible(workbook.activeSheet, workbook.sheets[workbook.activeSheet])
       ? workbook.activeSheet : firstVisible;
     const cachedEngine = workbookEngineCache.get(WB_KEY);
     engine = cachedEngine || new window.FormulaEngine(workbook);
@@ -279,7 +286,7 @@
 
   async function hydrateVisibleSheetIfEmpty(key, expectedWorkbook = workbook, expectedSheet = activeSheet) {
     const sheet = expectedWorkbook?.sheets?.[expectedSheet];
-    if (!sheet || sheet.hidden || Object.keys(sheet.cells || {}).length > 0) return;
+    if (!sheet || !isSheetVisible(expectedSheet, sheet, key) || Object.keys(sheet.cells || {}).length > 0) return;
     if ((sheet.maxRow || 0) <= 1 && (sheet.maxCol || 0) <= 1) return;
     try {
       const loaded = await loadSheetFromNeon(key, expectedSheet);
@@ -457,7 +464,7 @@
     redoStack.push(mirrorOf(prev));
     trimHistory(redoStack);
     restoreState(prev);
-    if (!workbook.sheets[activeSheet] || workbook.sheets[activeSheet].hidden) activeSheet = visibleSheets()[0];
+    if (!workbook.sheets[activeSheet] || !isSheetVisible(activeSheet, workbook.sheets[activeSheet])) activeSheet = visibleSheets()[0];
     engine = new window.FormulaEngine(workbook);
     engine.recalculateAll();
     updateUndoRedoButtons();
@@ -474,7 +481,7 @@
     undoStack.push(mirrorOf(next));
     trimHistory(undoStack);
     restoreState(next);
-    if (!workbook.sheets[activeSheet] || workbook.sheets[activeSheet].hidden) activeSheet = visibleSheets()[0];
+    if (!workbook.sheets[activeSheet] || !isSheetVisible(activeSheet, workbook.sheets[activeSheet])) activeSheet = visibleSheets()[0];
     engine = new window.FormulaEngine(workbook);
     engine.recalculateAll();
     updateUndoRedoButtons();
@@ -653,7 +660,7 @@
     workbookCache.set(WB_KEY, workbook);
     rememberSyncedWorkbook(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
-    activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
+    activeSheet = workbook.sheets.PegarData && isSheetVisible('PegarData', workbook.sheets.PegarData) ? 'PegarData' : activeSheet;
     engine = new window.FormulaEngine(workbook);
     engine.recalculateAll();
     renderSheetTabs();
@@ -919,7 +926,7 @@
 
   // Render Sheet Tabs
   function visibleSheets() {
-    return (workbook.sheetOrder || Object.keys(workbook.sheets)).filter(n => workbook.sheets[n] && !workbook.sheets[n].hidden);
+    return (workbook.sheetOrder || Object.keys(workbook.sheets)).filter(n => isSheetVisible(n, workbook.sheets[n]));
   }
 
   function renderSheetTabs() {
