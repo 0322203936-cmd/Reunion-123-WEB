@@ -1023,8 +1023,10 @@ async function start() {
   try {
     await initDatabase();
     persistenceReady = true;
-    // Do not delay the web service while the one-time cell migration runs.
-    void migrateAllWorkbookCellsInBackground();
+    // Cell migration is intentionally not started from the web process.
+    // The workbooks are large, and running it beside the live cache can exhaust
+    // Render's memory after an edit. The normalized tables remain available;
+    // migration is performed separately in a controlled job.
     await loadWorkbook(DEFAULT_WB);
     // Cor is initialized at startup, but Append does not need to be rebuilt
     // until a source workbook changes. Avoid competing with the first edits.
