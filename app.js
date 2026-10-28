@@ -312,12 +312,13 @@
     if ((sheet.maxRow || 0) <= 1 && (sheet.maxCol || 0) <= 1) return;
     try {
       const loaded = await loadSheetFromNeon(key, expectedSheet);
-      if (workbook !== expectedWorkbook || WB_KEY !== key || activeSheet !== expectedSheet) return;
-      expectedWorkbook.sheets[expectedSheet] = loaded;
-      workbookCache.set(key, expectedWorkbook);
-      rememberSyncedWorkbook(key, expectedWorkbook);
+      if (WB_KEY !== key || activeSheet !== expectedSheet) return;
+      const currentWorkbook = workbook;
+      currentWorkbook.sheets[expectedSheet] = loaded;
+      workbookCache.set(key, currentWorkbook);
+      rememberSyncedWorkbook(key, currentWorkbook);
       workbookEngineCache.delete(key);
-      engine = new window.FormulaEngine(expectedWorkbook);
+      engine = new window.FormulaEngine(currentWorkbook);
       engine.recalculateAll();
       renderSheetTabs();
       renderSheet();
@@ -3001,11 +3002,13 @@
     const cellsLoaded = Object.keys(sheetState.cells || {}).length > 0;
     const sheetNeedsCells = (sheetState.maxRow || 0) > 1 || (sheetState.maxCol || 0) > 1;
     if (!Object.prototype.hasOwnProperty.call(sheetState, 'cells') || (!cellsLoaded && sheetNeedsCells)) {
-      const requestedWorkbook = workbook;
       const requestedKey = WB_KEY;
       try {
         const sheet = await loadSheetFromNeon(requestedKey, sheetName);
-        if (requestedWorkbook !== workbook || requestedKey !== WB_KEY) return;
+        if (requestedKey !== WB_KEY || activeSheet !== sheetName) return;
+        // The workbook can be refreshed by the live event stream while the
+        // large sheet response is in flight. Apply the fresh Neon sheet to
+        // the current workbook instead of silently discarding it.
         workbook.sheets[sheetName] = sheet;
         workbookCache.set(WB_KEY, workbook);
         engine = new window.FormulaEngine(workbook);
