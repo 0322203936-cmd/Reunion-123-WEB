@@ -90,6 +90,21 @@
   const workbookCache = new Map();
   const workbookEngineCache = new Map();
   const workbookLoading = new Map();
+  // Last workbook state acknowledged by the server. This lets autosave send
+  // cell-level patches instead of serializing the entire sheet on every edit.
+  const syncedSheetSnapshots = new Map();
+
+  function cloneJson(value) {
+    return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
+  }
+
+  function rememberSyncedWorkbook(key, nextWorkbook) {
+    const snapshots = new Map();
+    for (const [name, sheet] of Object.entries(nextWorkbook?.sheets || {})) {
+      snapshots.set(name, cloneJson(sheet));
+    }
+    syncedSheetSnapshots.set(key, snapshots);
+  }
 
   function setWorkbookKey(key) {
     WB_KEY = VALID_WB_KEYS.includes(key) ? key : 'reunion';
@@ -103,8 +118,18 @@
     return 'data/initial_workbook.json';
   }
 
+  async function fetchWithTimeout(url, options = {}, timeoutMs = 15000) {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      return await fetch(url, { ...options, signal: controller.signal });
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   async function fetchWorkbookForKey(key) {
-    let response = await fetch(`/api/workbook?wb=${key}`, { cache: 'no-store' });
+    let response = await fetchWithTimeout(`/api/workbook?wb=${key}`, { cache: 'no-store' });
     if (!response.ok) {
       response = await fetch(initialWorkbookPath(key), { cache: 'force-cache' });
     }
@@ -132,6 +157,7 @@
         warmEngine.recalculateAll();
         workbookCache.set(key, ready);
         workbookEngineCache.set(key, warmEngine);
+        rememberSyncedWorkbook(key, ready);
         return ready;
       })
       .catch(() => null)
@@ -144,6 +170,7 @@
     setWorkbookKey(key);
     workbook = workbookReady(nextWorkbook, key);
     workbookCache.set(WB_KEY, workbook);
+    if (!syncedSheetSnapshots.has(WB_KEY)) rememberSyncedWorkbook(WB_KEY, workbook);
     if (workbook.workbookName) document.title = workbook.workbookName;
 
     const statusInfo = document.getElementById('statusFormulaInfo');
@@ -291,9 +318,36 @@
     showToast('Action redone (Ctrl+Y)');
   }
 
-  // Saving sends only the sheets that changed (PATCH); the server keeps the rest
+  // Saving sends only changed cells (PATCH); structural sheet changes fall back
+  // to sending that complete sheet for compatibility.
   const dirtySheets = new Set();
   function markSheetDirty(name) { if (name) dirtySheets.add(name); }
+
+  function buildSheetChange(current, previous) {
+    if (!current || !previous) return { full: cloneJson(current) };
+
+    const currentKeys = Object.keys(current);
+    const previousKeys = Object.keys(previous);
+    const structuralKeys = new Set([...currentKeys, ...previousKeys]);
+    structuralKeys.delete('cells');
+    for (const key of structuralKeys) {
+      if (JSON.stringify(current[key]) !== JSON.stringify(previous[key])) {
+        return { full: cloneJson(current) };
+      }
+    }
+
+    const set = {};
+    const deleted = [];
+    const currentCells = current.cells || {};
+    const previousCells = previous.cells || {};
+    for (const coord of new Set([...Object.keys(currentCells), ...Object.keys(previousCells)])) {
+      const now = currentCells[coord];
+      const before = previousCells[coord];
+      if (now === undefined) deleted.push(coord);
+      else if (before === undefined || JSON.stringify(now) !== JSON.stringify(before)) set[coord] = cloneJson(now);
+    }
+    return { cells: { set, delete: deleted } };
+  }
 
   let saveTimeout = null;
   let saving = Promise.resolve();
@@ -304,6 +358,7 @@
     dirtySheets.clear();
     const savedWorkbook = workbook;
     const savedWbKey = WB_KEY;
+    const baselines = syncedSheetSnapshots.get(savedWbKey) || new Map();
     const payload = {
       meta: {
         workbookName: savedWorkbook.workbookName,
@@ -313,20 +368,34 @@
         activeSheet
       },
       sheets: {},
+      cellPatches: {},
       deleted: []
     };
+    const snapshots = new Map();
     for (const n of names) {
-      if (savedWorkbook.sheets[n]) payload.sheets[n] = savedWorkbook.sheets[n];
-      else payload.deleted.push(n);
+      if (!savedWorkbook.sheets[n]) {
+        payload.deleted.push(n);
+        continue;
+      }
+      const current = savedWorkbook.sheets[n];
+      const change = buildSheetChange(current, baselines.get(n));
+      snapshots.set(n, cloneJson(current));
+      if (change.full) payload.sheets[n] = change.full;
+      else if (change.cells.set && (Object.keys(change.cells.set).length || change.cells.delete.length)) payload.cellPatches[n] = change.cells;
     }
+    if (!Object.keys(payload.sheets).length && !Object.keys(payload.cellPatches).length && !payload.deleted.length) return;
     saving = saving.then(async () => {
       try {
-        const res = await fetch(`/api/workbook?wb=${savedWbKey}`, {
+        const res = await fetchWithTimeout(`/api/workbook?wb=${savedWbKey}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
-        });
+        }, 20000);
         if (!res.ok) throw new Error(String(res.status));
+        const nextBaselines = syncedSheetSnapshots.get(savedWbKey) || new Map();
+        for (const [name, snapshot] of snapshots) nextBaselines.set(name, snapshot);
+        for (const name of payload.deleted) nextBaselines.delete(name);
+        syncedSheetSnapshots.set(savedWbKey, nextBaselines);
       } catch (e) {
         names.forEach(markSheetDirty); // retry with the next save
         showToast('No se pudo guardar; se reintentará con el próximo cambio', true);
@@ -357,10 +426,11 @@
   }
 
   async function reloadWorkbookAfterActualizarData() {
-    const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
+    const workbookResponse = await fetchWithTimeout(`/api/workbook${API_Q}`, { cache: 'no-store' });
     if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
     workbook = await workbookResponse.json();
     workbookCache.set(WB_KEY, workbook);
+    rememberSyncedWorkbook(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
     activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
     engine = new window.FormulaEngine(workbook);
@@ -436,10 +506,11 @@
   }
 
   async function reloadWorkbookAfterActualizarInventario() {
-    const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
+    const workbookResponse = await fetchWithTimeout(`/api/workbook${API_Q}`, { cache: 'no-store' });
     if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro con el inventario actualizado.');
     workbook = await workbookResponse.json();
     workbookCache.set(WB_KEY, workbook);
+    rememberSyncedWorkbook(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
     activeSheet = workbook.sheets.Inventario && !workbook.sheets.Inventario.hidden ? 'Inventario' : activeSheet;
     engine = new window.FormulaEngine(workbook);

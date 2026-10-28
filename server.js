@@ -320,7 +320,10 @@ async function initDatabase() {
     ssl: { rejectUnauthorized: false },
     max: 5,
     idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
+    connectionTimeoutMillis: 10000,
+    // Never let a slow Neon query hold a browser request indefinitely.
+    statement_timeout: 15000,
+    query_timeout: 20000
   });
 
   for (const key of Object.keys(WORKBOOKS)) {
@@ -394,13 +397,21 @@ async function loadWorkbook(key) {
     return localWorkbook;
   }
   const p = cfg(key).prefix;
-  const metaRes = await pool.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`);
-  const sheetRes = await pool.query(`SELECT name, data FROM ${p}_workbook_sheets`);
-  const meta = metaRes.rows[0]?.meta || splitWorkbook(initialWorkbook(key)).meta;
-  const sheets = {};
-  for (const row of sheetRes.rows) sheets[row.name] = row.data;
-  caches[key] = { ...meta, sheets };
-  return caches[key];
+  try {
+    const metaRes = await pool.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`);
+    const sheetRes = await pool.query(`SELECT name, data FROM ${p}_workbook_sheets`);
+    const meta = metaRes.rows[0]?.meta || splitWorkbook(initialWorkbook(key)).meta;
+    const sheets = {};
+    for (const row of sheetRes.rows) sheets[row.name] = row.data;
+    caches[key] = { ...meta, sheets };
+    return caches[key];
+  } catch (error) {
+    // A temporary Neon failure must not leave the workbook request pending.
+    // The local snapshot is the safe read fallback; the next request can try
+    // Neon again after the service recovers.
+    console.error(`No se pudo leer ${key} desde Neon; usando respaldo local:`, error.message);
+    return caches[key] = readJson(cfg(key).state, null) || initialWorkbook(key);
+  }
 }
 
 const fileWriteTimers = {};
@@ -430,11 +441,26 @@ async function patchWorkbook(key, patch) {
     if (meta[k] !== undefined) workbook[k] = meta[k];
   }
   const changed = patch.sheets || {};
+  const cellPatches = patch.cellPatches && typeof patch.cellPatches === 'object'
+    ? patch.cellPatches : {};
   const deleted = Array.isArray(patch.deleted) ? patch.deleted : [];
   for (const [name, data] of Object.entries(changed)) workbook.sheets[name] = data;
+  for (const [name, cellPatch] of Object.entries(cellPatches)) {
+    const sheet = workbook.sheets[name];
+    if (!sheet || !cellPatch || typeof cellPatch !== 'object') continue;
+    if (!sheet.cells || typeof sheet.cells !== 'object') sheet.cells = {};
+    const set = cellPatch.set && typeof cellPatch.set === 'object' ? cellPatch.set : {};
+    for (const [coord, cell] of Object.entries(set)) sheet.cells[coord] = cell;
+    for (const coord of (Array.isArray(cellPatch.delete) ? cellPatch.delete : [])) {
+      delete sheet.cells[coord];
+    }
+  }
   for (const name of deleted) delete workbook.sheets[name];
 
-  if (!pool) return persistFileSoon(key);
+  // Keep a local snapshot as an immediate recovery path if Neon is slow or
+  // temporarily unavailable on the next page load.
+  persistFileSoon(key);
+  if (!pool) return;
 
   const p = cfg(key).prefix;
   const client = await pool.connect();
@@ -445,6 +471,17 @@ async function patchWorkbook(key, patch) {
         `INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)
          ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
         [name, JSON.stringify(data)]
+      );
+    }
+    // The database currently stores one JSONB document per sheet. The
+    // browser sends only changed cells, but we still rewrite only the
+    // affected sheet document here (instead of every sheet in the workbook).
+    for (const name of Object.keys(cellPatches)) {
+      if (!workbook.sheets[name] || changed[name]) continue;
+      await client.query(
+        `INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)
+         ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
+        [name, JSON.stringify(workbook.sheets[name])]
       );
     }
     for (const name of deleted) {
