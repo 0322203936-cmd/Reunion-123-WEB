@@ -176,6 +176,21 @@
     }
   }
 
+  async function savePatchWithRetry(url, options) {
+    let lastError = null;
+    for (let attempt = 0; attempt < 3; attempt++) {
+      try {
+        const response = await fetchWithTimeout(url, options, 8000);
+        if (response.ok) return response;
+        lastError = new Error(String(response.status));
+      } catch (error) {
+        lastError = error;
+      }
+      if (attempt < 2) await new Promise(resolve => setTimeout(resolve, 300 * (attempt + 1)));
+    }
+    throw lastError || new Error('No se pudo guardar');
+  }
+
   async function fetchWorkbookForKey(key) {
     let response = await fetchWithTimeout(`/api/workbook?wb=${key}`, { cache: 'no-store' });
     if (!response.ok) {
@@ -531,12 +546,11 @@
     if (!Object.keys(payload.sheets).length && !Object.keys(payload.cellPatches).length && !payload.deleted.length) return;
     saving = saving.then(async () => {
       try {
-        const res = await fetchWithTimeout(`/api/workbook?wb=${savedWbKey}`, {
+        await savePatchWithRetry(`/api/workbook?wb=${savedWbKey}`, {
           method: 'PATCH',
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
-        }, 20000);
-        if (!res.ok) throw new Error(String(res.status));
+        });
         const nextBaselines = syncedSheetSnapshots.get(savedWbKey) || new Map();
         for (const [name, snapshot] of snapshots) {
           if (snapshot.full) {
@@ -555,7 +569,7 @@
       } catch (e) {
         names.forEach(markSheetDirty); // retry with the next save
         for (const [name, coords] of capturedCoords) for (const coord of coords) markCellDirty(name, coord);
-        showToast('No se pudo guardar; se reintentará con el próximo cambio', true);
+        showToast('No se pudo confirmar el guardado; se reintentará automáticamente', true);
       }
     });
   }
