@@ -4,11 +4,11 @@
 // ============================================================================
 
 (function () {
-  if (new URLSearchParams(location.search).get('wb') !== 'rvp') return;
   const App = () => window.MauriApp;
 
   async function refreshAppend() {
     const app = App();
+    if (!app || app.getWorkbookKey?.() !== 'rvp') return;
     if (!app || !app.getWorkbook() || !app.getEngine()) { setTimeout(refreshAppend, 500); return; }
     const res = await fetch('/api/sheet?wb=rvp&name=Append', { cache: 'no-store' });
     if (!res.ok) return;
@@ -24,8 +24,13 @@
   (function refreshOnLoad() {
     const app = App();
     if (!app || !app.getWorkbook() || !app.getEngine() || !window.MauriPivot || !window.MauriPivot.refreshAll) { setTimeout(refreshOnLoad, 500); return; }
-    window.MauriPivot.refreshAll('Append');
+    if (app.getWorkbookKey?.() === 'rvp') window.MauriPivot.refreshAll('Append');
   })();
+
+  window.addEventListener('mauri:workbook-switch', event => {
+    if (event.detail?.key !== 'rvp') return;
+    refreshAppend().catch(err => console.error('Append:', err));
+  });
 
   function listen() {
     const es = new EventSource('/api/events?wb=rvp');

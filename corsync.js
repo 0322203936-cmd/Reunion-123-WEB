@@ -7,25 +7,25 @@
 // ============================================================================
 
 (function () {
-  const params = new URLSearchParams(location.search);
   const App = () => window.MauriApp;
-  // Plan de cosecha page: take the cells written from Reunion so a later save doesn't overwrite them
-  if (params.get('wb') === 'cosecha') {
-    const listenCosecha = () => {
-      const es = new EventSource('/api/events?wb=cosecha');
-      es.addEventListener('cosecha', e => {
-        const app = App();
-        const sheet = app && app.getWorkbook() && app.getWorkbook().sheets[JSON.parse(e.data).sheet];
-        if (!sheet) return;
-        Object.assign(sheet.cells, JSON.parse(e.data).cells);
-        app.recalcAndRender();
-      });
-      es.onerror = () => { es.close(); setTimeout(listenCosecha, 3000); };
-    };
-    listenCosecha();
-    return;
-  }
-  if ((params.get('wb') && params.get('wb') !== 'reunion') || !window.CosechaCor) return; // Reunion only
+  // Keep the real-time feeds alive for the whole single-page session. The
+  // active workbook decides which feed is applied, so switching apartados
+  // does not require a full page reload.
+  const listenCosecha = () => {
+    const es = new EventSource('/api/events?wb=cosecha');
+    es.addEventListener('cosecha', e => {
+      const app = App();
+      if (!app || app.getWorkbookKey?.() !== 'cosecha') return;
+      const update = JSON.parse(e.data);
+      const sheet = app.getWorkbook() && app.getWorkbook().sheets[update.sheet];
+      if (!sheet) return;
+      Object.assign(sheet.cells, update.cells);
+      app.recalcAndRender();
+    });
+    es.onerror = () => { es.close(); setTimeout(listenCosecha, 3000); };
+  };
+  listenCosecha();
+  if (!window.CosechaCor) return; // The real-time Cor bridge is optional.
   let feed = null;
   let quiet = false; // applying a server update (not a user edit)
 

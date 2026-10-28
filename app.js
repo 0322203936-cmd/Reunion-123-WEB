@@ -76,42 +76,74 @@
   const btnFormatPainter = document.getElementById('btnFormatPainter');
   const btnClearFormat = document.getElementById('btnClearFormat');
 
-  // Which "apartado" (workbook) this page shows: ?wb=cosecha, default Reunion
-  const WB_KEY = ['cosecha', 'rvp'].includes(new URLSearchParams(location.search).get('wb')) ? new URLSearchParams(location.search).get('wb') : 'reunion';
-  const API_Q = `?wb=${WB_KEY}`;
-  const BACKUP_KEY = WB_KEY === 'reunion' ? 'reunion123_workbook_backup' : `${WB_KEY}_workbook_backup`;
-  let actualizarDataPollTimer = null;
-  let actualizarDataPollInFlight = false;
-  const actualizarDataNoticeKey = 'reunion123_actualizar_data_notice';
-  let actualizarInventarioPollTimer = null;
-  let actualizarInventarioPollInFlight = false;
-  const actualizarInventarioNoticeKey = 'reunion123_actualizar_inventario_notice';
+  // Which "apartado" (workbook) this page shows. The three workbooks now stay
+  // in the same browser session so changing the top tabs does not reload the
+  // complete Excel engine every time.
+  const VALID_WB_KEYS = ['reunion', 'cosecha', 'rvp'];
+  const wbFromUrl = () => {
+    const value = new URLSearchParams(location.search).get('wb');
+    return VALID_WB_KEYS.includes(value) ? value : 'reunion';
+  };
+  let WB_KEY = wbFromUrl();
+  let API_Q = `?wb=${WB_KEY}`;
+  let BACKUP_KEY = WB_KEY === 'reunion' ? 'reunion123_workbook_backup' : `${WB_KEY}_workbook_backup`;
+  const workbookCache = new Map();
+  const workbookEngineCache = new Map();
+  const workbookLoading = new Map();
 
-  async function init() {
-    document.querySelectorAll('.wb-switch [data-wb]').forEach(a => a.classList.toggle('active', a.dataset.wb === WB_KEY));
-    const btnActualizarData = document.getElementById('btnActualizarData');
-    if (btnActualizarData) btnActualizarData.hidden = WB_KEY !== 'reunion'; // only in Reunion
-    const btnActualizarInventario = document.getElementById('btnActualizarInventario');
-    if (btnActualizarInventario) btnActualizarInventario.hidden = WB_KEY !== 'reunion'; // only in Reunion
-    try {
-      let res = await fetch(`/api/workbook${API_Q}`);
-      if (!res.ok) {
-        res = await fetch('data/initial_workbook.json');
-      }
-      workbook = await res.json();
-    } catch (err) {
-      const localBackup = localStorage.getItem(BACKUP_KEY);
-      if (localBackup) {
-        workbook = JSON.parse(localBackup);
-      } else {
-        const res = await fetch('data/initial_workbook.json');
-        workbook = await res.json();
-      }
-    }
+  function setWorkbookKey(key) {
+    WB_KEY = VALID_WB_KEYS.includes(key) ? key : 'reunion';
+    API_Q = `?wb=${WB_KEY}`;
+    BACKUP_KEY = WB_KEY === 'reunion' ? 'reunion123_workbook_backup' : `${WB_KEY}_workbook_backup`;
+  }
 
-    if (!workbook.sheetOrder || workbook.sheetOrder.length === 0) {
-      workbook.sheetOrder = Object.keys(workbook.sheets);
+  function initialWorkbookPath(key) {
+    if (key === 'cosecha') return 'data/cosecha_initial_workbook.json';
+    if (key === 'rvp') return 'data/rvp_initial_workbook.json';
+    return 'data/initial_workbook.json';
+  }
+
+  async function fetchWorkbookForKey(key) {
+    let response = await fetch(`/api/workbook?wb=${key}`, { cache: 'no-store' });
+    if (!response.ok) {
+      response = await fetch(initialWorkbookPath(key), { cache: 'force-cache' });
     }
+    if (!response.ok) throw new Error(`No se pudo cargar ${key}`);
+    return response.json();
+  }
+
+  function workbookReady(nextWorkbook, key) {
+    const ready = nextWorkbook || { workbookName: key, sheetOrder: [], sheets: {} };
+    if (!ready.sheetOrder || ready.sheetOrder.length === 0) {
+      ready.sheetOrder = Object.keys(ready.sheets || {});
+    }
+    return ready;
+  }
+
+  function prefetchWorkbook(key) {
+    if (key === WB_KEY || workbookCache.has(key)) return Promise.resolve(workbookCache.get(key));
+    if (workbookLoading.has(key)) return workbookLoading.get(key);
+    const request = fetchWorkbookForKey(key)
+      .then(next => {
+        const ready = workbookReady(next, key);
+        // Recalculate in the background so the click only has to swap the
+        // already-loaded workbook and paint its current sheet.
+        const warmEngine = new window.FormulaEngine(ready);
+        warmEngine.recalculateAll();
+        workbookCache.set(key, ready);
+        workbookEngineCache.set(key, warmEngine);
+        return ready;
+      })
+      .catch(() => null)
+      .finally(() => workbookLoading.delete(key));
+    workbookLoading.set(key, request);
+    return request;
+  }
+
+  function activateWorkbook(nextWorkbook, key) {
+    setWorkbookKey(key);
+    workbook = workbookReady(nextWorkbook, key);
+    workbookCache.set(WB_KEY, workbook);
     if (workbook.workbookName) document.title = workbook.workbookName;
 
     const statusInfo = document.getElementById('statusFormulaInfo');
@@ -120,22 +152,58 @@
     const firstVisible = visibleSheets()[0] || workbook.sheetOrder[0] || 'Sheet1';
     activeSheet = workbook.activeSheet && workbook.sheets[workbook.activeSheet] && !workbook.sheets[workbook.activeSheet].hidden
       ? workbook.activeSheet : firstVisible;
+    engine = workbookEngineCache.get(WB_KEY) || new window.FormulaEngine(workbook);
+    if (!workbookEngineCache.has(WB_KEY)) engine.recalculateAll();
+    renderSheetTabs();
+    renderSheet();
+    selectCell('A1', false);
+    sheetTabsList.querySelector('.sheet-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 
-    engine = new window.FormulaEngine(workbook);
-    engine.recalculateAll();
+    document.querySelectorAll('.wb-switch [data-wb]').forEach(a => a.classList.toggle('active', a.dataset.wb === WB_KEY));
+    const btnActualizarData = document.getElementById('btnActualizarData');
+    if (btnActualizarData) btnActualizarData.hidden = WB_KEY !== 'reunion';
+    const btnActualizarInventario = document.getElementById('btnActualizarInventario');
+    if (btnActualizarInventario) btnActualizarInventario.hidden = WB_KEY !== 'reunion';
+    updateStatusMetrics();
+    window.dispatchEvent(new CustomEvent('mauri:workbook-switch', { detail: { key: WB_KEY } }));
+  }
+  let actualizarDataPollTimer = null;
+  let actualizarDataPollInFlight = false;
+  const actualizarDataNoticeKey = 'reunion123_actualizar_data_notice';
+  let actualizarInventarioPollTimer = null;
+  let actualizarInventarioPollInFlight = false;
+  const actualizarInventarioNoticeKey = 'reunion123_actualizar_inventario_notice';
+
+  async function init() {
+    try {
+      const loaded = await fetchWorkbookForKey(WB_KEY);
+      activateWorkbook(loaded, WB_KEY);
+    } catch (err) {
+      const localBackup = localStorage.getItem(BACKUP_KEY);
+      if (localBackup) {
+        activateWorkbook(JSON.parse(localBackup), WB_KEY);
+      } else {
+        const fallback = await fetch(initialWorkbookPath(WB_KEY), { cache: 'force-cache' });
+        activateWorkbook(await fallback.json(), WB_KEY);
+      }
+    }
 
     sheetCanvasWrapper.style.zoom = `${zoomLevel}%`;
     const zLbl = document.getElementById('zoomLabel');
     if (zLbl) zLbl.textContent = `${zoomLevel}%`;
 
-    renderSheetTabs();
-    renderSheet();
-    selectCell('A1', false);
-    sheetTabsList.querySelector('.sheet-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
     bindEvents();
-    updateStatusMetrics();
+    bindWorkspaceNavigation();
     pollActualizarData();
     pollActualizarInventario();
+
+    // Warm the other apartados after the first screen is usable. Hovering a
+    // tab also starts this immediately, so a normal click feels instant.
+    setTimeout(() => {
+      VALID_WB_KEYS.filter(key => key !== WB_KEY).forEach((key, index) => {
+        setTimeout(() => prefetchWorkbook(key), index * 250);
+      });
+    }, 800);
   }
 
   // Undo history stores only the sheets an action touches (big workbooks would not fit otherwise)
@@ -233,41 +301,53 @@
 
   let saveTimeout = null;
   let saving = Promise.resolve();
+  function queueWorkbookSave() {
+    saveTimeout = null;
+    const names = [...dirtySheets];
+    if (!names.length || !workbook) return;
+    dirtySheets.clear();
+    const savedWorkbook = workbook;
+    const savedWbKey = WB_KEY;
+    const payload = {
+      meta: {
+        workbookName: savedWorkbook.workbookName,
+        sheetOrder: savedWorkbook.sheetOrder,
+        tables: savedWorkbook.tables || {},
+        pivots: savedWorkbook.pivots || [],
+        activeSheet
+      },
+      sheets: {},
+      deleted: []
+    };
+    for (const n of names) {
+      if (savedWorkbook.sheets[n]) payload.sheets[n] = savedWorkbook.sheets[n];
+      else payload.deleted.push(n);
+    }
+    saving = saving.then(async () => {
+      try {
+        const res = await fetch(`/api/workbook?wb=${savedWbKey}`, {
+          method: 'PATCH',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload)
+        });
+        if (!res.ok) throw new Error(String(res.status));
+      } catch (e) {
+        names.forEach(markSheetDirty); // retry with the next save
+        showToast('No se pudo guardar; se reintentará con el próximo cambio', true);
+      }
+    });
+  }
+
   function saveWorkbookState() {
     markSheetDirty(activeSheet);
     clearTimeout(saveTimeout);
-    saveTimeout = setTimeout(() => {
-      const names = [...dirtySheets];
-      dirtySheets.clear();
-      const payload = {
-        meta: {
-          workbookName: workbook.workbookName,
-          sheetOrder: workbook.sheetOrder,
-          tables: workbook.tables || {},
-          pivots: workbook.pivots || [],
-          activeSheet
-        },
-        sheets: {},
-        deleted: []
-      };
-      for (const n of names) {
-        if (workbook.sheets[n]) payload.sheets[n] = workbook.sheets[n];
-        else payload.deleted.push(n);
-      }
-      saving = saving.then(async () => {
-        try {
-          const res = await fetch(`/api/workbook${API_Q}`, {
-            method: 'PATCH',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload)
-          });
-          if (!res.ok) throw new Error(String(res.status));
-        } catch (e) {
-          names.forEach(markSheetDirty); // retry with the next save
-          showToast('No se pudo guardar; se reintentará con el próximo cambio', true);
-        }
-      });
-    }, 300);
+    saveTimeout = setTimeout(queueWorkbookSave, 300);
+  }
+
+  async function flushPendingSave() {
+    clearTimeout(saveTimeout);
+    if (saveTimeout !== null) queueWorkbookSave();
+    await saving;
   }
 
   function setActualizarDataButtonState(state) {
@@ -284,6 +364,8 @@
     const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
     if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
     workbook = await workbookResponse.json();
+    workbookCache.set(WB_KEY, workbook);
+    workbookEngineCache.delete(WB_KEY);
     activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
     engine = new window.FormulaEngine(workbook);
     engine.recalculateAll();
@@ -361,6 +443,8 @@
     const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
     if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro con el inventario actualizado.');
     workbook = await workbookResponse.json();
+    workbookCache.set(WB_KEY, workbook);
+    workbookEngineCache.delete(WB_KEY);
     activeSheet = workbook.sheets.Inventario && !workbook.sheets.Inventario.hidden ? 'Inventario' : activeSheet;
     engine = new window.FormulaEngine(workbook);
     engine.recalculateAll();
@@ -2601,6 +2685,55 @@
     sheetTabsList.querySelector('.sheet-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
   }
 
+  let workspaceSwitchPromise = null;
+  async function switchWorkbookApartado(key, updateHistory = true) {
+    if (!VALID_WB_KEYS.includes(key) || key === WB_KEY) return;
+    if (workspaceSwitchPromise) return workspaceSwitchPromise;
+
+    workspaceSwitchPromise = (async () => {
+      const previousKey = WB_KEY;
+      await flushPendingSave();
+      clearTimeout(actualizarDataPollTimer);
+      clearTimeout(actualizarInventarioPollTimer);
+      actualizarDataPollTimer = null;
+      actualizarInventarioPollTimer = null;
+      closeInlineEditor(true);
+
+      let nextWorkbook = workbookCache.get(key);
+      if (!nextWorkbook) nextWorkbook = await prefetchWorkbook(key);
+      if (!nextWorkbook) {
+        setWorkbookKey(previousKey);
+        showToast(`No se pudo cargar ${key}.`, true);
+        return;
+      }
+
+      undoStack.length = 0;
+      redoStack.length = 0;
+      dirtySheets.clear();
+      activateWorkbook(nextWorkbook, key);
+      updateUndoRedoButtons();
+      if (updateHistory) history.pushState({ wb: key }, '', `/?wb=${key}`);
+      if (WB_KEY === 'reunion') {
+        pollActualizarData();
+        pollActualizarInventario();
+      }
+    })().finally(() => { workspaceSwitchPromise = null; });
+
+    return workspaceSwitchPromise;
+  }
+
+  function bindWorkspaceNavigation() {
+    document.querySelectorAll('.wb-switch [data-wb]').forEach(link => {
+      link.addEventListener('mouseenter', () => prefetchWorkbook(link.dataset.wb));
+      link.addEventListener('focus', () => prefetchWorkbook(link.dataset.wb));
+      link.addEventListener('click', event => {
+        event.preventDefault();
+        switchWorkbookApartado(link.dataset.wb);
+      });
+    });
+    window.addEventListener('popstate', () => switchWorkbookApartado(wbFromUrl(), false));
+  }
+
   function addNewSheet() {
     pushUndoState();
     let idx = (workbook.sheetOrder?.length || 1) + 1;
@@ -3704,6 +3837,7 @@
 
   window.MauriApp = {
     getWorkbook: () => workbook,
+    getWorkbookKey: () => WB_KEY,
     toast: (msg, isWarn) => showToast(msg, isWarn),
     getSelectionBounds: () => getSelectionBounds(),
     selectCoord: coord => selectCell(coord, false),
