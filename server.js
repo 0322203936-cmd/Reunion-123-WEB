@@ -594,7 +594,33 @@ async function patchWorkbook(key, patch) {
   }
 
   const p = cfg(key).prefix;
+  const onlyCellChanges = !Object.keys(changed).length && !deleted.length && !Object.keys(meta).length;
   const client = await pool.connect();
+  if (onlyCellChanges) {
+    try {
+      const setRows = [];
+      const deleteRows = [];
+      for (const [name, cellPatch] of Object.entries(cellPatches)) {
+        for (const [coord, cell] of Object.entries((cellPatch && cellPatch.set) || {})) {
+          setRows.push({ sheet_name: name, coord, cell });
+        }
+        for (const coord of (Array.isArray(cellPatch && cellPatch.delete) ? cellPatch.delete : [])) {
+          deleteRows.push({ sheet_name: name, coord });
+        }
+      }
+      await insertCellRows(client, `${p}_workbook_cells`, setRows);
+      if (deleteRows.length) {
+        await client.query(
+          `DELETE FROM ${p}_workbook_cells c
+           USING jsonb_to_recordset($1::jsonb) AS x(sheet_name text, coord text)
+           WHERE c.sheet_name = x.sheet_name AND c.coord = x.coord`,
+          [JSON.stringify(deleteRows)]
+        );
+      }
+      broadcastWorkbookMutation(key, patch);
+      return;
+    } finally { client.release(); }
+  }
   try {
     await client.query('BEGIN');
     for (const [name, data] of Object.entries(changed)) {
