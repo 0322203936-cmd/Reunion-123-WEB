@@ -192,13 +192,15 @@
   }
 
   async function fetchWorkbookForKey(key) {
-    let response = await fetchWithTimeout(`/api/workbook?wb=${key}`, { cache: 'no-store' });
+    // Neon is the only source of truth in the deployed app. Do not silently
+    // replace a failed database response with a bundled JSON snapshot: that
+    // made the interface look healthy while showing stale data.
+    const response = await fetchWithTimeout(`/api/workbook?wb=${key}`, { cache: 'no-store' });
     if (!response.ok) {
-      response = await fetch(initialWorkbookPath(key), { cache: 'force-cache' });
+      const detail = await response.text().catch(() => '');
+      throw new Error(`No se pudo cargar ${key} desde Neon (${response.status}${detail ? `: ${detail.slice(0, 160)}` : ''})`);
     }
-    if (!response.ok) throw new Error(`No se pudo cargar ${key}`);
     const nextWorkbook = await response.json();
-    void writeCachedWorkbook(key, nextWorkbook);
     return nextWorkbook;
   }
 
@@ -331,20 +333,14 @@
   const actualizarInventarioNoticeKey = 'reunion123_actualizar_inventario_notice';
 
   async function init() {
-    let usedFastCache = false;
     try {
-      const cached = await readCachedWorkbook(WB_KEY);
-      const loaded = cached || await fetchWorkbookForKey(WB_KEY);
-      usedFastCache = !!cached;
+      const loaded = await fetchWorkbookForKey(WB_KEY);
       activateWorkbook(loaded, WB_KEY, { deferRecalc: true });
     } catch (err) {
-      const localBackup = localStorage.getItem(BACKUP_KEY);
-      if (localBackup) {
-        activateWorkbook(JSON.parse(localBackup), WB_KEY);
-      } else {
-        const fallback = await fetch(initialWorkbookPath(WB_KEY), { cache: 'force-cache' });
-        activateWorkbook(await fallback.json(), WB_KEY);
-      }
+      // Keep the UI explicit about a database outage instead of opening a
+      // stale local workbook that could be mistaken for current Neon data.
+      activateWorkbook({ workbookName: WB_KEY, sheetOrder: [], sheets: {} }, WB_KEY);
+      showToast(err.message, true);
     }
 
     sheetCanvasWrapper.style.zoom = `${zoomLevel}%`;
@@ -356,18 +352,6 @@
     listenWorkbookChanges();
     pollActualizarData();
     pollActualizarInventario();
-
-    // Paint immediately from IndexedDB on reload, then reconcile with Neon in
-    // the background. A missed update from another browser is therefore
-    // corrected without holding the page on a blank loading screen.
-    if (usedFastCache) {
-      const key = WB_KEY;
-      void fetchWorkbookForKey(key).then(fresh => {
-        if (WB_KEY !== key || dirtySheets.size) return;
-        rememberSyncedWorkbook(key, fresh);
-        activateWorkbook(fresh, key, { deferRecalc: true });
-      }).catch(() => {});
-    }
 
     // Other apartados are warmed only when the user points to or focuses a
     // tab. Never download/recalculate the other large workbooks during the
