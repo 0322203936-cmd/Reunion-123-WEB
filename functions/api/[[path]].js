@@ -76,6 +76,13 @@ async function savePatch(sql, book, patch) {
   const deleted = Array.isArray(patch.deleted) ? patch.deleted : [];
   const meta = patch.meta && typeof patch.meta === 'object' ? patch.meta : {};
   for (const [name, data] of Object.entries(changed)) {
+    // A POSCO failure or a lazy-loaded workbook must never replace PegarData
+    // with an empty sheet. Only accept a full replacement when it contains
+    // actual cells; normal cell patches remain supported below.
+    if (book === 'reunion' && name === 'PegarData' && (!data || typeof data !== 'object' || !data.cells || !Object.keys(data.cells).length)) {
+      const existing = rowsOf(await sql.query(`SELECT 1 FROM reunion123_workbook_cells WHERE sheet_name = $1 LIMIT 1`, [name]));
+      if (existing.length) throw new Error('Se rechazó reemplazar PegarData vacía para proteger los datos existentes.');
+    }
     await sql.query(`INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb) ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`, [name, JSON.stringify(withoutCells(data))]);
     await sql.query(`DELETE FROM ${p}_workbook_cells WHERE sheet_name = $1`, [name]);
     await upsertCells(sql, `${p}_workbook_cells`, cellRows(name, data));
