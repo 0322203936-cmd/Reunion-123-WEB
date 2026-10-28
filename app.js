@@ -321,7 +321,14 @@
   // Saving sends only changed cells (PATCH); structural sheet changes fall back
   // to sending that complete sheet for compatibility.
   const dirtySheets = new Set();
+  const dirtyCellCoords = new Map();
   function markSheetDirty(name) { if (name) dirtySheets.add(name); }
+  function markCellDirty(name, coord) {
+    if (!name || !coord) return;
+    markSheetDirty(name);
+    if (!dirtyCellCoords.has(name)) dirtyCellCoords.set(name, new Set());
+    dirtyCellCoords.get(name).add(coord);
+  }
 
   function buildSheetChange(current, previous) {
     if (!current || !previous) return { full: cloneJson(current) };
@@ -356,6 +363,12 @@
     const names = [...dirtySheets];
     if (!names.length || !workbook) return;
     dirtySheets.clear();
+    const capturedCoords = new Map();
+    for (const name of names) {
+      const coords = dirtyCellCoords.get(name);
+      if (coords && coords.size) capturedCoords.set(name, new Set(coords));
+      dirtyCellCoords.delete(name);
+    }
     const savedWorkbook = workbook;
     const savedWbKey = WB_KEY;
     const baselines = syncedSheetSnapshots.get(savedWbKey) || new Map();
@@ -378,8 +391,22 @@
         continue;
       }
       const current = savedWorkbook.sheets[n];
-      const change = buildSheetChange(current, baselines.get(n));
-      snapshots.set(n, cloneJson(current));
+      const tracked = capturedCoords.get(n);
+      let change;
+      if (tracked && tracked.size && baselines.get(n)) {
+        const set = {};
+        const deleted = [];
+        for (const coord of tracked) {
+          const cell = current.cells && current.cells[coord];
+          if (cell === undefined) deleted.push(coord);
+          else set[coord] = cloneJson(cell);
+        }
+        change = { cells: { set, delete: deleted } };
+        snapshots.set(n, { cells: cloneJson(change.cells) });
+      } else {
+        change = buildSheetChange(current, baselines.get(n));
+        snapshots.set(n, { full: cloneJson(current) });
+      }
       if (change.full) payload.sheets[n] = change.full;
       else if (change.cells.set && (Object.keys(change.cells.set).length || change.cells.delete.length)) payload.cellPatches[n] = change.cells;
     }
@@ -393,11 +420,22 @@
         }, 20000);
         if (!res.ok) throw new Error(String(res.status));
         const nextBaselines = syncedSheetSnapshots.get(savedWbKey) || new Map();
-        for (const [name, snapshot] of snapshots) nextBaselines.set(name, snapshot);
+        for (const [name, snapshot] of snapshots) {
+          if (snapshot.full) {
+            nextBaselines.set(name, snapshot.full);
+            continue;
+          }
+          const baseline = nextBaselines.get(name);
+          if (!baseline) continue;
+          if (!baseline.cells) baseline.cells = {};
+          for (const [coord, cell] of Object.entries(snapshot.cells.set || {})) baseline.cells[coord] = cell;
+          for (const coord of (snapshot.cells.delete || [])) delete baseline.cells[coord];
+        }
         for (const name of payload.deleted) nextBaselines.delete(name);
         syncedSheetSnapshots.set(savedWbKey, nextBaselines);
       } catch (e) {
         names.forEach(markSheetDirty); // retry with the next save
+        for (const [name, coords] of capturedCoords) for (const coord of coords) markCellDirty(name, coord);
         showToast('No se pudo guardar; se reintentará con el próximo cambio', true);
       }
     });
@@ -1748,6 +1786,7 @@
 
   function applyCellValueRaw(sheetName, coord, rawInput) {
     writeCellValue(sheetName, coord, rawInput);
+    markCellDirty(sheetName, coord);
     if (window.MauriCorMarks && window.MauriCorMarks.onUserEdit) window.MauriCorMarks.onUserEdit(sheetName, coord);
   }
 

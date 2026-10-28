@@ -170,6 +170,7 @@ async function receiveGitHubPoscoCallback(payload) {
 const corClients = new Set();
 let corFeed = null;
 let corTimer = null;
+let appendTimer = null;
 // change history of the Cor (last 5 changes per product + date), kept in data/cor_history.json
 const COR_HISTORY_FILE = path.join(DATA_DIR, 'cor_history.json');
 let corHistory = null;
@@ -198,17 +199,32 @@ function scheduleCorSync(delay = 150) {
   clearTimeout(corTimer);
   corTimer = setTimeout(() => { syncCor().catch(err => console.error('Sync Cor:', err)); }, delay);
 }
+function scheduleAppendSync(delay = 1200) {
+  clearTimeout(appendTimer);
+  appendTimer = setTimeout(async () => {
+    try {
+      await syncAppend(await loadWorkbook('reunion'), await loadWorkbook('cosecha'));
+    } catch (err) {
+      console.error('Sync Append:', err);
+    }
+  }, delay);
+}
 async function syncCor() {
   const cosecha = await loadWorkbook('cosecha');
   const reunion = await loadWorkbook('reunion');
   const feed = CosechaCor.computeFeed(cosecha);
-  const changed = CosechaCor.applyFeed(reunion, feed);
-  if (changed) await patchWorkbook('reunion', { sheets: { Reunion: reunion.sheets.Reunion } });
+  const changedCells = {};
+  const changed = CosechaCor.applyFeed(reunion, feed, changedCells);
+  if (changed) {
+    await patchWorkbook('reunion', {
+      cellPatches: { Reunion: { set: changedCells, delete: [] } }
+    });
+  }
   const feedChanged = !corFeed || corFeed.sig !== feed.sig;
   corFeed = feed;
   if (CosechaCor.trackChanges(loadCorHistory(), feed, new Date().toISOString())) saveCorHistorySoon();
   if (changed || feedChanged) broadcastCor();
-  await syncAppend(reunion, cosecha);
+  scheduleAppendSync();
 }
 
 // Requerimiento Vs Proyeccion: sheet "Append" rebuilt from PegarData + Plan de cosecha
@@ -476,16 +492,28 @@ async function patchWorkbook(key, patch) {
         [name, JSON.stringify(data)]
       );
     }
-    // The database currently stores one JSONB document per sheet. The
-    // browser sends only changed cells, but we still rewrite only the
-    // affected sheet document here (instead of every sheet in the workbook).
-    for (const name of Object.keys(cellPatches)) {
+    // Apply individual cells directly inside the sheet JSONB. This keeps a
+    // one-cell edit from serializing and uploading a 10-20 MB sheet.
+    for (const [name, cellPatch] of Object.entries(cellPatches)) {
       if (!workbook.sheets[name] || changed[name]) continue;
-      await client.query(
-        `INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)
-         ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [name, JSON.stringify(workbook.sheets[name])]
-      );
+      const set = cellPatch && cellPatch.set && typeof cellPatch.set === 'object'
+        ? cellPatch.set : {};
+      for (const [coord, cell] of Object.entries(set)) {
+        await client.query(
+          `UPDATE ${p}_workbook_sheets
+           SET data = jsonb_set(data, ARRAY['cells', $2]::text[], $3::jsonb, true), updated_at = NOW()
+           WHERE name = $1`,
+          [name, coord, JSON.stringify(cell)]
+        );
+      }
+      for (const coord of (Array.isArray(cellPatch && cellPatch.delete) ? cellPatch.delete : [])) {
+        await client.query(
+          `UPDATE ${p}_workbook_sheets
+           SET data = data #- ARRAY['cells', $2]::text[], updated_at = NOW()
+           WHERE name = $1`,
+          [name, coord]
+        );
+      }
     }
     for (const name of deleted) {
       await client.query(`DELETE FROM ${p}_workbook_sheets WHERE name = $1`, [name]);
@@ -674,7 +702,15 @@ async function handleRequest(req, res) {
       return sendJson(res, 400, { error: 'Cambio inválido' });
     }
     await patchWorkbook(key, parsed);
-    scheduleCorSync();
+    if (key === 'cosecha') scheduleCorSync();
+    else if (key === 'reunion') {
+      const appendSheets = new Set(['PegarData', 'Inventario']);
+      const affectsAppend = [...Object.keys(parsed.sheets || {}), ...Object.keys(parsed.cellPatches || {})]
+        .some(name => appendSheets.has(name));
+      const reunionNamesChanged = parsed.cellPatches && parsed.cellPatches.Reunion &&
+        Object.keys(parsed.cellPatches.Reunion.set || {}).some(coord => /^A\d+$/.test(coord));
+      if (affectsAppend || reunionNamesChanged) scheduleAppendSync();
+    }
     return sendJson(res, 200, { ok: true });
   }
 
@@ -709,7 +745,9 @@ async function handleRequest(req, res) {
       Object.assign(changed, r.cells);
     }
     if (sheetName) {
-      await patchWorkbook('cosecha', { sheets: { [sheetName]: cosecha.sheets[sheetName] } });
+      await patchWorkbook('cosecha', {
+        cellPatches: { [sheetName]: { set: changed, delete: [] } }
+      });
       const msg = `event: cosecha
 data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
 

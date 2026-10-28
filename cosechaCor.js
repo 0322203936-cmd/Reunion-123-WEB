@@ -147,7 +147,7 @@
   }
 
   // writes the feed into sheet "Reunion" of the Reunion book; returns the number of cells changed
-  function applyFeed(reunionBook, feed) {
+  function applyFeed(reunionBook, feed, changedCells) {
     const sheet = reunionBook && reunionBook.sheets && reunionBook.sheets.Reunion;
     if (!sheet || !feed || !feed.sheet) return 0;
     const cells = sheet.cells;
@@ -180,6 +180,7 @@
         const target = days[serial] || 0;
         if (cell && !cell.f && cell.v === target) return;
         if (cell) { delete cell.f; cell.v = target; } else cells[coord] = { v: target };
+        if (changedCells) changedCells[coord] = { ...cells[coord] };
         changed++;
       });
     }
