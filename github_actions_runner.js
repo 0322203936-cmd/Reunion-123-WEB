@@ -16,6 +16,26 @@ function splitWorkbook(workbook) {
   return { meta, sheets };
 }
 
+function withoutCells(sheet) {
+  if (!sheet || typeof sheet !== 'object') return sheet;
+  const { cells, ...rest } = sheet;
+  return rest;
+}
+
+function cellRows(sheetName, sheet) {
+  return Object.entries((sheet && sheet.cells) || {}).map(([coord, cell]) => ({ sheet_name: sheetName, coord, cell }));
+}
+
+async function saveCells(client, table, rows) {
+  for (let i = 0; i < rows.length; i += 10000) {
+    const batch = rows.slice(i, i + 10000);
+    await client.query(`INSERT INTO ${table} (sheet_name, coord, cell)
+      SELECT sheet_name, coord, cell
+      FROM jsonb_to_recordset($1::jsonb) AS x(sheet_name text, coord text, cell jsonb)
+      ON CONFLICT (sheet_name, coord) DO UPDATE SET cell = EXCLUDED.cell, updated_at = NOW()`, [JSON.stringify(batch)]);
+  }
+}
+
 async function loadWorkbook(pool, prefix = WORKBOOK_PREFIX) {
   const [metaResult, sheetsResult] = await Promise.all([
     pool.query(`SELECT meta FROM ${prefix}_workbook_meta WHERE id = 1`),
@@ -38,8 +58,13 @@ async function saveWorkbookSheets(pool, workbook, sheetNames, prefix = WORKBOOK_
       await client.query(
         `INSERT INTO ${prefix}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)
          ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [name, JSON.stringify(sheet)]
+        [name, JSON.stringify(withoutCells(sheet))]
       );
+      // Workbook cells live in their own Neon table. Replacing only the
+      // target sheet must never remove or rewrite Reunion, Cortes, or any
+      // other sheet.
+      await client.query(`DELETE FROM ${prefix}_workbook_cells WHERE sheet_name = $1`, [name]);
+      await saveCells(client, `${prefix}_workbook_cells`, cellRows(name, sheet));
     }
     await client.query(
       `INSERT INTO ${prefix}_workbook_meta (id, meta) VALUES (1, $1::jsonb)
