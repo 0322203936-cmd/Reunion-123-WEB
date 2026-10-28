@@ -93,6 +93,42 @@
   // Last workbook state acknowledged by the server. This lets autosave send
   // cell-level patches instead of serializing the entire sheet on every edit.
   const syncedSheetSnapshots = new Map();
+  const CACHE_DB_NAME = 'reunion123-workbook-cache';
+  const CACHE_STORE = 'workbooks';
+
+  function openWorkbookCache() {
+    return new Promise((resolve, reject) => {
+      const request = indexedDB.open(CACHE_DB_NAME, 1);
+      request.onupgradeneeded = () => {
+        const db = request.result;
+        if (!db.objectStoreNames.contains(CACHE_STORE)) db.createObjectStore(CACHE_STORE);
+      };
+      request.onsuccess = () => resolve(request.result);
+      request.onerror = () => reject(request.error);
+    });
+  }
+
+  async function readCachedWorkbook(key) {
+    try {
+      const db = await openWorkbookCache();
+      return await new Promise((resolve, reject) => {
+        const request = db.transaction(CACHE_STORE, 'readonly').objectStore(CACHE_STORE).get(key);
+        request.onsuccess = () => resolve(request.result || null);
+        request.onerror = () => reject(request.error);
+      });
+    } catch (error) { return null; }
+  }
+
+  async function writeCachedWorkbook(key, value) {
+    try {
+      const db = await openWorkbookCache();
+      await new Promise((resolve, reject) => {
+        const request = db.transaction(CACHE_STORE, 'readwrite').objectStore(CACHE_STORE).put(value, key);
+        request.onsuccess = () => resolve();
+        request.onerror = () => reject(request.error);
+      });
+    } catch (error) { /* Cache is an acceleration only; Neon remains authoritative. */ }
+  }
 
   function cloneJson(value) {
     return value === undefined ? undefined : JSON.parse(JSON.stringify(value));
@@ -104,6 +140,18 @@
       snapshots.set(name, cloneJson(sheet));
     }
     syncedSheetSnapshots.set(key, snapshots);
+  }
+
+  function rememberSyncedPatch(key, payload) {
+    const snapshots = syncedSheetSnapshots.get(key);
+    if (!snapshots) return;
+    for (const [name, patch] of Object.entries(payload.cellPatches || {})) {
+      const sheet = snapshots.get(name);
+      if (!sheet) continue;
+      if (!sheet.cells) sheet.cells = {};
+      for (const [coord, cell] of Object.entries((patch && patch.set) || {})) sheet.cells[coord] = cloneJson(cell);
+      for (const coord of ((patch && patch.delete) || [])) delete sheet.cells[coord];
+    }
   }
 
   function setWorkbookKey(key) {
@@ -134,7 +182,9 @@
       response = await fetch(initialWorkbookPath(key), { cache: 'force-cache' });
     }
     if (!response.ok) throw new Error(`No se pudo cargar ${key}`);
-    return response.json();
+    const nextWorkbook = await response.json();
+    void writeCachedWorkbook(key, nextWorkbook);
+    return nextWorkbook;
   }
 
   function workbookReady(nextWorkbook, key) {
@@ -194,6 +244,53 @@
     updateStatusMetrics();
     window.dispatchEvent(new CustomEvent('mauri:workbook-switch', { detail: { key: WB_KEY } }));
   }
+
+  let workbookEventSource = null;
+  function applyIncomingCellPatch(target, payload) {
+    if (!target || !payload) return false;
+    for (const [name, patch] of Object.entries(payload.cellPatches || {})) {
+      const sheet = target.sheets && target.sheets[name];
+      if (!sheet) continue;
+      if (!sheet.cells) sheet.cells = {};
+      for (const [coord, cell] of Object.entries((patch && patch.set) || {})) sheet.cells[coord] = cell;
+      for (const coord of ((patch && patch.delete) || [])) delete sheet.cells[coord];
+    }
+    for (const [key, value] of Object.entries(payload.meta || {})) target[key] = value;
+    return true;
+  }
+
+  function listenWorkbookChanges() {
+    if (workbookEventSource) workbookEventSource.close();
+    workbookEventSource = new EventSource('/api/events');
+    workbookEventSource.addEventListener('workbook-patch', event => {
+      try {
+        const payload = JSON.parse(event.data);
+        const key = payload.key;
+        const target = key === WB_KEY ? workbook : workbookCache.get(key);
+        if (!target || !applyIncomingCellPatch(target, payload)) return;
+        workbookCache.set(key, target);
+        void writeCachedWorkbook(key, target);
+        if (key === WB_KEY) {
+          rememberSyncedPatch(key, payload);
+          engine.recalculateAll();
+          renderSheet();
+          selectCell(selectedCoord, false);
+        }
+      } catch (error) { console.error('No se pudo aplicar cambio en vivo:', error); }
+    });
+    workbookEventSource.addEventListener('workbook-refresh', event => {
+      try {
+        const payload = JSON.parse(event.data);
+        const key = payload.key;
+        void fetchWorkbookForKey(key).then(fresh => {
+          const ready = workbookReady(fresh, key);
+          workbookCache.set(key, ready);
+          rememberSyncedWorkbook(key, ready);
+          if (key === WB_KEY && !dirtySheets.size) activateWorkbook(ready, key);
+        }).catch(() => {});
+      } catch (error) { /* reconnect/background refresh will recover */ }
+    });
+  }
   let actualizarDataPollTimer = null;
   let actualizarDataPollInFlight = false;
   const actualizarDataNoticeKey = 'reunion123_actualizar_data_notice';
@@ -202,8 +299,11 @@
   const actualizarInventarioNoticeKey = 'reunion123_actualizar_inventario_notice';
 
   async function init() {
+    let usedFastCache = false;
     try {
-      const loaded = await fetchWorkbookForKey(WB_KEY);
+      const cached = await readCachedWorkbook(WB_KEY);
+      const loaded = cached || await fetchWorkbookForKey(WB_KEY);
+      usedFastCache = !!cached;
       activateWorkbook(loaded, WB_KEY);
     } catch (err) {
       const localBackup = localStorage.getItem(BACKUP_KEY);
@@ -221,8 +321,21 @@
 
     bindEvents();
     bindWorkspaceNavigation();
+    listenWorkbookChanges();
     pollActualizarData();
     pollActualizarInventario();
+
+    // Paint immediately from IndexedDB on reload, then reconcile with Neon in
+    // the background. A missed update from another browser is therefore
+    // corrected without holding the page on a blank loading screen.
+    if (usedFastCache) {
+      const key = WB_KEY;
+      void fetchWorkbookForKey(key).then(fresh => {
+        if (WB_KEY !== key || dirtySheets.size) return;
+        rememberSyncedWorkbook(key, fresh);
+        activateWorkbook(fresh, key);
+      }).catch(() => {});
+    }
 
     // Other apartados are warmed only when the user points to or focuses a
     // tab. Never download/recalculate the other large workbooks during the
@@ -433,6 +546,7 @@
         }
         for (const name of payload.deleted) nextBaselines.delete(name);
         syncedSheetSnapshots.set(savedWbKey, nextBaselines);
+        void writeCachedWorkbook(savedWbKey, savedWorkbook);
       } catch (e) {
         names.forEach(markSheetDirty); // retry with the next save
         for (const [name, coords] of capturedCoords) for (const coord of coords) markCellDirty(name, coord);

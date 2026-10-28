@@ -221,6 +221,16 @@ function broadcastCor() {
   const msg = `event: cor\ndata: ${JSON.stringify(publicCorFeed())}\n\n`;
   for (const res of corClients) res.write(msg);
 }
+function broadcastWorkbookMutation(key, patch) {
+  const hasStructuralChange = Object.keys((patch && patch.sheets) || {}).length ||
+    ((patch && patch.deleted) || []).length;
+  const event = hasStructuralChange ? 'workbook-refresh' : 'workbook-patch';
+  const payload = hasStructuralChange
+    ? { key }
+    : { key, cellPatches: (patch && patch.cellPatches) || {} };
+  const msg = `event: ${event}\ndata: ${JSON.stringify(payload)}\n\n`;
+  for (const res of corClients) res.write(msg);
+}
 function scheduleCorSync(delay = 150) {
   clearTimeout(corTimer);
   corTimer = setTimeout(() => { syncCor().catch(err => console.error('Sync Cor:', err)); }, delay);
@@ -471,8 +481,9 @@ function persistFileSoon(key) {
 async function saveWholeWorkbook(key, workbook) {
   caches[key] = workbook;
   invalidateGzip(key);
-  if (!pool) return persistFileSoon(key);
-  await writeWholeWorkbookToDb(key, workbook);
+  if (!pool) persistFileSoon(key);
+  else await writeWholeWorkbookToDb(key, workbook);
+  broadcastWorkbookMutation(key, { sheets: workbook.sheets || {} });
 }
 
 async function patchWorkbook(key, patch) {
@@ -504,6 +515,7 @@ async function patchWorkbook(key, patch) {
   // block the event loop and make the next reload appear stuck.
   if (!pool) {
     persistFileSoon(key);
+    broadcastWorkbookMutation(key, patch);
     return;
   }
 
@@ -551,6 +563,7 @@ async function patchWorkbook(key, patch) {
       [JSON.stringify(fullMeta)]
     );
     await client.query('COMMIT');
+    broadcastWorkbookMutation(key, patch);
   } catch (error) {
     await client.query('ROLLBACK');
     // Keep a recovery snapshot only when Neon fails, so a transient database
