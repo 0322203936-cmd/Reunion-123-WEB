@@ -90,44 +90,15 @@
   const workbookCache = new Map();
   const workbookEngineCache = new Map();
   const workbookLoading = new Map();
+  let sheetLoadSequence = 0;
   // Last workbook state acknowledged by the server. This lets autosave send
   // cell-level patches instead of serializing the entire sheet on every edit.
   const syncedSheetSnapshots = new Map();
-  const CACHE_DB_NAME = 'reunion123-workbook-cache';
-  const CACHE_STORE = 'workbooks';
-
-  function openWorkbookCache() {
-    return new Promise((resolve, reject) => {
-      const request = indexedDB.open(CACHE_DB_NAME, 1);
-      request.onupgradeneeded = () => {
-        const db = request.result;
-        if (!db.objectStoreNames.contains(CACHE_STORE)) db.createObjectStore(CACHE_STORE);
-      };
-      request.onsuccess = () => resolve(request.result);
-      request.onerror = () => reject(request.error);
-    });
-  }
-
-  async function readCachedWorkbook(key) {
-    try {
-      const db = await openWorkbookCache();
-      return await new Promise((resolve, reject) => {
-        const request = db.transaction(CACHE_STORE, 'readonly').objectStore(CACHE_STORE).get(key);
-        request.onsuccess = () => resolve(request.result || null);
-        request.onerror = () => reject(request.error);
-      });
-    } catch (error) { return null; }
-  }
-
-  async function writeCachedWorkbook(key, value) {
-    try {
-      const db = await openWorkbookCache();
-      await new Promise((resolve, reject) => {
-        const request = db.transaction(CACHE_STORE, 'readwrite').objectStore(CACHE_STORE).put(value, key);
-        request.onsuccess = () => resolve();
-        request.onerror = () => reject(request.error);
-      });
-    } catch (error) { /* Cache is an acceleration only; Neon remains authoritative. */ }
+  // This app used to save a full workbook in IndexedDB. That made an old
+  // browser copy look like current data. Neon is now the only persisted
+  // workbook source, so remove the old database when a browser opens the app.
+  function clearLegacyBrowserWorkbookCache() {
+    try { indexedDB.deleteDatabase('reunion123-workbook-cache'); } catch (error) { /* non-blocking cleanup */ }
   }
 
   function cloneJson(value) {
@@ -352,7 +323,6 @@
         const target = key === WB_KEY ? workbook : workbookCache.get(key);
         if (!target || !applyIncomingCellPatch(target, payload)) return;
         workbookCache.set(key, target);
-        void writeCachedWorkbook(key, target);
         if (key === WB_KEY) {
           rememberSyncedPatch(key, payload);
           engine.recalculateAll();
@@ -382,6 +352,7 @@
   const actualizarInventarioNoticeKey = 'reunion123_actualizar_inventario_notice';
 
   async function init() {
+    clearLegacyBrowserWorkbookCache();
     try {
       const loaded = await fetchWorkbookForKey(WB_KEY);
       activateWorkbook(loaded, WB_KEY, { deferRecalc: true });
@@ -642,7 +613,6 @@
         }
         for (const name of payload.deleted) nextBaselines.delete(name);
         syncedSheetSnapshots.set(savedWbKey, nextBaselines);
-        void writeCachedWorkbook(savedWbKey, savedWorkbook);
       } catch (e) {
         names.forEach(markSheetDirty); // retry with the next save
         for (const [name, coords] of capturedCoords) for (const coord of coords) markCellDirty(name, coord);
@@ -2998,17 +2968,18 @@
 
   async function switchSheet(sheetName) {
     if (!workbook.sheets[sheetName]) return;
+    const requestedKey = WB_KEY;
+    const requestId = ++sheetLoadSequence;
     const sheetState = workbook.sheets[sheetName];
     const cellsLoaded = Object.keys(sheetState.cells || {}).length > 0;
     const sheetNeedsCells = (sheetState.maxRow || 0) > 1 || (sheetState.maxCol || 0) > 1;
     if (!Object.prototype.hasOwnProperty.call(sheetState, 'cells') || (!cellsLoaded && sheetNeedsCells)) {
-      const requestedKey = WB_KEY;
       try {
         const sheet = await loadSheetFromNeon(requestedKey, sheetName);
-        if (requestedKey !== WB_KEY || activeSheet !== sheetName) return;
-        // The workbook can be refreshed by the live event stream while the
-        // large sheet response is in flight. Apply the fresh Neon sheet to
-        // the current workbook instead of silently discarding it.
+        // A large sheet arrives asynchronously. Ignore only a newer tab click
+        // or workbook change; never discard it merely because the previous
+        // sheet is still active while this request is in flight.
+        if (requestedKey !== WB_KEY || requestId !== sheetLoadSequence) return;
         workbook.sheets[sheetName] = sheet;
         workbookCache.set(WB_KEY, workbook);
         engine = new window.FormulaEngine(workbook);
@@ -3018,6 +2989,7 @@
         return;
       }
     }
+    if (requestedKey !== WB_KEY || requestId !== sheetLoadSequence) return;
     activeSheet = sheetName;
     renderSheetTabs();
     renderSheet();
