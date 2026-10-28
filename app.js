@@ -486,13 +486,9 @@
     const savedWbKey = WB_KEY;
     const baselines = syncedSheetSnapshots.get(savedWbKey) || new Map();
     const payload = {
-      meta: {
-        workbookName: savedWorkbook.workbookName,
-        sheetOrder: savedWorkbook.sheetOrder,
-        tables: savedWorkbook.tables || {},
-        pivots: savedWorkbook.pivots || [],
-        activeSheet
-      },
+      // Cell edits do not need to rewrite workbook metadata. Metadata is
+      // attached only when a structural sheet change is sent.
+      meta: {},
       sheets: {},
       cellPatches: {},
       deleted: []
@@ -522,6 +518,15 @@
       }
       if (change.full) payload.sheets[n] = change.full;
       else if (change.cells.set && (Object.keys(change.cells.set).length || change.cells.delete.length)) payload.cellPatches[n] = change.cells;
+    }
+    if (Object.keys(payload.sheets).length || payload.deleted.length) {
+      payload.meta = {
+        workbookName: savedWorkbook.workbookName,
+        sheetOrder: savedWorkbook.sheetOrder,
+        tables: savedWorkbook.tables || {},
+        pivots: savedWorkbook.pivots || [],
+        activeSheet
+      };
     }
     if (!Object.keys(payload.sheets).length && !Object.keys(payload.cellPatches).length && !payload.deleted.length) return;
     saving = saving.then(async () => {

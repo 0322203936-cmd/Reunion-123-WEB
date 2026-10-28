@@ -630,12 +630,14 @@ async function patchWorkbook(key, patch) {
     for (const name of deleted) {
       await client.query(`DELETE FROM ${p}_workbook_sheets WHERE name = $1`, [name]);
     }
-    const { meta: fullMeta } = splitWorkbook(workbook);
-    await client.query(
-      `INSERT INTO ${p}_workbook_meta (id, meta) VALUES (1, $1::jsonb)
-       ON CONFLICT (id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()`,
-      [JSON.stringify(fullMeta)]
-    );
+    if (Object.keys(meta).length) {
+      const { meta: fullMeta } = splitWorkbook(workbook);
+      await client.query(
+        `INSERT INTO ${p}_workbook_meta (id, meta) VALUES (1, $1::jsonb)
+         ON CONFLICT (id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()`,
+        [JSON.stringify(fullMeta)]
+      );
+    }
     await client.query('COMMIT');
     broadcastWorkbookMutation(key, patch);
   } catch (error) {
