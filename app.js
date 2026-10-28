@@ -178,7 +178,7 @@
 
   async function savePatchWithRetry(url, options) {
     let lastError = null;
-    for (let attempt = 0; attempt < 3; attempt++) {
+    for (let attempt = 0; attempt < 5; attempt++) {
       try {
         const response = await fetchWithTimeout(url, options, 8000);
         if (response.ok) return response;
@@ -209,7 +209,7 @@
         lastError = error;
         if (attempt === 2) throw error;
       }
-      await new Promise(resolve => setTimeout(resolve, 350 * (attempt + 1)));
+      await new Promise(resolve => setTimeout(resolve, 700 * (attempt + 1)));
     }
     throw lastError || new Error(`No se pudo cargar ${key} desde Neon`);
   }
@@ -351,6 +351,23 @@
       // stale local workbook that could be mistaken for current Neon data.
       activateWorkbook({ workbookName: WB_KEY, sheetOrder: [], sheets: {} }, WB_KEY);
       showToast(err.message, true);
+      // A transient 503 can happen while Cloudflare/Neon establishes a
+      // connection. Keep retrying Neon in the background and recover the
+      // workbook without requiring another manual refresh.
+      const failedKey = WB_KEY;
+      void (async () => {
+        for (let attempt = 0; attempt < 6; attempt++) {
+          await new Promise(resolve => setTimeout(resolve, 1500 * (attempt + 1)));
+          if (WB_KEY !== failedKey || workbook?.sheetOrder?.length) return;
+          try {
+            const recovered = await fetchWorkbookForKey(failedKey);
+            if (WB_KEY !== failedKey) return;
+            activateWorkbook(recovered, failedKey, { deferRecalc: true });
+            showToast('Libro recuperado desde Neon.', false);
+            return;
+          } catch { /* keep retrying Neon; never use a local snapshot */ }
+        }
+      })();
     }
 
     sheetCanvasWrapper.style.zoom = `${zoomLevel}%`;
