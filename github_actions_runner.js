@@ -59,7 +59,7 @@ async function notifyRender(payload) {
   const callbackUrl = String(process.env.REUNION_CALLBACK_URL || '').trim();
   const token = String(process.env.REUNION_SYNC_TOKEN || '').trim();
   if (!callbackUrl || !token) {
-    console.log('Callback de Render no configurado; datos guardados en Neon.');
+    console.log('Callback de la aplicación no configurado; datos guardados en Neon.');
     return;
   }
   const response = await fetch(callbackUrl, {
@@ -70,7 +70,7 @@ async function notifyRender(payload) {
     },
     body: JSON.stringify(payload)
   });
-  if (!response.ok) throw new Error(`Render callback respondió HTTP ${response.status}.`);
+  if (!response.ok) throw new Error(`Callback de la aplicación respondió HTTP ${response.status}.`);
 }
 
 async function run() {
@@ -106,7 +106,7 @@ async function run() {
     try {
       await notifyRender({ operation: OPERATION, status: 'failed', error: error.message || 'Error desconocido.' });
     } catch (callbackError) {
-      console.error('No se pudo avisar a Render:', callbackError.message);
+      console.error('No se pudo avisar a la aplicación:', callbackError.message);
     }
     throw error;
   } finally {

@@ -11,6 +11,7 @@
     "node": ">=20"
   },
   "dependencies": {
+    "@neondatabase/serverless": "^1.2.0",
     "@sparticuz/chromium": "^140.0.0",
     "pg": "^8.23.1",
     "playwright": "^1.55.0",

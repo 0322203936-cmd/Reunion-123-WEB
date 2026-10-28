@@ -63,7 +63,7 @@ Y estos secretos en GitHub Actions:
 DATABASE_URL
 POSCO_USER
 POSCO_PASSWORD
-REUNION_CALLBACK_URL=https://reunion-123.onrender.com/api/posco-callback
+REUNION_CALLBACK_URL=https://reunion-123-cf.pages.dev/api/posco-callback
 REUNION_SYNC_TOKEN   (el mismo valor configurado en Render)
 ```
 
