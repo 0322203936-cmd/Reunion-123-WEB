@@ -56,7 +56,13 @@ async function saveWorkbookSheets(pool, workbook, sheetNames, prefix = WORKBOOK_
 }
 
 async function notifyRender(payload) {
-  const callbackUrl = String(process.env.REUNION_CALLBACK_URL || '').trim();
+  // During the migration, an old Render callback secret may still exist in
+  // GitHub. Prefer the Cloudflare endpoint so the web UI receives completion
+  // status even after Render is turned off.
+  const configuredCallback = String(process.env.REUNION_CALLBACK_URL || '').trim();
+  const callbackUrl = configuredCallback && !configuredCallback.includes('onrender.com')
+    ? configuredCallback
+    : 'https://reunion-123-cf.pages.dev/api/posco-callback';
   const token = String(process.env.REUNION_SYNC_TOKEN || '').trim();
   if (!callbackUrl || !token) {
     console.log('Callback de la aplicación no configurado; datos guardados en Neon.');
