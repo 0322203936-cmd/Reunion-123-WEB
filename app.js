@@ -176,9 +176,17 @@
           const initialName = index.activeSheet && index.sheets?.[index.activeSheet] && isSheetVisible(index.activeSheet, index.sheets[index.activeSheet], key)
             ? index.activeSheet : (visible[0] || Object.keys(index.sheets || {})[0]);
           if (initialName) {
-            const sheetResponse = await fetchWithTimeout(`/api/sheet?wb=${key}&name=${encodeURIComponent(initialName)}`, { cache: 'no-store' });
-            if (!sheetResponse.ok) throw new Error(`No se pudo cargar la hoja ${initialName} desde Neon (${sheetResponse.status})`);
-            index.sheets[initialName] = await sheetResponse.json();
+            // Reunion formulas read PegarData. Load both sheets before the
+            // formula engine starts; otherwise the first recalculation sees an
+            // empty dependency sheet and replaces valid results with zeros.
+            const requiredSheets = [initialName];
+            if (key === 'reunion' && initialName !== 'PegarData' && index.sheets?.PegarData) requiredSheets.push('PegarData');
+            const loadedSheets = await Promise.all(requiredSheets.map(async name => {
+              const sheetResponse = await fetchWithTimeout(`/api/sheet?wb=${key}&name=${encodeURIComponent(name)}`, { cache: 'no-store' });
+              if (!sheetResponse.ok) throw new Error(`No se pudo cargar la hoja ${name} desde Neon (${sheetResponse.status})`);
+              return [name, await sheetResponse.json()];
+            }));
+            for (const [name, sheet] of loadedSheets) index.sheets[name] = sheet;
           }
           return index;
         }
