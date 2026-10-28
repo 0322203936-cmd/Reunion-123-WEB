@@ -245,7 +245,7 @@ function scheduleAppendSync(delay = 1200) {
     }
   }, delay);
 }
-async function syncCor() {
+async function syncCor({ rebuildAppend = true } = {}) {
   const cosecha = await loadWorkbook('cosecha');
   const reunion = await loadWorkbook('reunion');
   const feed = CosechaCor.computeFeed(cosecha);
@@ -260,7 +260,7 @@ async function syncCor() {
   corFeed = feed;
   if (CosechaCor.trackChanges(loadCorHistory(), feed, new Date().toISOString())) saveCorHistorySoon();
   if (changed || feedChanged) broadcastCor();
-  scheduleAppendSync();
+  if (rebuildAppend) scheduleAppendSync();
 }
 
 // Requerimiento Vs Proyeccion: sheet "Append" rebuilt from PegarData + Plan de cosecha
@@ -958,7 +958,9 @@ async function start() {
     await initDatabase();
     persistenceReady = true;
     await loadWorkbook(DEFAULT_WB);
-    await syncCor();
+    // Cor is initialized at startup, but Append does not need to be rebuilt
+    // until a source workbook changes. Avoid competing with the first edits.
+    await syncCor({ rebuildAppend: false });
     console.log(' Persistencia inicializada y sincronización lista');
   } catch (error) {
     // Keep the web service available with the local snapshot. The next
