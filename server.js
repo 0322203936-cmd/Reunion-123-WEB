@@ -77,6 +77,10 @@ const MIME_TYPES = {
 };
 
 let pool = null;
+// Render should start serving the page even if Neon is waking up. Until the
+// database finishes initializing, read-only workbook requests use the local
+// snapshot and do not cache it over the database-backed workbook.
+let persistenceReady = !DATABASE_URL;
 const caches = {}; // wbKey -> full workbook kept in memory; PATCH merges into it
 const gzCache = {}; // wbKey -> gzipped JSON of the cached workbook (dropped on every change)
 let actualizarDataRunning = false;
@@ -383,10 +387,11 @@ async function writeWholeWorkbookToDb(key, workbook) {
 
 // ---------------------------------------------------------------- workbook persistence
 async function loadWorkbook(key) {
-  if (caches[key]) return caches[key];
-  if (!pool) {
-    caches[key] = readJson(cfg(key).state, null) || initialWorkbook(key);
-    return caches[key];
+  if (caches[key] && persistenceReady) return caches[key];
+  if (!pool || !persistenceReady) {
+    const localWorkbook = caches[key] || readJson(cfg(key).state, null) || initialWorkbook(key);
+    if (persistenceReady) caches[key] = localWorkbook;
+    return localWorkbook;
   }
   const p = cfg(key).prefix;
   const metaRes = await pool.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`);
@@ -738,27 +743,31 @@ data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
 }
 
 async function start() {
+  const server = http.createServer((req, res) => {
+    handleRequest(req, res).catch(error => {
+      console.error('Request error:', error);
+      if (!res.headersSent) sendJson(res, 500, { error: 'Error interno del servidor' });
+      else res.end();
+    });
+  });
+
+  server.listen(PORT, '0.0.0.0', () => {
+    console.log('====================================================');
+    console.log(' SISTEMA EXCEL - Reunion 123 / Plan de cosecha ACTIVO');
+    console.log(` URL: http://localhost:${PORT}`);
+    console.log('====================================================');
+  });
+
   try {
     await initDatabase();
+    persistenceReady = true;
     await loadWorkbook(DEFAULT_WB);
     await syncCor();
-    const server = http.createServer((req, res) => {
-      handleRequest(req, res).catch(error => {
-        console.error('Request error:', error);
-        if (!res.headersSent) sendJson(res, 500, { error: 'Error interno del servidor' });
-        else res.end();
-      });
-    });
-
-    server.listen(PORT, '0.0.0.0', () => {
-      console.log('====================================================');
-      console.log(' SISTEMA EXCEL - Reunion 123 / Plan de cosecha ACTIVO');
-      console.log(` URL: http://localhost:${PORT}`);
-      console.log('====================================================');
-    });
+    console.log(' Persistencia inicializada y sincronización lista');
   } catch (error) {
-    console.error('No se pudo inicializar la persistencia:', error.message);
-    process.exit(1);
+    // Keep the web service available with the local snapshot. The next
+    // deployment/retry can initialize Neon without leaving the page blank.
+    console.error('No se pudo inicializar la persistencia; se mantiene el respaldo local:', error.message);
   }
 }
 

@@ -197,13 +197,9 @@
     pollActualizarData();
     pollActualizarInventario();
 
-    // Warm the other apartados after the first screen is usable. Hovering a
-    // tab also starts this immediately, so a normal click feels instant.
-    setTimeout(() => {
-      VALID_WB_KEYS.filter(key => key !== WB_KEY).forEach((key, index) => {
-        setTimeout(() => prefetchWorkbook(key), index * 250);
-      });
-    }, 800);
+    // Other apartados are warmed only when the user points to or focuses a
+    // tab. Never download/recalculate the other large workbooks during the
+    // first paint of the current one.
   }
 
   // Undo history stores only the sheets an action touches (big workbooks would not fit otherwise)
