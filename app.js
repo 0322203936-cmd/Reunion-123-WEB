@@ -245,13 +245,19 @@
     const request = fetchWorkbookForKey(key)
       .then(next => {
         const ready = workbookReady(next, key);
-        // Recalculate in the background so the click only has to swap the
-        // already-loaded workbook and paint its current sheet.
+        // Do not make an apartado click wait for every formula in the book.
+        // The grid evaluates visible formulas lazily; the complete pass can
+        // warm in idle time after the workbook is already available.
         const warmEngine = new window.FormulaEngine(ready);
-        warmEngine.recalculateAll();
         workbookCache.set(key, ready);
         workbookEngineCache.set(key, warmEngine);
         rememberSyncedWorkbook(key, ready);
+        const warm = () => {
+          if (workbookEngineCache.get(key) !== warmEngine) return;
+          warmEngine.recalculateAll();
+        };
+        if (typeof window.requestIdleCallback === 'function') window.requestIdleCallback(warm, { timeout: 2500 });
+        else setTimeout(warm, 0);
         return ready;
       })
       .catch(() => null)
@@ -3014,7 +3020,6 @@
         workbook.sheets[sheetName] = sheet;
         workbookCache.set(WB_KEY, workbook);
         engine = new window.FormulaEngine(workbook);
-        engine.recalculateAll();
       } catch (error) {
         showToast(error.message || `No se pudo cargar ${sheetName}.`, true);
         return;
