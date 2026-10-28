@@ -2997,7 +2997,10 @@
 
   async function switchSheet(sheetName) {
     if (!workbook.sheets[sheetName]) return;
-    if (!Object.prototype.hasOwnProperty.call(workbook.sheets[sheetName], 'cells')) {
+    const sheetState = workbook.sheets[sheetName];
+    const cellsLoaded = Object.keys(sheetState.cells || {}).length > 0;
+    const sheetNeedsCells = (sheetState.maxRow || 0) > 1 || (sheetState.maxCol || 0) > 1;
+    if (!Object.prototype.hasOwnProperty.call(sheetState, 'cells') || (!cellsLoaded && sheetNeedsCells)) {
       const requestedWorkbook = workbook;
       const requestedKey = WB_KEY;
       try {
