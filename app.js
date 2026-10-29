@@ -281,8 +281,12 @@
       if (!keys.has(n)) { delete workbook.sheets[n]; markSheetDirty(n); }
     }
     for (const [n, json] of Object.entries(snap.saved)) {
+      const before = workbook.sheets[n];
       if (json === null) delete workbook.sheets[n];
-      else workbook.sheets[n] = JSON.parse(json);
+      else {
+        workbook.sheets[n] = JSON.parse(json);
+        if (before && sentSheets.has(before)) sentSheets.set(workbook.sheets[n], sentSheets.get(before));
+      }
       markSheetDirty(n);
     }
     workbook.sheetOrder = [...snap.order];
@@ -395,6 +399,7 @@
     const names = [...dirtySheets];
     if (!names.length || !workbook) return;
     const touched = new Map(touchedCells);
+    const later = [];
     dirtySheets.clear();
     touchedCells.clear();
     const savedWorkbook = workbook;
@@ -416,16 +421,23 @@
       if (!sheet) { payload.deleted.push(n); continue; }
       const sent = sentSheets.get(sheet);
       const coords = touched.get(n) || null;
-      // sent whole: a sheet the server knows by another name / not at all, or a whole-sheet change
-      // while this page is still learning it
-      if (!sent || sent.name !== n || (!coords && sent.snap.partial)) {
+      // sent whole only when the server knows it by another name or not at all
+      if (!sent || sent.name !== n) {
         payload.sheets[n] = sheet;
         learnSent(sheet, n);
         continue;
       }
+      // a whole-sheet change while this page is still learning the sheet: wait a moment
+      if (!coords && sent.snap.partial) { later.push(n); continue; }
       const diff = window.SheetDelta.diffSheet(sent.snap, sheet, coords);
       if (diff) payload.deltas[n] = diff.delta;
     }
+    if (later.length) {
+      later.forEach(n => markSheetDirty(n));
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(queueWorkbookSave, 500);
+    }
+    if (!Object.keys(payload.sheets).length && !Object.keys(payload.deltas).length && !payload.deleted.length && later.length === names.length) return;
     saving = saving.then(async () => {
       try {
         const res = await fetch(`/api/workbook?wb=${savedWbKey}`, {

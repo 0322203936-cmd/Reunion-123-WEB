@@ -5,7 +5,7 @@
   "description": "Sistema Excel web Reunion 123",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node --max-old-space-size=320 server.js"
   },
   "engines": {
     "node": ">=20"

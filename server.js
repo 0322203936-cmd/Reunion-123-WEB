@@ -422,28 +422,14 @@ function rememberStored(key, meta, sheets, deltaCounts = {}) {
   for (const name of Object.keys(sheets)) learnSheet(key, name);
 }
 
-// "what Neon has" of a sheet (to compare whole sheets later) is built in small steps, so the server
-// keeps answering meanwhile; until it is complete the snapshot is "partial"
-const LEARN_CHUNK = 4000;
+// what Neon has of a sheet: only its settings (colWidths, merges...). Its cells are not copied in memory
+// (Render's free plan has 512 MB): the page says which cells changed and those are written as they are now;
+// a whole sheet replaced without saying which cells changed is written whole ("partial" snapshot)
 function learnSheet(key, name) {
   const st = stored[key];
   const sheet = persistForm(key, name, caches[key] ? caches[key].sheets[name] : null);
   if (!st || !sheet) return;
-  const snap = { known: new Map(), knownProps: SheetDelta.propsOf(sheet), partial: true };
-  st.sheets[name] = snap;
-  const coords = Object.keys(sheet.cells || {});
-  let i = 0;
-  const step = () => {
-    if (stored[key] !== st || st.sheets[name] !== snap) return; // replaced meanwhile
-    const cells = sheet.cells || {};
-    for (const end = Math.min(coords.length, i + LEARN_CHUNK); i < end; i++) {
-      const cell = cells[coords[i]];
-      if (cell !== undefined && !snap.known.has(coords[i])) snap.known.set(coords[i], JSON.stringify(cell));
-    }
-    if (i < coords.length) setImmediate(step);
-    else snap.partial = false;
-  };
-  setImmediate(step);
+  st.sheets[name] = { known: new Map(), knownProps: SheetDelta.propsOf(sheet), partial: true };
 }
 function newPending() {
   // dirty: { name: 'all' | Set of touched cells }, compared with what Neon has when writing
@@ -564,6 +550,7 @@ function collectChanges(key, pd) {
     // a big change (e.g. Actualizar Data) is cheaper as a full copy than as a delta
     if (diff.size > Math.max(3000, known.known.size * 0.3)) { delete pd.deltas[name]; pd.snapshots.add(name); continue; }
     pd.deltas[name] = pd.deltas[name] ? SheetDelta.mergeDelta(pd.deltas[name], diff.delta) : diff.delta;
+    known.known.clear();
   }
   pd.dirty = {};
   const metaJson = JSON.stringify(splitWorkbook(workbook).meta);
