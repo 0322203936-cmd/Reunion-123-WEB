@@ -159,7 +159,6 @@
     renderSheetTabs();
     renderSheet();
     selectCell('A1', false);
-    hideSplash();
     connectLive();
     sheetTabsList.querySelector('.sheet-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 
@@ -345,16 +344,7 @@
     if (key === WB_KEY) replaceWorkbookKeepingView(fresh);
   }
 
-  function hideSplash() {
-    const splash = document.getElementById('splash');
-    if (!splash || splash.classList.contains('done')) return;
-    splash.classList.add('done');
-    setTimeout(() => splash.remove(), 400);
-  }
-
   async function init() {
-    const apartado = document.getElementById('splashApartado');
-    if (apartado) apartado.textContent = WB_KEY === 'cosecha' ? 'Plan de cosecha' : WB_KEY === 'rvp' ? 'Requerimiento Vs Proyeccion' : 'Reunion';
     try {
       await loadFirstWorkbook();
     } catch (err) {
