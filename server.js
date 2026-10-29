@@ -85,7 +85,49 @@ let pool = null;
 // snapshot and do not cache it over the database-backed workbook.
 let persistenceReady = !DATABASE_URL;
 const caches = {}; // wbKey -> full workbook kept in memory; PATCH merges into it
-const gzCache = {}; // wbKey -> gzipped JSON of the cached workbook (dropped on every change)
+const gzCache = {}; // wbKey -> promise of the gzipped JSON of the cached workbook (rebuilt soon after a change)
+const sheetJson = {}; // wbKey -> Map(sheet name -> its JSON): only the sheets that changed are converted again
+const warmTimers = {};
+
+// the book changed (`names`: only those sheets, or all when omitted): the compressed copy that pages
+// download is prepared again in the background, so a reload right after typing finds it ready
+function bookChanged(key, names) {
+  delete gzCache[key];
+  const cache = sheetJson[key];
+  if (cache) {
+    if (names) for (const n of names) cache.delete(n);
+    else cache.clear();
+  }
+  clearTimeout(warmTimers[key]);
+  warmTimers[key] = setTimeout(() => {
+    if (key === 'rvp' && appendDirty) return; // Append is rebuilt (and the copy prepared) when RvP is opened
+    if (caches[key] && !gzCache[key]) compressedBook(key, caches[key]).catch(() => {});
+  }, 1500);
+}
+function workbookJson(key, workbook) {
+  const cache = sheetJson[key] || (sheetJson[key] = new Map());
+  const { sheets = {}, ...meta } = workbook;
+  for (const n of cache.keys()) if (!(n in sheets)) cache.delete(n);
+  const parts = [];
+  for (const [name, sheet] of Object.entries(sheets)) {
+    let json = cache.get(name);
+    if (json === undefined) { json = JSON.stringify(sheet); cache.set(name, json); }
+    parts.push(`${JSON.stringify(name)}:${json}`);
+  }
+  const head = JSON.stringify(meta).slice(0, -1);
+  return `${head}${head.length > 1 ? ',' : ''}"sheets":{${parts.join(',')}}}`;
+}
+function compressedBook(key, workbook) {
+  if (!gzCache[key]) {
+    // fast level: it is redone after every change. The ETag (hash of the content) lets a page that
+    // already has this exact copy skip the download (304)
+    const job = gzipAsync(workbookJson(key, workbook), { level: 1 })
+      .then(body => ({ body, etag: `"${crypto.createHash('md5').update(body).digest('hex')}"` }));
+    gzCache[key] = job;
+    job.catch(() => { if (gzCache[key] === job) delete gzCache[key]; });
+  }
+  return gzCache[key];
+}
 let actualizarDataRunning = false;
 let actualizarInventarioRunning = false;
 const actualizarDataState = {
@@ -118,7 +160,7 @@ function publicActualizarInventarioState() {
 
 function resetWorkbookCache(key) {
   delete caches[key];
-  delete gzCache[key];
+  bookChanged(key);
   delete stored[key];
   delete pending[key];
 }
@@ -277,7 +319,6 @@ async function runActualizarDataInBackground() {
     const currentWorkbook = await loadWorkbook('reunion');
     const result = await runActualizarData(currentWorkbook);
     await saveWholeWorkbook('reunion', result.workbook);
-    delete gzCache.reunion;
     scheduleCorSync();
     actualizarDataState.status = 'succeeded';
     actualizarDataState.finishedAt = new Date().toISOString();
@@ -308,7 +349,6 @@ async function runActualizarInventarioInBackground() {
     // the day the inventory was taken: its week (Sat..Fri) is the week the stock counts in Requerimiento Vs Proyeccion
     if (result.workbook.sheets && result.workbook.sheets.Inventario) result.workbook.sheets.Inventario.updatedAt = new Date().toISOString();
     await saveWholeWorkbook('reunion', result.workbook);
-    delete gzCache.reunion;
     scheduleCorSync();
     actualizarInventarioState.status = 'succeeded';
     actualizarInventarioState.finishedAt = new Date().toISOString();
@@ -612,7 +652,7 @@ async function backupIfDue() {
 async function saveWholeWorkbook(key, workbook) {
   const before = caches[key] ? Object.keys(caches[key].sheets || {}) : [];
   caches[key] = workbook;
-  delete gzCache[key];
+  bookChanged(key);
   if (!pool) return persistFileSoon(key);
   const names = Object.keys(workbook.sheets || {});
   queueChanges(key, names, before.filter(n => !names.includes(n)));
@@ -620,7 +660,6 @@ async function saveWholeWorkbook(key, workbook) {
 
 async function patchWorkbook(key, patch) {
   const workbook = await loadWorkbook(key);
-  delete gzCache[key];
   const meta = patch.meta || {};
   for (const k of ['workbookName', 'sheetOrder', 'tables', 'activeSheet', 'pivots']) {
     if (meta[k] !== undefined) workbook[k] = meta[k];
@@ -638,6 +677,7 @@ async function patchWorkbook(key, patch) {
     touched[name] = Object.keys(delta.cells || {});
   }
   if (key === 'rvp' && ('Append' in changed || 'Append' in touched)) appendSig = null; // formulas edited by hand
+  bookChanged(key, [...Object.keys(changed), ...Object.keys(touched), ...deleted]);
 
   if (!pool) { persistFileSoon(key); return missing; }
   queueChanges(key, [...Object.keys(changed), ...Object.keys(touched)], deleted, touched);
@@ -646,7 +686,7 @@ async function patchWorkbook(key, patch) {
 
 // the server changed some cells of a sheet itself (Cor, Plan de cosecha written from Reunion)
 function markCellsChanged(key, name, coords) {
-  delete gzCache[key];
+  bookChanged(key, [name]);
   if (!pool) return persistFileSoon(key);
   queueChanges(key, [name], [], { [name]: coords });
 }
@@ -791,9 +831,12 @@ async function handleRequest(req, res) {
     const workbook = await loadWorkbook(key);
     if (String(req.headers['accept-encoding'] || '').includes('gzip')) {
       // compressed off the main thread, and kept until the book changes
-      if (!gzCache[key]) gzCache[key] = gzipAsync(JSON.stringify(workbook), { level: 4 });
-      const body = await gzCache[key];
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-store' });
+      const { body, etag } = await compressedBook(key, workbook);
+      if (req.headers['if-none-match'] === etag) {
+        res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
+        return res.end();
+      }
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-cache', ETag: etag });
       return res.end(body);
     }
     return sendJson(res, 200, workbook);

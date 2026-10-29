@@ -176,11 +176,68 @@
   let actualizarInventarioPollInFlight = false;
   const actualizarInventarioNoticeKey = 'reunion123_actualizar_inventario_notice';
 
+  // ---- instant start: the last copy of the book kept in the browser (Cache Storage) is shown at once,
+  //   read-only, while the server is asked whether it changed (ETag). Unchanged: nothing is downloaded.
+  //   Changed: the new copy replaces it, keeping the sheet, selection and scroll.
+  const BOOK_CACHE = 'reunion123-books';
+  const bookUrl = key => `/api/workbook?wb=${key}`;
+  async function cachedBook(key) {
+    try { return (await (await caches.open(BOOK_CACHE)).match(bookUrl(key))) || null; } catch (e) { return null; }
+  }
+  async function storeBook(key, response) {
+    try { await (await caches.open(BOOK_CACHE)).put(bookUrl(key), response); } catch (e) { /* storage unavailable */ }
+  }
+  let staleView = false;
+  function setStale(on) {
+    staleView = on;
+    document.body.classList.toggle('wb-stale', on);
+    const statusInfo = document.getElementById('statusFormulaInfo');
+    if (statusInfo) statusInfo.textContent = on ? 'Actualizando datos… (solo lectura)' : `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
+  }
+  // while the copy shown is the old one: moving around and copying is fine, editing waits
+  const STALE_OK_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End', 'Tab', 'Shift', 'Control', 'Alt', 'Meta']);
+  window.addEventListener('keydown', e => {
+    if (!staleView || STALE_OK_KEYS.has(e.key) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c')) return;
+    e.preventDefault();
+    e.stopImmediatePropagation();
+  }, true);
+  for (const type of ['dblclick', 'paste', 'cut', 'drop']) {
+    window.addEventListener(type, e => { if (staleView) { e.preventDefault(); e.stopImmediatePropagation(); } }, true);
+  }
+  function replaceWorkbookKeepingView(fresh) {
+    const keepSheet = activeSheet;
+    const keepCoord = selectedCoord;
+    const vp = document.getElementById('spreadsheetViewport');
+    const keepScroll = [vp.scrollTop, vp.scrollLeft];
+    workbookEngineCache.delete(WB_KEY);
+    activateWorkbook(fresh, WB_KEY);
+    if (keepSheet !== activeSheet && workbook.sheets[keepSheet] && !workbook.sheets[keepSheet].hidden) switchSheet(keepSheet);
+    vp.scrollTop = keepScroll[0];
+    vp.scrollLeft = keepScroll[1];
+    if (keepCoord) selectCell(keepCoord, false, false);
+  }
+  async function loadFirstWorkbook() {
+    const cached = await cachedBook(WB_KEY);
+    let shown = false;
+    if (cached) {
+      try { activateWorkbook(await cached.clone().json(), WB_KEY); setStale(true); shown = true; } catch (e) { shown = false; }
+    }
+    const etag = shown && cached.headers.get('ETag');
+    const res = await fetch(bookUrl(WB_KEY), { cache: 'no-store', headers: etag ? { 'If-None-Match': etag } : {} });
+    if (res.status === 304 && shown) { setStale(false); return; }
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    storeBook(WB_KEY, res.clone());
+    const fresh = await res.json();
+    if (shown) replaceWorkbookKeepingView(fresh);
+    else activateWorkbook(fresh, WB_KEY);
+    setStale(false);
+  }
+
   async function init() {
     try {
-      const loaded = await fetchWorkbookForKey(WB_KEY);
-      activateWorkbook(loaded, WB_KEY);
+      await loadFirstWorkbook();
     } catch (err) {
+      setStale(false);
       const localBackup = localStorage.getItem(BACKUP_KEY);
       if (localBackup) {
         activateWorkbook(JSON.parse(localBackup), WB_KEY);

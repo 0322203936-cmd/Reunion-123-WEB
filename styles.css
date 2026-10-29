@@ -2539,3 +2539,9 @@ body.pv-panel-open .spreadsheet-viewport {
 .pv-menu-sort button:hover, .pv-menu-clear:hover { background: #ecfdf5; }
 .pv-menu-sort button.on { font-weight: 700; color: var(--excel-green); }
 .pv-menu-clear { color: #64748b; margin-bottom: 4px; }
+
+/* the copy shown is the one kept in the browser while the current one arrives: read-only */
+body.wb-stale .excel-format-toolbar,
+body.wb-stale .excel-formulabar,
+body.wb-stale .sheet-tabs-bar { pointer-events: none; opacity: 0.6; }
+body.wb-stale #statusFormulaInfo { font-weight: 700; }
