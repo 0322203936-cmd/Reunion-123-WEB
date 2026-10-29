@@ -159,6 +159,8 @@
     renderSheetTabs();
     renderSheet();
     selectCell('A1', false);
+    hideSplash();
+    connectLive();
     sheetTabsList.querySelector('.sheet-tab.active')?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
 
     document.querySelectorAll('.wb-switch [data-wb]').forEach(a => a.classList.toggle('active', a.dataset.wb === WB_KEY));
@@ -233,7 +235,126 @@
     setStale(false);
   }
 
+  // ---- live sync: what other computers change in this book shows up here within a second or two
+  //   ("live" events from /api/events: cells as deltas, whole sheets to fetch, sheet order / pivots;
+  //   "reload": the whole book was replaced, e.g. Actualizar Data)
+  const CLIENT_ID = Math.random().toString(36).slice(2) + Date.now().toString(36);
+  let liveSource = null;
+  let liveKey = null;
+  let liveConnectedOnce = false;
+  let remoteRenderTimer = null;
+  // other modules (Cor, Append) listen on this same connection instead of opening their own
+  const liveHandlers = [];
+  window.MauriEvents = {
+    on(event, fn) {
+      liveHandlers.push([event, fn]);
+      if (liveSource) liveSource.addEventListener(event, fn);
+    }
+  };
+  function connectLive() {
+    if (liveSource && liveKey === WB_KEY) return;
+    if (liveSource) liveSource.close();
+    liveKey = WB_KEY;
+    liveConnectedOnce = false;
+    const es = new EventSource(`/api/events?wb=${WB_KEY}&client=${CLIENT_ID}`);
+    liveSource = es;
+    for (const [event, fn] of liveHandlers) es.addEventListener(event, fn);
+    es.addEventListener('live', e => { try { applyRemote(JSON.parse(e.data)); } catch (err) { console.error('live', err); } });
+    es.addEventListener('reload', () => { reloadFromServer().catch(err => console.error('reload', err)); });
+    // back after a connection drop: something may have been missed, check the book (cheap when unchanged)
+    es.onopen = () => { if (liveConnectedOnce) reloadFromServer().catch(() => {}); liveConnectedOnce = true; };
+    es.onerror = () => {
+      if (es.readyState !== EventSource.CLOSED) return; // the browser retries by itself
+      if (liveSource === es) { liveSource = null; setTimeout(connectLive, 3000); }
+    };
+  }
+  // undo must not bring back an old copy over what someone else changed meanwhile
+  function dropUndoFor(names) {
+    if (!names.size) return;
+    const touches = snap => Object.keys(snap.saved).some(n => names.has(n));
+    for (const stack of [undoStack, redoStack]) {
+      for (let i = stack.length - 1; i >= 0; i--) if (touches(stack[i])) stack.splice(i, 1);
+    }
+    updateUndoRedoButtons();
+  }
+  function applyRemote(data) {
+    if (!workbook) return;
+    const changed = new Set();
+    const editing = inlineEditor ? inlineEditor.coord : null;
+    for (const [name, delta] of Object.entries(data.deltas || {})) {
+      const sheet = workbook.sheets[name];
+      if (!sheet) { fetchRemoteSheet(name); continue; }
+      const mine = touchedCells.get(name); // typed here and not saved yet: those cells stay as typed
+      const sent = sentSheets.get(sheet);
+      if (delta.cells) {
+        const cells = {};
+        for (const [coord, cell] of Object.entries(delta.cells)) {
+          if ((mine && mine.has(coord)) || (name === activeSheet && coord === editing)) continue;
+          cells[coord] = cell;
+          if (sent) { if (cell === null) sent.snap.known.delete(coord); else sent.snap.known.set(coord, JSON.stringify(cell)); }
+        }
+        window.SheetDelta.applyDelta(sheet, { cells });
+      }
+      if (delta.props || delta.removed) {
+        window.SheetDelta.applyDelta(sheet, { props: delta.props, removed: delta.removed });
+        if (sent) {
+          for (const [k, v] of Object.entries(delta.props || {})) sent.snap.knownProps.set(k, JSON.stringify(v));
+          for (const k of delta.removed || []) sent.snap.knownProps.delete(k);
+        }
+      }
+      changed.add(name);
+    }
+    for (const name of data.sheets || []) { changed.add(name); fetchRemoteSheet(name); }
+    for (const name of data.deleted || []) { changed.add(name); delete workbook.sheets[name]; }
+    if (data.meta) {
+      for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) if (data.meta[k] !== undefined) workbook[k] = data.meta[k];
+    }
+    dropUndoFor(changed);
+    scheduleRemoteRender();
+  }
+  async function fetchRemoteSheet(name) {
+    const key = WB_KEY;
+    const res = await fetch(`/api/sheet?wb=${key}&name=${encodeURIComponent(name)}`, { cache: 'no-store' });
+    if (!res.ok || key !== WB_KEY) return;
+    const sheet = await res.json();
+    workbook.sheets[name] = sheet;
+    learnSent(sheet, name);
+    scheduleRemoteRender();
+  }
+  function scheduleRemoteRender() {
+    clearTimeout(remoteRenderTimer);
+    remoteRenderTimer = setTimeout(() => {
+      if (inlineEditor) { scheduleRemoteRender(); return; } // never interrupt someone typing
+      if (!workbook.sheets[activeSheet] || workbook.sheets[activeSheet].hidden) activeSheet = visibleSheets()[0] || activeSheet;
+      engine.recalculateAll();
+      renderSheetTabs();
+      renderSheet();
+      highlightSelectedCellInDOM();
+      updateStatusMetrics();
+    }, 150);
+  }
+  async function reloadFromServer() {
+    await flushPendingSave();
+    const key = WB_KEY;
+    const cached = await cachedBook(key);
+    const etag = cached && cached.headers.get('ETag');
+    const res = await fetch(bookUrl(key), { cache: 'no-store', headers: etag ? { 'If-None-Match': etag } : {} });
+    if (key !== WB_KEY || res.status === 304 || !res.ok) return;
+    storeBook(key, res.clone());
+    const fresh = await res.json();
+    if (key === WB_KEY) replaceWorkbookKeepingView(fresh);
+  }
+
+  function hideSplash() {
+    const splash = document.getElementById('splash');
+    if (!splash || splash.classList.contains('done')) return;
+    splash.classList.add('done');
+    setTimeout(() => splash.remove(), 400);
+  }
+
   async function init() {
+    const apartado = document.getElementById('splashApartado');
+    if (apartado) apartado.textContent = WB_KEY === 'cosecha' ? 'Plan de cosecha' : WB_KEY === 'rvp' ? 'Requerimiento Vs Proyeccion' : 'Reunion';
     try {
       await loadFirstWorkbook();
     } catch (err) {
@@ -442,7 +563,7 @@
       try {
         const res = await fetch(`/api/workbook?wb=${savedWbKey}`, {
           method: 'PATCH',
-          headers: { 'Content-Type': 'application/json' },
+          headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
           body: JSON.stringify(payload)
         });
         if (res.status === 409) {

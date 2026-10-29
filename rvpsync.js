@@ -32,10 +32,5 @@
     refreshAppend().catch(err => console.error('Append:', err));
   });
 
-  function listen() {
-    const es = new EventSource('/api/events?wb=rvp');
-    es.addEventListener('append', () => { refreshAppend().catch(err => console.error('Append:', err)); });
-    es.onerror = () => { es.close(); setTimeout(listen, 3000); };
-  }
-  listen();
+  window.MauriEvents.on('append', () => { refreshAppend().catch(err => console.error('Append:', err)); });
 })();

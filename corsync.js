@@ -11,20 +11,16 @@
   // Keep the real-time feeds alive for the whole single-page session. The
   // active workbook decides which feed is applied, so switching apartados
   // does not require a full page reload.
-  const listenCosecha = () => {
-    const es = new EventSource('/api/events?wb=cosecha');
-    es.addEventListener('cosecha', e => {
-      const app = App();
-      if (!app || app.getWorkbookKey?.() !== 'cosecha') return;
-      const update = JSON.parse(e.data);
-      const sheet = app.getWorkbook() && app.getWorkbook().sheets[update.sheet];
-      if (!sheet) return;
-      Object.assign(sheet.cells, update.cells);
-      app.recalcAndRender();
-    });
-    es.onerror = () => { es.close(); setTimeout(listenCosecha, 3000); };
-  };
-  listenCosecha();
+  // (the page's single live connection, app.js: one per tab, browsers allow only a few per server)
+  window.MauriEvents.on('cosecha', e => {
+    const app = App();
+    if (!app || app.getWorkbookKey?.() !== 'cosecha') return;
+    const update = JSON.parse(e.data);
+    const sheet = app.getWorkbook() && app.getWorkbook().sheets[update.sheet];
+    if (!sheet) return;
+    Object.assign(sheet.cells, update.cells);
+    app.recalcAndRender();
+  });
   if (!window.CosechaCor) return; // The real-time Cor bridge is optional.
   let feed = null;
   let quiet = false; // applying a server update (not a user edit)
@@ -201,10 +197,5 @@
   window.MauriCorMarks = { cellExtra, onSelect, onUserEdit };
 
   fetch('/api/cor-feed').then(r => (r.ok ? r.json() : null)).then(f => { if (f) setFeed(f); }).catch(() => {});
-  function listen() {
-    const es = new EventSource('/api/events?wb=reunion');
-    es.addEventListener('cor', e => { try { setFeed(JSON.parse(e.data)); } catch (err) { console.error(err); } });
-    es.onerror = () => { es.close(); setTimeout(listen, 3000); };
-  }
-  listen();
+  window.MauriEvents.on('cor', e => { try { setFeed(JSON.parse(e.data)); } catch (err) { console.error(err); } });
 })();

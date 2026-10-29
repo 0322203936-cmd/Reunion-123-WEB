@@ -196,6 +196,7 @@ async function receiveGitHubPoscoCallback(payload) {
     await flushBook('reunion');
     resetWorkbookCache('reunion');
     await syncCor();
+    broadcastBook('reunion', 'reload', {});
     state.status = 'succeeded';
     state.rows = Number.isFinite(Number(payload.rows)) ? Number(payload.rows) : null;
     state.lastRow = Number.isFinite(Number(payload.lastRow)) ? Number(payload.lastRow) : null;
@@ -247,6 +248,11 @@ function saveCorHistorySoon() {
 function publicCorFeed() {
   const h = loadCorHistory();
   return { ...corFeed, history: { source: h.source, entries: h.entries } };
+}
+// live sync: `event` to every page with book `key` open, except the one that made the change
+function broadcastBook(key, event, data, exceptClient) {
+  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
+  for (const res of corClients) if (res.wbKey === key && (!exceptClient || res.clientId !== exceptClient)) res.write(msg);
 }
 function broadcastCor() {
   const msg = `event: cor\ndata: ${JSON.stringify(publicCorFeed())}\n\n`;
@@ -640,6 +646,7 @@ async function saveWholeWorkbook(key, workbook) {
   const before = caches[key] ? Object.keys(caches[key].sheets || {}) : [];
   caches[key] = workbook;
   bookChanged(key);
+  broadcastBook(key, 'reload', {});
   if (!pool) return persistFileSoon(key);
   const names = Object.keys(workbook.sheets || {});
   queueChanges(key, names, before.filter(n => !names.includes(n)));
@@ -674,6 +681,12 @@ async function patchWorkbook(key, patch) {
 // the server changed some cells of a sheet itself (Cor, Plan de cosecha written from Reunion)
 function markCellsChanged(key, name, coords) {
   bookChanged(key, [name]);
+  const sheet = caches[key] && caches[key].sheets[name];
+  if (sheet && coords.length) {
+    const cells = {};
+    for (const c of coords) cells[c] = sheet.cells[c] || null;
+    broadcastBook(key, 'live', { deltas: { [name]: { cells } }, sheets: [], deleted: [] });
+  }
   if (!pool) return persistFileSoon(key);
   queueChanges(key, [name], [], { [name]: coords });
 }
@@ -851,6 +864,16 @@ async function handleRequest(req, res) {
     }
     const missing = await patchWorkbook(key, parsed);
     scheduleCorSync();
+    // the other pages get the same change: cells as deltas, whole sheets to be fetched, sheet order / pivots
+    const from = String(req.headers['x-client-id'] || '');
+    const deltas = {};
+    for (const [name, delta] of Object.entries(parsed.deltas || {})) if (!missing.includes(name)) deltas[name] = delta;
+    const live = { deltas, sheets: Object.keys(parsed.sheets || {}), deleted: parsed.deleted || [] };
+    if (parsed.meta) {
+      const { activeSheet, ...meta } = parsed.meta; // each page keeps its own active sheet
+      live.meta = meta;
+    }
+    if (Object.keys(deltas).length || live.sheets.length || live.deleted.length) broadcastBook(key, 'live', live, from);
     if (missing && missing.length) return sendJson(res, 409, { error: 'Hojas desconocidas', missing });
     return sendJson(res, 200, { ok: true });
   }
@@ -920,6 +943,7 @@ data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
     res.write(': ok\n\n');
     res.wbKey = key;
+    res.clientId = urlObj.searchParams.get('client') || '';
     corClients.add(res);
     if (key === 'rvp' && appendDirty) scheduleAppend(500);
     const ping = setInterval(() => res.write(': ping\n\n'), 25000);
