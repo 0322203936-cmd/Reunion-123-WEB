@@ -8,6 +8,7 @@ const { runActualizarData } = require('./actualizar_data');
 const { runActualizarInventario } = require('./actualizar_inventario');
 const CosechaCor = require('./cosechaCor');
 const AppendBuilder = require('./appendBuilder');
+const NeonStore = require('./neonStore');
 const crypto = require('crypto');
 
 function loadLocalEnv() {
@@ -113,11 +114,11 @@ function publicActualizarInventarioState() {
   return { ...actualizarInventarioState, ok: actualizarInventarioState.status === 'succeeded' };
 }
 
-function resetWorkbookCaches() {
-  for (const key of Object.keys(WORKBOOKS)) {
-    delete caches[key];
-    delete gzCache[key];
-  }
+function resetWorkbookCache(key) {
+  delete caches[key];
+  delete gzCache[key];
+  delete stored[key];
+  delete pending[key];
 }
 
 function stateForOperation(operation) {
@@ -126,6 +127,7 @@ function stateForOperation(operation) {
 
 async function dispatchGitHubPosco(operation) {
   if (!GITHUB_ACTIONS_TOKEN) return false;
+  await flushAll(); // the runner reads Neon: give it the latest edits
   const response = await fetch(`https://api.github.com/repos/${GITHUB_REPOSITORY}/dispatches`, {
     method: 'POST',
     headers: {
@@ -147,7 +149,8 @@ async function receiveGitHubPoscoCallback(payload) {
   if (payload.status === 'succeeded') {
     // GitHub Actions escribió Neon desde fuera del proceso de Render.
     // Se limpian las cachés para que las pestañas reciban esos datos.
-    resetWorkbookCaches();
+    await flushBook('reunion');
+    resetWorkbookCache('reunion');
     await syncCor();
     state.status = 'succeeded';
     state.rows = Number.isFinite(Number(payload.rows)) ? Number(payload.rows) : null;
@@ -180,6 +183,17 @@ function loadCorHistory() {
 }
 function saveCorHistorySoon() {
   clearTimeout(corHistoryTimer);
+  if (pool) {
+    // Neon: grouped, at most one write every 15 s
+    corHistoryTimer = setTimeout(() => {
+      pool.query(
+        `INSERT INTO app_state (key, value) VALUES ('cor_history', $1::jsonb)
+         ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = NOW()`,
+        [JSON.stringify(corHistory)]
+      ).catch(err => console.error('Historial Cor:', err.message));
+    }, 15000);
+    return;
+  }
   corHistoryTimer = setTimeout(() => {
     const tmp = `${COR_HISTORY_FILE}.tmp`;
     fs.writeFileSync(tmp, JSON.stringify(corHistory), 'utf8');
@@ -311,81 +325,80 @@ function splitWorkbook(workbook) {
   return { meta, sheets };
 }
 
-// ---------------------------------------------------------------- database
+// ---------------------------------------------------------------- database (Neon, see neonStore.js)
+//   Consumption is kept low: the books live in memory, so the database is only read once at start;
+//   a change writes only the cells that changed, several edits within a few seconds go in one write,
+//   and data rebuilt by the server (the cells of "Append") is not stored at all.
+const FLUSH_DEBOUNCE_MS = 2000;  // write when nobody has edited for 2 s...
+const FLUSH_MAX_WAIT_MS = 10000; // ...or at most 10 s after the first pending change
+const COMPACT_AFTER = 150;       // deltas of one sheet before it is written whole again
+const BACKUP_EVERY_MS = 24 * 60 * 60 * 1000;
+const stored = {};  // wbKey -> { sheets: { name: { known, knownProps } }, meta: JSON, deltaCounts: {} } (what Neon has)
+const pending = {}; // wbKey -> { deltas: { name: delta }, snapshots: Set, deleted: Set, meta: bool, since }
+const flushTimers = {};
+let lastBackupAt = 0;
+
+// what is stored of a sheet: "Append" is rebuilt from PegarData + Plan de cosecha, so only its settings
+function persistForm(key, name, sheet) {
+  if (key === 'rvp' && name === 'Append' && sheet) return { ...sheet, cells: {} };
+  return sheet;
+}
+function persistBook(key, workbook) {
+  const { meta, sheets } = splitWorkbook(workbook);
+  const out = {};
+  for (const [name, sheet] of Object.entries(sheets)) out[name] = persistForm(key, name, sheet);
+  return { meta, sheets: out };
+}
+function rememberStored(key, meta, sheets, deltaCounts = {}) {
+  const st = { sheets: {}, meta: JSON.stringify(meta), deltaCounts };
+  for (const [name, sheet] of Object.entries(sheets)) st.sheets[name] = NeonStore.snapshotOf(persistForm(key, name, sheet));
+  stored[key] = st;
+}
+function newPending() {
+  return { deltas: {}, snapshots: new Set(), deleted: new Set(), meta: false, since: Date.now() };
+}
+
 async function initDatabase() {
   if (!DATABASE_URL) return;
 
   pool = new Pool({
     connectionString: DATABASE_URL,
     ssl: { rejectUnauthorized: false },
-    max: 5,
-    idleTimeoutMillis: 30000,
-    connectionTimeoutMillis: 10000
+    max: 3,
+    idleTimeoutMillis: 10000, // idle connections close quickly so Neon can go to sleep
+    connectionTimeoutMillis: 15000,
+    allowExitOnIdle: true
   });
+  pool.on('error', err => console.error('Neon:', err.message));
 
+  await NeonStore.ensureSharedTables(pool);
   for (const key of Object.keys(WORKBOOKS)) {
     const p = cfg(key).prefix;
-    await pool.query(`
-      CREATE TABLE IF NOT EXISTS ${p}_workbook_meta (
-        id SMALLINT PRIMARY KEY CHECK (id = 1),
-        meta JSONB NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS ${p}_workbook_sheets (
-        name TEXT PRIMARY KEY,
-        data JSONB NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-
-      CREATE TABLE IF NOT EXISTS ${p}_homologations (
-        id SMALLINT PRIMARY KEY CHECK (id = 1),
-        state JSONB NOT NULL,
-        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-      );
-    `);
-
+    await NeonStore.ensureTables(pool, p);
     const existing = await pool.query(`SELECT 1 FROM ${p}_workbook_meta WHERE id = 1`);
     if (existing.rowCount === 0) {
-      await writeWholeWorkbookToDb(key, readJson(cfg(key).state, initialWorkbook(key)));
+      // first start against an empty database: upload the local data once
+      const local = readJson(cfg(key).state, null) || initialWorkbook(key);
+      const { meta, sheets } = persistBook(key, local);
+      await NeonStore.writeWholeBook(pool, p, meta, sheets);
+      console.log(` Neon: ${cfg(key).name} subido desde los datos locales (${Object.keys(sheets).length} hojas)`);
     }
     await pool.query(
       `INSERT INTO ${p}_homologations (id, state) VALUES (1, $1::jsonb) ON CONFLICT (id) DO NOTHING`,
       [JSON.stringify(initialHomologations(key))]
     );
   }
+  const corRow = await pool.query(`SELECT value FROM app_state WHERE key = 'cor_history'`);
+  if (corRow.rows[0]) corHistory = corRow.rows[0].value;
+  else { loadCorHistory(); saveCorHistorySoon(); }
+  const last = await pool.query('SELECT MAX(created_at) AS at FROM app_backups');
+  lastBackupAt = last.rows[0].at ? new Date(last.rows[0].at).getTime() : 0;
 
   console.log(' Persistencia activa: Neon PostgreSQL');
 }
 
-async function writeWholeWorkbookToDb(key, workbook) {
-  const p = cfg(key).prefix;
-  const { meta, sheets } = splitWorkbook(workbook);
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    await client.query(`DELETE FROM ${p}_workbook_sheets`);
-    for (const [name, data] of Object.entries(sheets)) {
-      await client.query(
-        `INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)`,
-        [name, JSON.stringify(data)]
-      );
-    }
-    await client.query(
-      `INSERT INTO ${p}_workbook_meta (id, meta) VALUES (1, $1::jsonb)
-       ON CONFLICT (id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()`,
-      [JSON.stringify(meta)]
-    );
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
-}
-
 // ---------------------------------------------------------------- workbook persistence
+const loadingBooks = {};
 async function loadWorkbook(key) {
   if (caches[key] && persistenceReady) return caches[key];
   if (!pool || !persistenceReady) {
@@ -393,14 +406,17 @@ async function loadWorkbook(key) {
     if (persistenceReady) caches[key] = localWorkbook;
     return localWorkbook;
   }
-  const p = cfg(key).prefix;
-  const metaRes = await pool.query(`SELECT meta FROM ${p}_workbook_meta WHERE id = 1`);
-  const sheetRes = await pool.query(`SELECT name, data FROM ${p}_workbook_sheets`);
-  const meta = metaRes.rows[0]?.meta || splitWorkbook(initialWorkbook(key)).meta;
-  const sheets = {};
-  for (const row of sheetRes.rows) sheets[row.name] = row.data;
-  caches[key] = { ...meta, sheets };
-  return caches[key];
+  if (!loadingBooks[key]) {
+    loadingBooks[key] = (async () => {
+      const book = await NeonStore.loadBook(pool, cfg(key).prefix);
+      const meta = book ? book.meta : splitWorkbook(initialWorkbook(key)).meta;
+      const sheets = book ? book.sheets : {};
+      rememberStored(key, meta, sheets, book ? book.deltaCounts : {});
+      caches[key] = { ...meta, sheets };
+      return caches[key];
+    })().finally(() => { delete loadingBooks[key]; });
+  }
+  return loadingBooks[key];
 }
 
 const fileWriteTimers = {};
@@ -415,11 +431,120 @@ function persistFileSoon(key) {
   }, 400);
 }
 
+// the in-memory book changed: queue what differs from what Neon has
+function queueChanges(key, names, deletedNames) {
+  const st = stored[key];
+  if (!st) return;
+  const workbook = caches[key];
+  const pd = pending[key] || (pending[key] = newPending());
+  for (const name of deletedNames) {
+    if (!st.sheets[name]) continue;
+    delete st.sheets[name];
+    delete pd.deltas[name];
+    pd.snapshots.delete(name);
+    pd.deleted.add(name);
+  }
+  for (const name of names) {
+    const sheet = persistForm(key, name, workbook.sheets[name]);
+    if (!sheet) continue;
+    pd.deleted.delete(name);
+    const known = st.sheets[name];
+    if (!known) { st.sheets[name] = NeonStore.snapshotOf(sheet); pd.snapshots.add(name); continue; }
+    const diff = NeonStore.diffSheet(known.known, known.knownProps, sheet);
+    if (!diff || pd.snapshots.has(name)) continue; // nothing new, or the whole sheet is going anyway
+    // a big change (e.g. Actualizar Data) is cheaper as a full copy than as a delta
+    if (diff.size > Math.max(3000, known.known.size * 0.3)) { delete pd.deltas[name]; pd.snapshots.add(name); continue; }
+    pd.deltas[name] = pd.deltas[name] ? NeonStore.mergeDelta(pd.deltas[name], diff.delta) : diff.delta;
+  }
+  const metaJson = JSON.stringify(splitWorkbook(workbook).meta);
+  if (metaJson !== st.meta) { st.meta = metaJson; pd.meta = true; }
+  if (!Object.keys(pd.deltas).length && !pd.snapshots.size && !pd.deleted.size && !pd.meta) { delete pending[key]; return; }
+  scheduleFlush(key);
+}
+
+function scheduleFlush(key, delay = FLUSH_DEBOUNCE_MS) {
+  const pd = pending[key];
+  if (!pd) return;
+  clearTimeout(flushTimers[key]);
+  const wait = Math.max(0, Math.min(delay, pd.since + FLUSH_MAX_WAIT_MS - Date.now()));
+  flushTimers[key] = setTimeout(() => { flushBook(key).catch(err => console.error(`Neon (${key}):`, err.message)); }, wait);
+}
+
+const flushing = {};
+async function flushBook(key) {
+  while (flushing[key]) await flushing[key].catch(() => {});
+  const pd = pending[key];
+  if (!pd || !pool) return;
+  delete pending[key];
+  clearTimeout(flushTimers[key]);
+  const p = cfg(key).prefix;
+  const st = stored[key];
+  const workbook = caches[key];
+  flushing[key] = NeonStore.transaction(pool, async client => {
+    for (const name of pd.deleted) {
+      await client.query(`DELETE FROM ${p}_workbook_sheets WHERE name = $1`, [name]);
+      await client.query(`DELETE FROM ${p}_sheet_deltas WHERE name = $1`, [name]);
+    }
+    const snaps = {};
+    for (const name of pd.snapshots) if (workbook.sheets[name]) snaps[name] = persistForm(key, name, workbook.sheets[name]);
+    await NeonStore.writeSnapshots(client, p, snaps);
+    for (const [name, delta] of Object.entries(pd.deltas)) {
+      await client.query(`INSERT INTO ${p}_sheet_deltas (name, delta) VALUES ($1, $2::jsonb)`, [name, JSON.stringify(delta)]);
+    }
+    if (pd.meta) await NeonStore.writeMeta(client, p, splitWorkbook(workbook).meta);
+  });
+  try {
+    await flushing[key];
+  } catch (error) {
+    // put it back (newer changes on top) and try again a bit later: Neon waking up, network...
+    const newer = pending[key];
+    if (newer) {
+      for (const [name, delta] of Object.entries(newer.deltas)) pd.deltas[name] = pd.deltas[name] ? NeonStore.mergeDelta(pd.deltas[name], delta) : delta;
+      newer.snapshots.forEach(n => { pd.snapshots.add(n); delete pd.deltas[n]; });
+      newer.deleted.forEach(n => pd.deleted.add(n));
+      pd.meta = pd.meta || newer.meta;
+    }
+    pending[key] = pd;
+    scheduleFlush(key, 15000);
+    throw error;
+  } finally {
+    delete flushing[key];
+  }
+  for (const name of pd.deleted) delete st.deltaCounts[name];
+  for (const name of pd.snapshots) st.deltaCounts[name] = 0;
+  for (const name of Object.keys(pd.deltas)) st.deltaCounts[name] = (st.deltaCounts[name] || 0) + 1;
+  // sheets with many deltas are written whole again, so loading stays quick
+  const heavy = Object.keys(st.deltaCounts).filter(n => st.deltaCounts[n] >= COMPACT_AFTER && workbook.sheets[n]);
+  if (heavy.length) {
+    const next = pending[key] || (pending[key] = newPending());
+    for (const n of heavy) { delete next.deltas[n]; next.snapshots.add(n); }
+    scheduleFlush(key);
+  }
+  backupIfDue().catch(err => console.error('Respaldo:', err.message));
+}
+
+async function flushAll() {
+  for (const key of Object.keys(pending)) await flushBook(key).catch(err => console.error(`Neon (${key}):`, err.message));
+}
+
+// once a day (only while the database is awake for a write anyway): gzip copy of every book, last 7 kept
+async function backupIfDue() {
+  if (!pool || Date.now() - lastBackupAt < BACKUP_EVERY_MS) return;
+  lastBackupAt = Date.now();
+  let total = 0;
+  for (const key of Object.keys(WORKBOOKS)) {
+    if (caches[key]) total += await NeonStore.writeBackup(pool, key, caches[key]);
+  }
+  console.log(` Respaldo diario guardado en Neon (${(total / 1048576).toFixed(1)} MB comprimido)`);
+}
+
 async function saveWholeWorkbook(key, workbook) {
+  const before = caches[key] ? Object.keys(caches[key].sheets || {}) : [];
   caches[key] = workbook;
   delete gzCache[key];
   if (!pool) return persistFileSoon(key);
-  await writeWholeWorkbookToDb(key, workbook);
+  const names = Object.keys(workbook.sheets || {});
+  queueChanges(key, names, before.filter(n => !names.includes(n)));
 }
 
 async function patchWorkbook(key, patch) {
@@ -435,34 +560,7 @@ async function patchWorkbook(key, patch) {
   for (const name of deleted) delete workbook.sheets[name];
 
   if (!pool) return persistFileSoon(key);
-
-  const p = cfg(key).prefix;
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    for (const [name, data] of Object.entries(changed)) {
-      await client.query(
-        `INSERT INTO ${p}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)
-         ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [name, JSON.stringify(data)]
-      );
-    }
-    for (const name of deleted) {
-      await client.query(`DELETE FROM ${p}_workbook_sheets WHERE name = $1`, [name]);
-    }
-    const { meta: fullMeta } = splitWorkbook(workbook);
-    await client.query(
-      `INSERT INTO ${p}_workbook_meta (id, meta) VALUES (1, $1::jsonb)
-       ON CONFLICT (id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()`,
-      [JSON.stringify(fullMeta)]
-    );
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
+  queueChanges(key, Object.keys(changed), deleted);
 }
 
 async function resetWorkbook(key) {
@@ -677,6 +775,17 @@ data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
     }
     return sendJson(res, 200, { ok: !errors.length, errors });
   }
+  // download a copy of the whole book (gzip JSON), straight from memory: costs nothing in Neon
+  if (pathname === '/api/backup' && req.method === 'GET') {
+    const workbook = await loadWorkbook(key);
+    const stamp = new Date().toISOString().slice(0, 16).replace(/[:T]/g, '-');
+    res.writeHead(200, {
+      'Content-Type': 'application/gzip',
+      'Content-Disposition': `attachment; filename="respaldo-${key}-${stamp}.json.gz"`,
+      'Cache-Control': 'no-store'
+    });
+    return res.end(zlib.gzipSync(JSON.stringify(workbook), { level: 6 }));
+  }
   // one sheet of a book (used to refresh "Append" without reloading the whole page)
   if (pathname === '/api/sheet' && req.method === 'GET') {
     const workbook = await loadWorkbook(key);
@@ -761,7 +870,7 @@ async function start() {
   try {
     await initDatabase();
     persistenceReady = true;
-    await loadWorkbook(DEFAULT_WB);
+    for (const key of Object.keys(WORKBOOKS)) await loadWorkbook(key); // the only full read of Neon
     await syncCor();
     console.log(' Persistencia inicializada y sincronización lista');
   } catch (error) {
@@ -769,6 +878,15 @@ async function start() {
     // deployment/retry can initialize Neon without leaving the page blank.
     console.error('No se pudo inicializar la persistencia; se mantiene el respaldo local:', error.message);
   }
+}
+
+// Render stops the service with SIGTERM (deploys, sleeping): write what is still pending first
+for (const signal of ['SIGTERM', 'SIGINT']) {
+  process.on(signal, () => {
+    const pendingSaves = Object.keys(pending).length;
+    if (pendingSaves) console.log(` Guardando ${pendingSaves} libro(s) pendientes en Neon antes de salir...`);
+    Promise.race([flushAll(), new Promise(r => setTimeout(r, 8000))]).finally(() => process.exit(0));
+  });
 }
 
 start();

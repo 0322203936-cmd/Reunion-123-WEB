@@ -648,7 +648,7 @@
   // Excel number formats and conditional formatting)
   // ============================================================================
   const VIRTUAL_THRESHOLD = 250;   // visible rows above which only a window is rendered
-  const OVERSCAN_ROWS = 30;
+  const OVERSCAN_ROWS = 12;
   const COL_VIRTUAL_THRESHOLD = 40; // visible columns above which only the columns on screen are rendered
   const OVERSCAN_COLS = 10;
   const DEFAULT_ROW_PX = 20;
@@ -1577,31 +1577,33 @@
     refreshColWindow();
   }
 
+  // elements carrying selection classes, so repainting the selection doesn't search the whole grid
+  const SEL_CLASSES = ['selected-cell', 'in-selection-range', 'sel-edge-top', 'sel-edge-bottom', 'sel-edge-left', 'sel-edge-right', 'copied-range-cell', 'autofill-preview-cell', 'active-col-header', 'active-row-header'];
+  let decorated = [];
   function highlightSelectedCellInDOM(scroll = false) {
     if (scroll) {
       const focusP = parseCoord(selectionEndCoord || selectedCoord);
       if (focusP) { ensureRowRendered(focusP.row); ensureColRendered(focusP.col); }
+      // measure before changing any class: the layout is still clean, so this costs no reflow
+      const focusTd = gridBody.querySelector(`td[data-coord="${selectionEndCoord || selectedCoord}"]`);
+      if (focusTd) scrollCellIntoView(focusTd);
     }
-    gridBody.querySelectorAll('td.selected-cell, td.in-selection-range, td.sel-edge-top, td.sel-edge-bottom, td.sel-edge-left, td.sel-edge-right, td.copied-range-cell, td.autofill-preview-cell').forEach(el => {
-      el.classList.remove('selected-cell', 'in-selection-range', 'sel-edge-top', 'sel-edge-bottom', 'sel-edge-left', 'sel-edge-right', 'copied-range-cell', 'autofill-preview-cell');
-    });
-    gridBody.querySelectorAll('.cell-fill-handle').forEach(el => el.remove());
-    gridHead.querySelectorAll('th.active-col-header').forEach(el => el.classList.remove('active-col-header'));
-    gridBody.querySelectorAll('th.active-row-header').forEach(el => el.classList.remove('active-row-header'));
+    for (const el of decorated) if (el.isConnected) el.classList.remove(...SEL_CLASSES);
+    gridBody.querySelectorAll('td.autofill-preview-cell').forEach(el => el.classList.remove('autofill-preview-cell'));
+    const prevHandle = gridBody.querySelector('.cell-fill-handle');
+    if (prevHandle) prevHandle.remove();
+    decorated = [];
+    const mark = (el, ...cls) => { el.classList.add(...cls); decorated.push(el); };
 
     const bounds = getSelectionBounds();
     const { minRow, maxRow, minCol, maxCol } = bounds;
 
     const anchorTd = gridBody.querySelector(`td[data-coord="${selectedCoord}"]`);
-    if (anchorTd) anchorTd.classList.add('selected-cell');
+    if (anchorTd) mark(anchorTd, 'selected-cell');
 
-    const focusTd = gridBody.querySelector(`td[data-coord="${selectionEndCoord || selectedCoord}"]`);
-    if (focusTd && scroll) scrollCellIntoView(focusTd);
-
-    for (let c = minCol; c <= maxCol; c++) {
-      const colStr = indexToCol(c);
-      const colTh = gridHead.querySelector(`th[data-col="${colStr}"]`);
-      if (colTh) colTh.classList.add('active-col-header');
+    for (const th of gridHead.querySelectorAll('th[data-col]')) {
+      const c = colToIndex(th.dataset.col);
+      if (c >= minCol && c <= maxCol) mark(th, 'active-col-header');
     }
 
     // walk the rendered rows once instead of looking up every selected cell
@@ -1614,17 +1616,18 @@
       const inClip = clip && r >= clip.minRow && r <= clip.maxRow;
       if (!inSel && !inClip) continue;
       for (const cell of tr.cells) {
-        if (cell.tagName === 'TH') { if (inSel) cell.classList.add('active-row-header'); continue; }
+        if (cell.tagName === 'TH') { if (inSel) mark(cell, 'active-row-header'); continue; }
         const coord = cell.dataset.coord;
         if (!coord) continue;
         const c = colOf(coord);
-        if (inClip && c >= clip.minCol && c <= clip.maxCol) cell.classList.add('copied-range-cell');
+        if (inClip && c >= clip.minCol && c <= clip.maxCol) mark(cell, 'copied-range-cell');
         if (!inSel || c < minCol || c > maxCol) continue;
-        cell.classList.add('in-selection-range');
-        if (r === minRow) cell.classList.add('sel-edge-top');
-        if (r + (cell.rowSpan || 1) - 1 === maxRow) cell.classList.add('sel-edge-bottom');
-        if (c === minCol) cell.classList.add('sel-edge-left');
-        if (c + (cell.colSpan || 1) - 1 === maxCol) cell.classList.add('sel-edge-right');
+        const cls = ['in-selection-range'];
+        if (r === minRow) cls.push('sel-edge-top');
+        if (r + (cell.rowSpan || 1) - 1 === maxRow) cls.push('sel-edge-bottom');
+        if (c === minCol) cls.push('sel-edge-left');
+        if (c + (cell.colSpan || 1) - 1 === maxCol) cls.push('sel-edge-right');
+        mark(cell, ...cls);
       }
     }
 
@@ -2419,7 +2422,10 @@
     if (commit) setCellContent(activeSheet, coord, val);
   }
 
-  function moveSelection(dRow, dCol, extendSelection = false) {
+  // holding an arrow key repeats faster than the screen paints: the selection moves at once,
+  // the grid is repainted once per frame with wherever it ended up
+  let movePaint = null;
+  function moveSelection(dRow, dCol, extendSelection = false, coalesce = false) {
     const baseCoord = extendSelection ? (selectionEndCoord || selectedCoord) : selectedCoord;
     const parsed = parseCoord(baseCoord);
     if (!parsed) return;
@@ -2450,7 +2456,19 @@
     }
 
     if (needsRender) renderSheet();
-    selectCell(`${indexToCol(targetCol)}${targetRow}`, extendSelection);
+    const target = `${indexToCol(targetCol)}${targetRow}`;
+    if (!coalesce) { selectCell(target, extendSelection); return; }
+    if (extendSelection) selectionEndCoord = target;
+    else selectedCoord = selectionEndCoord = target;
+    if (movePaint) return;
+    const paint = () => {
+      if (!movePaint) return;
+      cancelAnimationFrame(movePaint.raf);
+      clearTimeout(movePaint.timer);
+      movePaint = null;
+      selectCell(extendSelection ? selectionEndCoord : selectedCoord, extendSelection);
+    };
+    movePaint = { raf: requestAnimationFrame(paint), timer: setTimeout(paint, 50) }; // timer: frames paused
   }
 
   // Row / Column Insert & Delete
@@ -3364,10 +3382,10 @@
         return;
       }
 
-      if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1, 0, e.shiftKey); }
-      else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1, 0, e.shiftKey); }
-      else if (e.key === 'ArrowRight') { e.preventDefault(); moveSelection(0, 1, e.shiftKey); }
-      else if (e.key === 'ArrowLeft') { e.preventDefault(); moveSelection(0, -1, e.shiftKey); }
+      if (e.key === 'ArrowDown') { e.preventDefault(); moveSelection(1, 0, e.shiftKey, e.repeat); }
+      else if (e.key === 'ArrowUp') { e.preventDefault(); moveSelection(-1, 0, e.shiftKey, e.repeat); }
+      else if (e.key === 'ArrowRight') { e.preventDefault(); moveSelection(0, 1, e.shiftKey, e.repeat); }
+      else if (e.key === 'ArrowLeft') { e.preventDefault(); moveSelection(0, -1, e.shiftKey, e.repeat); }
       else if (e.key === 'Tab') { e.preventDefault(); moveSelection(0, e.shiftKey ? -1 : 1, false); }
       else if ((e.ctrlKey || e.metaKey) && (e.key === '+' || e.key === '=')) {
         e.preventDefault();

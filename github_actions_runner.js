@@ -1,6 +1,7 @@
 const { Pool } = require('pg');
 const { runActualizarData } = require('./actualizar_data');
 const { runActualizarInventario } = require('./actualizar_inventario');
+const NeonStore = require('./neonStore');
 
 const WORKBOOK_PREFIX = 'reunion123';
 const OPERATION = String(process.argv[2] || '').trim().toLowerCase();
@@ -16,43 +17,22 @@ function splitWorkbook(workbook) {
   return { meta, sheets };
 }
 
+// snapshot + pending deltas (neonStore.js), the same way the server reads it
 async function loadWorkbook(pool, prefix = WORKBOOK_PREFIX) {
-  const [metaResult, sheetsResult] = await Promise.all([
-    pool.query(`SELECT meta FROM ${prefix}_workbook_meta WHERE id = 1`),
-    pool.query(`SELECT name, data FROM ${prefix}_workbook_sheets`)
-  ]);
-  if (!metaResult.rows[0]) throw new Error(`No existe la configuración de ${prefix} en Neon.`);
-  const sheets = {};
-  for (const row of sheetsResult.rows) sheets[row.name] = row.data;
-  return { ...metaResult.rows[0].meta, sheets };
+  const book = await NeonStore.loadBook(pool, prefix);
+  if (!book) throw new Error(`No existe la configuración de ${prefix} en Neon.`);
+  return { ...book.meta, sheets: book.sheets };
 }
 
+// the updated sheets are written whole (their old deltas go away)
 async function saveWorkbookSheets(pool, workbook, sheetNames, prefix = WORKBOOK_PREFIX) {
   const { meta } = splitWorkbook(workbook);
-  const client = await pool.connect();
-  try {
-    await client.query('BEGIN');
-    for (const name of sheetNames) {
-      const sheet = workbook.sheets?.[name];
-      if (!sheet) continue;
-      await client.query(
-        `INSERT INTO ${prefix}_workbook_sheets (name, data) VALUES ($1, $2::jsonb)
-         ON CONFLICT (name) DO UPDATE SET data = EXCLUDED.data, updated_at = NOW()`,
-        [name, JSON.stringify(sheet)]
-      );
-    }
-    await client.query(
-      `INSERT INTO ${prefix}_workbook_meta (id, meta) VALUES (1, $1::jsonb)
-       ON CONFLICT (id) DO UPDATE SET meta = EXCLUDED.meta, updated_at = NOW()`,
-      [JSON.stringify(meta)]
-    );
-    await client.query('COMMIT');
-  } catch (error) {
-    await client.query('ROLLBACK');
-    throw error;
-  } finally {
-    client.release();
-  }
+  const sheets = {};
+  for (const name of sheetNames) if (workbook.sheets?.[name]) sheets[name] = workbook.sheets[name];
+  await NeonStore.transaction(pool, async client => {
+    await NeonStore.writeSnapshots(client, prefix, sheets);
+    await NeonStore.writeMeta(client, prefix, meta);
+  });
 }
 
 async function notifyRender(payload) {
