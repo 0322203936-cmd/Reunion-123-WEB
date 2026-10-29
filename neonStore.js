@@ -10,6 +10,7 @@
 // ============================================================================
 
 const zlib = require('zlib');
+const { applyDelta, snapshotOf, diffSheet, mergeDelta } = require('./sheetDelta');
 
 async function ensureTables(pool, p) {
   await pool.query(`
@@ -53,19 +54,6 @@ async function ensureSharedTables(pool) {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
   `);
-}
-
-function applyDelta(sheet, delta) {
-  if (delta.cells) {
-    sheet.cells = sheet.cells || {};
-    for (const [coord, cell] of Object.entries(delta.cells)) {
-      if (cell === null) delete sheet.cells[coord];
-      else sheet.cells[coord] = cell;
-    }
-  }
-  if (delta.props) Object.assign(sheet, delta.props);
-  for (const key of delta.removed || []) delete sheet[key];
-  return sheet;
 }
 
 // { meta, sheets, deltaCounts: { name: n } } or null when the book was never stored
@@ -130,70 +118,6 @@ async function transaction(pool, fn) {
   } finally {
     client.release();
   }
-}
-
-// ---------------------------------------------------------------- what changed in a sheet
-// `known` (Map coord -> JSON of the cell as last stored) is updated to the new state.
-// Returns null when nothing changed, or { delta, size } (size: number of changed entries).
-function diffSheet(known, knownProps, sheet) {
-  const cells = {};
-  let n = 0;
-  const seen = new Set();
-  for (const [coord, cell] of Object.entries(sheet.cells || {})) {
-    seen.add(coord);
-    const s = JSON.stringify(cell);
-    if (known.get(coord) === s) continue;
-    known.set(coord, s);
-    cells[coord] = cell;
-    n++;
-  }
-  for (const coord of known.keys()) {
-    if (seen.has(coord)) continue;
-    known.delete(coord);
-    cells[coord] = null;
-    n++;
-  }
-  const props = {};
-  const removed = [];
-  const keys = new Set([...Object.keys(sheet), ...knownProps.keys()]);
-  for (const key of keys) {
-    if (key === 'cells') continue;
-    if (!(key in sheet)) { knownProps.delete(key); removed.push(key); n++; continue; }
-    const s = JSON.stringify(sheet[key]);
-    if (knownProps.get(key) === s) continue;
-    knownProps.set(key, s);
-    props[key] = sheet[key];
-    n++;
-  }
-  if (!n) return null;
-  const delta = {};
-  if (Object.keys(cells).length) delta.cells = cells;
-  if (Object.keys(props).length) delta.props = props;
-  if (removed.length) delta.removed = removed;
-  return { delta, size: n };
-}
-
-// remembers a sheet as stored, for the next diff
-function snapshotOf(sheet) {
-  const known = new Map();
-  for (const [coord, cell] of Object.entries(sheet.cells || {})) known.set(coord, JSON.stringify(cell));
-  const knownProps = new Map();
-  for (const [key, value] of Object.entries(sheet)) if (key !== 'cells') knownProps.set(key, JSON.stringify(value));
-  return { known, knownProps };
-}
-
-// merges a newer delta into an older pending one (same sheet)
-function mergeDelta(into, delta) {
-  if (delta.cells) into.cells = { ...(into.cells || {}), ...delta.cells };
-  if (delta.props) {
-    into.props = { ...(into.props || {}), ...delta.props };
-    if (into.removed) into.removed = into.removed.filter(k => !(k in delta.props));
-  }
-  if (delta.removed) {
-    into.removed = [...new Set([...(into.removed || []), ...delta.removed])];
-    if (into.props) for (const k of delta.removed) delete into.props[k];
-  }
-  return into;
 }
 
 // ---------------------------------------------------------------- backups (gzip, last N per book)

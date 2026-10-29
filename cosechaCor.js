@@ -27,17 +27,28 @@
     return Math.round((monday - 2 * 86400000 - EPOCH) / 86400000);
   }
 
+  const MAX_HEADER_COLS = 400;
+  // { col: cell } of the header row
+  function headerRow(sheet) {
+    const cells = sheet.cells || {};
+    const out = [];
+    const n = Math.max(sheet.maxCol || 0, MAX_HEADER_COLS);
+    for (let c = 1; c <= n; c++) {
+      const col = indexToCol(c);
+      const cell = cells[`${col}${HEADER_ROW}`];
+      if (cell) out.push({ col, cell });
+    }
+    return out;
+  }
+
   function lastCosechaSheet(book) {
     const order = (book && book.sheetOrder) || [];
     for (let i = order.length - 1; i >= 0; i--) {
       const name = order[i];
       const sheet = book.sheets[name];
       if (!sheet || sheet.hidden || !/^\s*p\s*cosecha/i.test(name)) continue;
-      const cells = sheet.cells || {};
-      for (const [coord, cell] of Object.entries(cells)) {
-        const m = /^([A-Z]+)(\d+)$/.exec(coord);
-        if (m && Number(m[2]) === HEADER_ROW && norm(cell.v) === 'FLOR 123') return { name, sheet, florCol: m[1] };
-      }
+      const flor = headerRow(sheet).find(h => norm(h.cell.v) === 'FLOR 123');
+      if (flor) return { name, sheet, florCol: flor.col };
     }
     return null;
   }
@@ -50,12 +61,9 @@
     const year = m ? 2000 + Number(m[1]) : new Date().getFullYear();
     const sheetWeek = m ? Number(m[2]) : 1;
     // week columns in order (row 4: a plain week number)
-    const weekCols = [];
-    for (const [coord, cell] of Object.entries(cells)) {
-      const mm = /^([A-Z]+)(\d+)$/.exec(coord);
-      if (mm && Number(mm[2]) === HEADER_ROW && !cell.f && Number.isInteger(cell.v) && cell.v >= 1 && cell.v <= 53) weekCols.push({ col: mm[1], week: cell.v });
-    }
-    weekCols.sort((a, b) => colToIndex(a.col) - colToIndex(b.col));
+    const weekCols = headerRow(sheet)
+      .filter(({ cell }) => !cell.f && Number.isInteger(cell.v) && cell.v >= 1 && cell.v <= 53)
+      .map(({ col, cell }) => ({ col, week: cell.v }));
     const dates = new Set();
     const dayCols = [];
     const groups = (sheet.weekDays && sheet.weekDays.groups) || {};
@@ -68,13 +76,12 @@
     }
     return { dates, dayCols };
   }
-  function lastRowOf(cells, col) {
-    let last = FIRST_ROW;
-    for (const coord of Object.keys(cells)) {
-      const mm = /^([A-Z]+)(\d+)$/.exec(coord);
-      if (mm && mm[1] === col && Number(mm[2]) > last) last = Number(mm[2]);
-    }
-    return last;
+  // last row with something in column `col` (walks up from the bottom of the sheet)
+  function lastRowOf(sheet, col) {
+    const cells = sheet.cells || {};
+    const top = Math.max(sheet.maxRow || 0, (sheet.weekDays && sheet.weekDays.lastRow) || 0, 3000);
+    for (let r = top; r > FIRST_ROW; r--) if (cells[`${col}${r}`]) return r;
+    return FIRST_ROW;
   }
 
   // { sheet, dates: [serial], values: { PRODUCT: { serial: total } }, sig }
@@ -84,7 +91,7 @@
     const { name, sheet, florCol } = found;
     const cells = sheet.cells || {};
     const { dates, dayCols } = dayColumns(found);
-    const last = lastRowOf(cells, florCol);
+    const last = lastRowOf(sheet, florCol);
     const values = {};
     for (let r = FIRST_ROW; r <= last; r++) {
       const product = norm((cells[`${florCol}${r}`] || {}).v);
@@ -113,13 +120,11 @@
     const day = dayColumns(found).dayCols.find(d => d.serial === serial);
     if (!day) return { error: `Esa fecha no está en ${clean(found.name)}` };
     const rows = [];
-    for (let r = FIRST_ROW; r <= lastRowOf(cells, florCol); r++) if (norm((cells[`${florCol}${r}`] || {}).v) === product) rows.push(r);
+    const last = lastRowOf(sheet, florCol);
+    for (let r = FIRST_ROW; r <= last; r++) if (norm((cells[`${florCol}${r}`] || {}).v) === product) rows.push(r);
     if (!rows.length) return { error: `${product} no está en Flor 123 de ${clean(found.name)}` };
-    let fincaCol = null;
-    for (const [coord, cell] of Object.entries(cells)) {
-      const m = /^([A-Z]+)(\d+)$/.exec(coord);
-      if (m && Number(m[2]) === HEADER_ROW && norm(cell.v) === 'FINCA') fincaCol = m[1];
-    }
+    const finca = headerRow(sheet).find(h => norm(h.cell.v) === 'FINCA');
+    const fincaCol = finca ? finca.col : null;
     // only one finca has a number that day: the change goes to it; otherwise to Isabela
     const withValue = rows.filter(r => num((cells[`${day.col}${r}`] || {}).v));
     const target = withValue.length === 1 ? withValue[0]
@@ -147,7 +152,7 @@
   }
 
   // writes the feed into sheet "Reunion" of the Reunion book; returns the number of cells changed
-  function applyFeed(reunionBook, feed) {
+  function applyFeed(reunionBook, feed, changedCoords) {
     const sheet = reunionBook && reunionBook.sheets && reunionBook.sheets.Reunion;
     if (!sheet || !feed || !feed.sheet) return 0;
     const cells = sheet.cells;
@@ -161,11 +166,8 @@
     const firstDate = cells[`${indexToCol(colToIndex(corCols[0]) - 1)}1`];
     const base = firstDate ? num(firstDate.v) : 0;
     if (!base) return 0;
-    let last = 3;
-    for (const coord of Object.keys(cells)) {
-      const mm = /^A(\d+)$/.exec(coord);
-      if (mm && Number(mm[1]) > last) last = Number(mm[1]);
-    }
+    let last = Math.max(sheet.maxRow || 0, 3000);
+    while (last > 3 && !cells[`A${last}`]) last--;
     let changed = 0;
     for (let r = 3; r <= last; r++) {
       const product = norm((cells[`A${r}`] || {}).v);
@@ -180,6 +182,7 @@
         const target = days[serial] || 0;
         if (cell && !cell.f && cell.v === target) return;
         if (cell) { delete cell.f; cell.v = target; } else cells[coord] = { v: target };
+        if (changedCoords) changedCoords.push(coord);
         changed++;
       });
     }

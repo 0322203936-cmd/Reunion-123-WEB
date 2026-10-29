@@ -117,6 +117,8 @@
     if (!ready.sheetOrder || ready.sheetOrder.length === 0) {
       ready.sheetOrder = Object.keys(ready.sheets || {});
     }
+    // learn what the server has, so even the first save of a sheet sends only what changed
+    for (const [name, sheet] of Object.entries(ready.sheets || {})) if (!sentSheets.has(sheet)) learnSent(sheet, name);
     return ready;
   }
 
@@ -291,9 +293,43 @@
     showToast('Action redone (Ctrl+Y)');
   }
 
-  // Saving sends only the sheets that changed (PATCH); the server keeps the rest
+  // Saving sends only the sheets that changed (PATCH), and of each one only the cells that changed
+  // (sheetDelta.js): the first save of a sheet sends it whole, later ones send deltas against it.
   const dirtySheets = new Set();
-  function markSheetDirty(name) { if (name) dirtySheets.add(name); }
+  const touchedCells = new Map();     // sheet -> Set of the only cells that changed (absent: compare the whole sheet)
+  const sentSheets = new WeakMap();   // sheet object -> { name, snap }: what the server has, as last sent
+  function markSheetDirty(name, coords) {
+    if (!name) return;
+    if (!coords) touchedCells.delete(name);
+    else if (!dirtySheets.has(name)) touchedCells.set(name, new Set(coords));
+    else if (touchedCells.has(name)) coords.forEach(c => touchedCells.get(name).add(c));
+    dirtySheets.add(name);
+  }
+  function forgetSent(names, wb) {
+    for (const n of names) if (wb.sheets[n]) sentSheets.delete(wb.sheets[n]);
+  }
+  // remembers a sheet as the server has it, a few thousand cells at a time so the page stays responsive;
+  // until it is complete the snapshot is "partial" (touched cells can still be sent as a delta)
+  const LEARN_CHUNK = 3000;
+  function learnSent(sheet, name) {
+    const snap = { known: new Map(), knownProps: window.SheetDelta.propsOf(sheet), partial: true };
+    const entry = { name, snap };
+    sentSheets.set(sheet, entry);
+    const coords = Object.keys(sheet.cells || {});
+    let i = 0;
+    const step = () => {
+      if (sentSheets.get(sheet) !== entry) return; // relearned meanwhile
+      const cells = sheet.cells || {};
+      for (const end = Math.min(coords.length, i + LEARN_CHUNK); i < end; i++) {
+        const cell = cells[coords[i]];
+        if (cell !== undefined && !snap.known.has(coords[i])) snap.known.set(coords[i], JSON.stringify(cell));
+      }
+      if (i < coords.length) setTimeout(step, 0);
+      else snap.partial = false;
+    };
+    setTimeout(step, 0);
+    return entry;
+  }
 
   let saveTimeout = null;
   let saving = Promise.resolve();
@@ -301,7 +337,9 @@
     saveTimeout = null;
     const names = [...dirtySheets];
     if (!names.length || !workbook) return;
+    const touched = new Map(touchedCells);
     dirtySheets.clear();
+    touchedCells.clear();
     const savedWorkbook = workbook;
     const savedWbKey = WB_KEY;
     const payload = {
@@ -313,11 +351,23 @@
         activeSheet
       },
       sheets: {},
+      deltas: {},
       deleted: []
     };
     for (const n of names) {
-      if (savedWorkbook.sheets[n]) payload.sheets[n] = savedWorkbook.sheets[n];
-      else payload.deleted.push(n);
+      const sheet = savedWorkbook.sheets[n];
+      if (!sheet) { payload.deleted.push(n); continue; }
+      const sent = sentSheets.get(sheet);
+      const coords = touched.get(n) || null;
+      // sent whole: a sheet the server knows by another name / not at all, or a whole-sheet change
+      // while this page is still learning it
+      if (!sent || sent.name !== n || (!coords && sent.snap.partial)) {
+        payload.sheets[n] = sheet;
+        learnSent(sheet, n);
+        continue;
+      }
+      const diff = window.SheetDelta.diffSheet(sent.snap, sheet, coords);
+      if (diff) payload.deltas[n] = diff.delta;
     }
     saving = saving.then(async () => {
       try {
@@ -326,16 +376,25 @@
           headers: { 'Content-Type': 'application/json' },
           body: JSON.stringify(payload)
         });
+        if (res.status === 409) {
+          // the server doesn't have some sheet the deltas were for: send them whole
+          const { missing = [] } = await res.json().catch(() => ({}));
+          forgetSent(missing, savedWorkbook);
+          missing.forEach(n => markSheetDirty(n));
+          if (missing.length) saveWorkbookState();
+          return;
+        }
         if (!res.ok) throw new Error(String(res.status));
       } catch (e) {
-        names.forEach(markSheetDirty); // retry with the next save
+        forgetSent(names, savedWorkbook); // what was sent is unknown: next save sends those sheets whole
+        names.forEach(n => markSheetDirty(n));
         showToast('No se pudo guardar; se reintentará con el próximo cambio', true);
       }
     });
   }
 
-  function saveWorkbookState() {
-    markSheetDirty(activeSheet);
+  function saveWorkbookState(coords) {
+    markSheetDirty(activeSheet, coords);
     clearTimeout(saveTimeout);
     saveTimeout = setTimeout(queueWorkbookSave, 300);
   }
@@ -1724,7 +1783,7 @@
     engine.recalculateAll();
     renderSheet();
     selectCell(coord, false);
-    saveWorkbookState();
+    saveWorkbookState([coord]);
   }
 
   function clearSelectedRange() {

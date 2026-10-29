@@ -9,6 +9,8 @@ const { runActualizarInventario } = require('./actualizar_inventario');
 const CosechaCor = require('./cosechaCor');
 const AppendBuilder = require('./appendBuilder');
 const NeonStore = require('./neonStore');
+const SheetDelta = require('./sheetDelta');
+const gzipAsync = require('util').promisify(zlib.gzip);
 const crypto = require('crypto');
 
 function loadLocalEnv() {
@@ -216,13 +218,39 @@ async function syncCor() {
   const cosecha = await loadWorkbook('cosecha');
   const reunion = await loadWorkbook('reunion');
   const feed = CosechaCor.computeFeed(cosecha);
-  const changed = CosechaCor.applyFeed(reunion, feed);
-  if (changed) await patchWorkbook('reunion', { sheets: { Reunion: reunion.sheets.Reunion } });
+  const coords = [];
+  const changed = CosechaCor.applyFeed(reunion, feed, coords);
+  if (changed) markCellsChanged('reunion', 'Reunion', coords);
   const feedChanged = !corFeed || corFeed.sig !== feed.sig;
   corFeed = feed;
   if (CosechaCor.trackChanges(loadCorHistory(), feed, new Date().toISOString())) saveCorHistorySoon();
   if (changed || feedChanged) broadcastCor();
-  await syncAppend(reunion, cosecha);
+  appendDirty = true;
+  if (rvpViewers()) scheduleAppend();
+}
+
+// "Append" is heavy to build (~100,000 cells): it is rebuilt only while someone has
+// Requerimiento Vs Proyeccion open (a few seconds after the last change) or when it is opened
+let appendDirty = true;
+let appendTimer = null;
+let appendBuilding = null;
+function rvpViewers() {
+  let n = 0;
+  for (const res of corClients) if (res.wbKey === 'rvp') n++;
+  return n;
+}
+function scheduleAppend(delay = 5000) {
+  clearTimeout(appendTimer);
+  appendTimer = setTimeout(() => { ensureAppend().catch(err => console.error('Append:', err)); }, delay);
+}
+async function ensureAppend() {
+  if (appendBuilding) return appendBuilding;
+  if (!appendDirty) return;
+  appendDirty = false;
+  appendBuilding = (async () => {
+    await syncAppend(await loadWorkbook('reunion'), await loadWorkbook('cosecha'));
+  })().finally(() => { appendBuilding = null; });
+  return appendBuilding;
 }
 
 // Requerimiento Vs Proyeccion: sheet "Append" rebuilt from PegarData + Plan de cosecha
@@ -232,8 +260,7 @@ async function syncAppend(reunion, cosecha) {
   const { sheet } = AppendBuilder.buildAppendSheet(reunion, cosecha, rvp);
   const md5 = obj => crypto.createHash('md5').update(JSON.stringify(obj)).digest('hex');
   const sig = md5(sheet.cells);
-  // nothing new, and nobody overwrote it with an older copy
-  if (sig === appendSig && rvp.sheets.Append && md5(rvp.sheets.Append.cells) === sig) return;
+  if (sig === appendSig && rvp.sheets.Append) return; // nothing new
   const order = rvp.sheetOrder || [];
   const meta = order.includes('Append') ? {} : { sheetOrder: [...order, 'Append'] };
   const prev = rvp.sheets.Append;
@@ -351,11 +378,36 @@ function persistBook(key, workbook) {
 }
 function rememberStored(key, meta, sheets, deltaCounts = {}) {
   const st = { sheets: {}, meta: JSON.stringify(meta), deltaCounts };
-  for (const [name, sheet] of Object.entries(sheets)) st.sheets[name] = NeonStore.snapshotOf(persistForm(key, name, sheet));
   stored[key] = st;
+  for (const name of Object.keys(sheets)) learnSheet(key, name);
+}
+
+// "what Neon has" of a sheet (to compare whole sheets later) is built in small steps, so the server
+// keeps answering meanwhile; until it is complete the snapshot is "partial"
+const LEARN_CHUNK = 4000;
+function learnSheet(key, name) {
+  const st = stored[key];
+  const sheet = persistForm(key, name, caches[key] ? caches[key].sheets[name] : null);
+  if (!st || !sheet) return;
+  const snap = { known: new Map(), knownProps: SheetDelta.propsOf(sheet), partial: true };
+  st.sheets[name] = snap;
+  const coords = Object.keys(sheet.cells || {});
+  let i = 0;
+  const step = () => {
+    if (stored[key] !== st || st.sheets[name] !== snap) return; // replaced meanwhile
+    const cells = sheet.cells || {};
+    for (const end = Math.min(coords.length, i + LEARN_CHUNK); i < end; i++) {
+      const cell = cells[coords[i]];
+      if (cell !== undefined && !snap.known.has(coords[i])) snap.known.set(coords[i], JSON.stringify(cell));
+    }
+    if (i < coords.length) setImmediate(step);
+    else snap.partial = false;
+  };
+  setImmediate(step);
 }
 function newPending() {
-  return { deltas: {}, snapshots: new Set(), deleted: new Set(), meta: false, since: Date.now() };
+  // dirty: { name: 'all' | Set of touched cells }, compared with what Neon has when writing
+  return { dirty: {}, deltas: {}, snapshots: new Set(), deleted: new Set(), meta: false, since: Date.now() };
 }
 
 async function initDatabase() {
@@ -411,8 +463,8 @@ async function loadWorkbook(key) {
       const book = await NeonStore.loadBook(pool, cfg(key).prefix);
       const meta = book ? book.meta : splitWorkbook(initialWorkbook(key)).meta;
       const sheets = book ? book.sheets : {};
-      rememberStored(key, meta, sheets, book ? book.deltaCounts : {});
       caches[key] = { ...meta, sheets };
+      rememberStored(key, meta, sheets, book ? book.deltaCounts : {});
       return caches[key];
     })().finally(() => { delete loadingBooks[key]; });
   }
@@ -431,13 +483,14 @@ function persistFileSoon(key) {
   }, 400);
 }
 
-// the in-memory book changed: queue what differs from what Neon has
-function queueChanges(key, names, deletedNames) {
+// the in-memory book changed: remember which sheets (and cells, when known) to compare at write time.
+// `touched` = { name: [coords] } for sheets where only those cells can have changed.
+function queueChanges(key, names, deletedNames, touched) {
   const st = stored[key];
   if (!st) return;
-  const workbook = caches[key];
   const pd = pending[key] || (pending[key] = newPending());
   for (const name of deletedNames) {
+    delete pd.dirty[name];
     if (!st.sheets[name]) continue;
     delete st.sheets[name];
     delete pd.deltas[name];
@@ -445,21 +498,37 @@ function queueChanges(key, names, deletedNames) {
     pd.deleted.add(name);
   }
   for (const name of names) {
+    pd.deleted.delete(name);
+    const coords = touched && touched[name];
+    const cur = pd.dirty[name];
+    if (cur === 'all' || !coords) { pd.dirty[name] = 'all'; continue; }
+    const set = cur || new Set();
+    for (const c of coords) set.add(c);
+    pd.dirty[name] = set;
+  }
+  scheduleFlush(key);
+}
+
+// turns the dirty marks into deltas / full copies (what differs from what Neon has)
+function collectChanges(key, pd) {
+  const st = stored[key];
+  const workbook = caches[key];
+  for (const [name, mark] of Object.entries(pd.dirty)) {
     const sheet = persistForm(key, name, workbook.sheets[name]);
     if (!sheet) continue;
-    pd.deleted.delete(name);
     const known = st.sheets[name];
-    if (!known) { st.sheets[name] = NeonStore.snapshotOf(sheet); pd.snapshots.add(name); continue; }
-    const diff = NeonStore.diffSheet(known.known, known.knownProps, sheet);
+    // a new sheet, or a whole sheet that can't be compared yet: written whole
+    if (!known || (mark === 'all' && known.partial)) { pd.snapshots.add(name); delete pd.deltas[name]; continue; }
+    const diff = SheetDelta.diffSheet(known, sheet, mark === 'all' ? null : mark);
     if (!diff || pd.snapshots.has(name)) continue; // nothing new, or the whole sheet is going anyway
     // a big change (e.g. Actualizar Data) is cheaper as a full copy than as a delta
     if (diff.size > Math.max(3000, known.known.size * 0.3)) { delete pd.deltas[name]; pd.snapshots.add(name); continue; }
-    pd.deltas[name] = pd.deltas[name] ? NeonStore.mergeDelta(pd.deltas[name], diff.delta) : diff.delta;
+    pd.deltas[name] = pd.deltas[name] ? SheetDelta.mergeDelta(pd.deltas[name], diff.delta) : diff.delta;
   }
+  pd.dirty = {};
   const metaJson = JSON.stringify(splitWorkbook(workbook).meta);
   if (metaJson !== st.meta) { st.meta = metaJson; pd.meta = true; }
-  if (!Object.keys(pd.deltas).length && !pd.snapshots.size && !pd.deleted.size && !pd.meta) { delete pending[key]; return; }
-  scheduleFlush(key);
+  return Object.keys(pd.deltas).length || pd.snapshots.size || pd.deleted.size || pd.meta;
 }
 
 function scheduleFlush(key, delay = FLUSH_DEBOUNCE_MS) {
@@ -477,6 +546,7 @@ async function flushBook(key) {
   if (!pd || !pool) return;
   delete pending[key];
   clearTimeout(flushTimers[key]);
+  if (!collectChanges(key, pd)) return; // nothing really changed: Neon stays asleep
   const p = cfg(key).prefix;
   const st = stored[key];
   const workbook = caches[key];
@@ -501,6 +571,7 @@ async function flushBook(key) {
     if (newer) {
       for (const [name, delta] of Object.entries(newer.deltas)) pd.deltas[name] = pd.deltas[name] ? NeonStore.mergeDelta(pd.deltas[name], delta) : delta;
       newer.snapshots.forEach(n => { pd.snapshots.add(n); delete pd.deltas[n]; });
+      Object.assign(pd.dirty, newer.dirty);
       newer.deleted.forEach(n => pd.deleted.add(n));
       pd.meta = pd.meta || newer.meta;
     }
@@ -511,7 +582,7 @@ async function flushBook(key) {
     delete flushing[key];
   }
   for (const name of pd.deleted) delete st.deltaCounts[name];
-  for (const name of pd.snapshots) st.deltaCounts[name] = 0;
+  for (const name of pd.snapshots) { st.deltaCounts[name] = 0; learnSheet(key, name); }
   for (const name of Object.keys(pd.deltas)) st.deltaCounts[name] = (st.deltaCounts[name] || 0) + 1;
   // sheets with many deltas are written whole again, so loading stays quick
   const heavy = Object.keys(st.deltaCounts).filter(n => st.deltaCounts[n] >= COMPACT_AFTER && workbook.sheets[n]);
@@ -558,9 +629,26 @@ async function patchWorkbook(key, patch) {
   const deleted = Array.isArray(patch.deleted) ? patch.deleted : [];
   for (const [name, data] of Object.entries(changed)) workbook.sheets[name] = data;
   for (const name of deleted) delete workbook.sheets[name];
+  // deltas (only the cells that changed); a sheet the server doesn't have is reported back
+  const missing = [];
+  const touched = {};
+  for (const [name, delta] of Object.entries(patch.deltas || {})) {
+    if (!workbook.sheets[name]) { missing.push(name); continue; }
+    SheetDelta.applyDelta(workbook.sheets[name], delta);
+    touched[name] = Object.keys(delta.cells || {});
+  }
+  if (key === 'rvp' && ('Append' in changed || 'Append' in touched)) appendSig = null; // formulas edited by hand
 
+  if (!pool) { persistFileSoon(key); return missing; }
+  queueChanges(key, [...Object.keys(changed), ...Object.keys(touched)], deleted, touched);
+  return missing;
+}
+
+// the server changed some cells of a sheet itself (Cor, Plan de cosecha written from Reunion)
+function markCellsChanged(key, name, coords) {
+  delete gzCache[key];
   if (!pool) return persistFileSoon(key);
-  queueChanges(key, Object.keys(changed), deleted);
+  queueChanges(key, [name], [], { [name]: coords });
 }
 
 async function resetWorkbook(key) {
@@ -699,11 +787,14 @@ async function handleRequest(req, res) {
   }
 
   if (pathname === '/api/workbook' && req.method === 'GET') {
+    if (key === 'rvp' && persistenceReady) await ensureAppend(); // Append up to date before it is sent
     const workbook = await loadWorkbook(key);
     if (String(req.headers['accept-encoding'] || '').includes('gzip')) {
-      if (!gzCache[key]) gzCache[key] = zlib.gzipSync(JSON.stringify(workbook), { level: 6 });
+      // compressed off the main thread, and kept until the book changes
+      if (!gzCache[key]) gzCache[key] = gzipAsync(JSON.stringify(workbook), { level: 4 });
+      const body = await gzCache[key];
       res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-store' });
-      return res.end(gzCache[key]);
+      return res.end(body);
     }
     return sendJson(res, 200, workbook);
   }
@@ -728,8 +819,9 @@ async function handleRequest(req, res) {
     } catch (error) {
       return sendJson(res, 400, { error: 'Cambio inválido' });
     }
-    await patchWorkbook(key, parsed);
+    const missing = await patchWorkbook(key, parsed);
     scheduleCorSync();
+    if (missing && missing.length) return sendJson(res, 409, { error: 'Hojas desconocidas', missing });
     return sendJson(res, 200, { ok: true });
   }
 
@@ -764,7 +856,7 @@ async function handleRequest(req, res) {
       Object.assign(changed, r.cells);
     }
     if (sheetName) {
-      await patchWorkbook('cosecha', { sheets: { [sheetName]: cosecha.sheets[sheetName] } });
+      markCellsChanged('cosecha', sheetName, Object.keys(changed));
       const msg = `event: cosecha
 data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
 
@@ -784,10 +876,11 @@ data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
       'Content-Disposition': `attachment; filename="respaldo-${key}-${stamp}.json.gz"`,
       'Cache-Control': 'no-store'
     });
-    return res.end(zlib.gzipSync(JSON.stringify(workbook), { level: 6 }));
+    return res.end(await gzipAsync(JSON.stringify(workbook), { level: 6 }));
   }
   // one sheet of a book (used to refresh "Append" without reloading the whole page)
   if (pathname === '/api/sheet' && req.method === 'GET') {
+    if (key === 'rvp' && urlObj.searchParams.get('name') === 'Append' && persistenceReady) await ensureAppend();
     const workbook = await loadWorkbook(key);
     const sheet = workbook.sheets[urlObj.searchParams.get('name') || ''];
     if (!sheet) return sendJson(res, 404, { error: 'Hoja no encontrada' });
@@ -796,7 +889,9 @@ data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
   if (pathname === '/api/events' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
     res.write(': ok\n\n');
+    res.wbKey = key;
     corClients.add(res);
+    if (key === 'rvp' && appendDirty) scheduleAppend(500);
     const ping = setInterval(() => res.write(': ping\n\n'), 25000);
     req.on('close', () => { clearInterval(ping); corClients.delete(res); });
     return;
