@@ -1030,12 +1030,18 @@ async function start() {
 }
 
 // Render stops the service with SIGTERM (deploys, sleeping): write what is still pending first
-for (const signal of ['SIGTERM', 'SIGINT']) {
-  process.on(signal, () => {
-    const pendingSaves = Object.keys(pending).length;
-    if (pendingSaves) console.log(` Guardando ${pendingSaves} libro(s) pendientes en Neon antes de salir...`);
-    Promise.race([flushAll(), new Promise(r => setTimeout(r, 8000))]).finally(() => process.exit(0));
-  });
+let stopping = false;
+function stopCleanly() {
+  if (stopping) return;
+  stopping = true;
+  const pendingSaves = Object.keys(pending).length;
+  if (pendingSaves) console.log(` Guardando ${pendingSaves} libro(s) pendientes en Neon antes de salir...`);
+  Promise.race([flushAll(), new Promise(r => setTimeout(r, 8000))]).finally(() => process.exit(0));
 }
+for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, stopCleanly);
+// Windows has no SIGTERM for other programs: tools/servidor.ps1 (updates, "Apagar sistema") creates this file instead
+const STOP_FLAG = path.join(__dirname, 'data', '.detener');
+try { fs.unlinkSync(STOP_FLAG); } catch (_) {}
+setInterval(() => { if (fs.existsSync(STOP_FLAG)) { try { fs.unlinkSync(STOP_FLAG); } catch (_) {} stopCleanly(); } }, 1000).unref();
 
 start();

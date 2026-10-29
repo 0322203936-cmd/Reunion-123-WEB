@@ -16,3 +16,8 @@ Thumbs.db
 # Local backup copies
 data/backup/
 
+
+# PC server: logs and stop requests (tools/servidor.ps1)
+logs/
+data/.detener
+data/.apagar
