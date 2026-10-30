@@ -31,6 +31,8 @@ $super = Get-EnvValue 'PG_SUPERPASSWORD'
 if (-not $super) { $super = New-Password; Set-EnvValue 'PG_SUPERPASSWORD' $super }
 if (-not (Test-Path "$Bin\psql.exe")) {
   Write-Host ' Instalando PostgreSQL 18 (unos minutos)...'
+  # over SSH Windows reports the domain as WORKGROUP and the installer rejects the account
+  $env:USERDOMAIN = $env:COMPUTERNAME
   $override = "--mode unattended --unattendedmodeui none --superpassword $super --serverport 5432 " +
     "--enable-components server,commandlinetools --disable-components pgAdmin,stackbuilder"
   winget install --id PostgreSQL.PostgreSQL.18 --exact --silent --accept-package-agreements --accept-source-agreements --override $override | Out-Null
