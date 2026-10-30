@@ -16,6 +16,7 @@
   let clipboardState = null; // { sheetName, minRow, maxRow, minCol, maxCol, isCut, grid, tsv }
   let inlineEditor = null;
   let staleRows = false; // values changed while a cell was being typed: redraw everything afterwards
+  let gridReach = { sheet: null, row: 1, col: 1 }; // how far the arrows took the grid past the used area
   let zoomLevel = 100;
   let formatPainterActive = false;
   let formatPainterSource = null;
@@ -1703,10 +1704,38 @@
     highlightSelectedCellInDOM();
   }
 
+  // The grid is exactly the used area: the last row / column holding a value or a formula (merged
+  // blocks and pictures included) and wherever the selection is. Typing, pasting or moving past the
+  // edge makes it grow; cells that only carry formatting stay stored but don't stretch the grid.
+  function usedExtent(sheet) {
+    let rows = 1, cols = 1;
+    const cells = sheet.cells || {};
+    for (const coord in cells) {
+      const cell = cells[coord];
+      if (!cell || (!cell.f && (cell.v === undefined || cell.v === null || cell.v === ''))) continue;
+      let i = coord.length;
+      while (i > 0 && coord.charCodeAt(i - 1) >= 48 && coord.charCodeAt(i - 1) <= 57) i--;
+      const row = Number(coord.slice(i));
+      if (row > rows) rows = row;
+      let col = 0;
+      for (let k = 0; k < i; k++) col = col * 26 + (coord.charCodeAt(k) - 64);
+      if (col > cols) cols = col;
+    }
+    for (const m of sheet.merges || []) {
+      const end = parseCoord(String(m).split(':')[1] || '');
+      if (end && cells[String(m).split(':')[0]]) { rows = Math.max(rows, end.row); cols = Math.max(cols, end.col); }
+    }
+    for (const img of sheet.images || []) { rows = Math.max(rows, img.row || 1); cols = Math.max(cols, img.col || 1); }
+    return { rows, cols };
+  }
+
   function fitSheetSize(sheet) {
-    const lastReal = getLastRealRow(activeSheet);
-    sheet.maxCol = Math.max(sheet.maxCol || 20, 20);
-    sheet.maxRow = Math.max(sheet.maxRow || 100, lastReal + 40, 100);
+    const used = usedExtent(sheet);
+    const a = parseCoord(selectedCoord || 'A1') || { row: 1, col: 1 };
+    const b = parseCoord(selectionEndCoord || selectedCoord || 'A1') || a;
+    const reach = gridReach.sheet === activeSheet ? gridReach : { row: 1, col: 1 };
+    sheet.maxRow = Math.max(used.rows, a.row, b.row, reach.row);
+    sheet.maxCol = Math.max(used.cols, a.col, b.col, reach.col);
   }
 
   // what decides where every row and column goes: when it is unchanged after an edit, the rows on
@@ -1730,10 +1759,10 @@
     const rows = new Set();
     for (const key of affected) if (key.startsWith(prefix)) rows.add(Number(key.slice(prefix.length).replace(/^[A-Z]+/, '')));
     const before = layoutKey(sheet);
-    // the grid only grows: a value below the last rows adds room (same rule as fitSheetSize)
+    // a value below the last row makes the grid grow (the next full render fits it again: fitSheetSize)
     let lastChanged = 0;
     for (const r of rows) if (r > lastChanged) lastChanged = r;
-    sheet.maxRow = Math.max(sheet.maxRow || 100, lastChanged + 40, 100);
+    sheet.maxRow = Math.max(sheet.maxRow || 1, lastChanged);
     computeLayout(sheet, true);
     if (layoutKey(sheet) !== before) { renderSheet(); return; }
     const cache = view.rowCache;
@@ -2612,8 +2641,8 @@
       }
     }
     if (clip.isCut) clipboardState = null;
-    if (endR + 5 > sheet.maxRow) sheet.maxRow = endR + 20;
-    if (endC + 2 > sheet.maxCol) sheet.maxCol = endC + 5;
+    sheet.maxRow = Math.max(sheet.maxRow || 1, endR);
+    sheet.maxCol = Math.max(sheet.maxCol || 1, endC);
 
     refreshValues(recalcRange(activeSheet, bounds.minRow, endR, bounds.minCol, endC, cutCells));
     selectedCoord = `${indexToCol(bounds.minCol)}${bounds.minRow}`;
@@ -2649,8 +2678,8 @@
 
     const endR = bounds.minRow + targetRows - 1;
     const endC = bounds.minCol + targetCols - 1;
-    if (endR + 5 > sheet.maxRow) sheet.maxRow = endR + 20;
-    if (endC + 2 > sheet.maxCol) sheet.maxCol = endC + 5;
+    sheet.maxRow = Math.max(sheet.maxRow || 1, endR);
+    sheet.maxCol = Math.max(sheet.maxCol || 1, endC);
 
     refreshValues(recalcRange(activeSheet, bounds.minRow, endR, bounds.minCol, endC));
     selectedCoord = `${indexToCol(bounds.minCol)}${bounds.minRow}`;
@@ -2881,12 +2910,17 @@
     if (visIdx >= 0 && view.visCols[visIdx + dCol] !== undefined) targetCol = view.visCols[visIdx + dCol];
     else if (visIdx >= 0 && dCol < 0) targetCol = fromCol;
 
-    if (targetRow > (sheet.maxRow || 100)) {
-      sheet.maxRow = targetRow + 25;
+    if (targetRow > (sheet.maxRow || 1) || targetCol > (sheet.maxCol || 1)) {
+      if (gridReach.sheet !== activeSheet) gridReach = { sheet: activeSheet, row: 1, col: 1 };
+      gridReach.row = Math.max(gridReach.row, targetRow);
+      gridReach.col = Math.max(gridReach.col, targetCol);
+    }
+    if (targetRow > (sheet.maxRow || 1)) {
+      sheet.maxRow = targetRow;
       needsRender = true;
     }
-    if (targetCol > (sheet.maxCol || 20)) {
-      sheet.maxCol = targetCol + 5;
+    if (targetCol > (sheet.maxCol || 1)) {
+      sheet.maxCol = targetCol;
       needsRender = true;
     }
 
@@ -3047,20 +3081,6 @@
     showToast(`${count} row(s) deleted`);
   }
 
-  function expandGridDimensions(extraRows = 0, extraCols = 0) {
-    const sheet = workbook.sheets[activeSheet];
-    if (!sheet) return;
-    if (extraRows > 0) sheet.maxRow = (sheet.maxRow || 100) + extraRows;
-    if (extraCols > 0) sheet.maxCol = (sheet.maxCol || 20) + extraCols;
-    renderSheet();
-    saveWorkbookState();
-    showToast(
-      extraRows > 0
-        ? `Added ${extraRows} more rows at the bottom (Total: ${sheet.maxRow} rows)`
-        : `Added ${extraCols} more columns to the right (Up to column ${indexToCol(sheet.maxCol)})`
-    );
-  }
-
   // Fill Handle Preview & Commit
   function updateFillHandlePreview(hoverCoord) {
     gridBody.querySelectorAll('td.autofill-preview-cell').forEach(el => el.classList.remove('autofill-preview-cell'));
@@ -3127,6 +3147,7 @@
   function switchSheet(sheetName) {
     if (!workbook.sheets[sheetName]) return;
     activeSheet = sheetName;
+    selectedCoord = selectionEndCoord = 'A1';
     renderSheetTabs();
     renderSheet();
     selectCell('A1', false);
@@ -3840,20 +3861,8 @@
       }
     });
 
-    // Infinite scroll-to-bottom auto-expansion
     const viewportEl = document.getElementById('spreadsheetViewport');
-    if (viewportEl) {
-      viewportEl.addEventListener('scroll', onViewportScroll, { passive: true });
-      viewportEl.addEventListener('scroll', () => {
-        if (viewportEl.scrollTop + viewportEl.clientHeight >= viewportEl.scrollHeight - 25) {
-          const sheet = workbook?.sheets?.[activeSheet];
-          if (sheet && (sheet.maxRow || 100) < 2500) {
-            sheet.maxRow = (sheet.maxRow || 100) + 150; // fewer, larger extensions while scrolling down
-            renderSheet();
-          }
-        }
-      });
-    }
+    if (viewportEl) viewportEl.addEventListener('scroll', onViewportScroll, { passive: true });
 
     // Excel Right-Click Context Menu
     const ctxMenu = document.createElement('div');
@@ -3916,13 +3925,6 @@
         <button class="excel-context-item danger" data-ctx="delete-row">
           <span>🗑️ Delete Selected Row(s)</span><span class="excel-context-shortcut">Ctrl+-</span>
         </button>
-        <div class="excel-context-divider"></div>
-        <button class="excel-context-item" data-ctx="add-50-rows">
-          <span>⬇️ Add 50 More Rows at Bottom</span>
-        </button>
-        <button class="excel-context-item" data-ctx="add-5-cols">
-          <span>➡️ Add 5 More Columns to Right</span>
-        </button>
       `;
 
       ctxMenu.style.display = 'flex';
@@ -3947,8 +3949,6 @@
       else if (action === 'insert-below') insertRowsAt(bounds.maxRow + 1, 1);
       else if (action === 'insert-5') insertRowsAt(bounds.minRow, 5);
       else if (action === 'delete-row') deleteSelectedRows();
-      else if (action === 'add-50-rows') expandGridDimensions(50, 0);
-      else if (action === 'add-5-cols') expandGridDimensions(0, 5);
       else if (action === 'sheet-add') addNewSheet();
       else if (action === 'sheet-rename') {
         const targetSheet = btn.getAttribute('data-target-sheet') || activeSheet;
