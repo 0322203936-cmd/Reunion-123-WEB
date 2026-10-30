@@ -480,7 +480,7 @@ async function initDatabase() {
   const last = await pool.query('SELECT MAX(created_at) AS at FROM app_backups');
   lastBackupAt = last.rows[0].at ? new Date(last.rows[0].at).getTime() : 0;
 
-  console.log(' Persistencia activa: Neon PostgreSQL');
+  console.log(` Persistencia activa: PostgreSQL ${DATABASE_SSL ? '(Neon, en la nube)' : '(en esta PC)'}`);
 }
 
 // ---------------------------------------------------------------- workbook persistence
