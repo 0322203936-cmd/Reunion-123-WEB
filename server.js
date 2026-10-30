@@ -36,6 +36,8 @@ const PORT = Number(process.env.PORT || 3070);
 const ROOT_DIR = __dirname;
 const DATA_DIR = path.join(ROOT_DIR, 'data');
 const DATABASE_URL = process.env.DATABASE_URL;
+// Neon needs SSL; the PostgreSQL installed on this same PC (tools/instalar_postgres.ps1) doesn't use it
+const DATABASE_SSL = /@(localhost|127\.0\.0\.1)[:/]/.test(DATABASE_URL || '') ? false : { rejectUnauthorized: false };
 const GITHUB_ACTIONS_TOKEN = String(process.env.GITHUB_ACTIONS_TOKEN || '').trim();
 const GITHUB_REPOSITORY = String(process.env.GITHUB_REPOSITORY || '0322203936-cmd/Reunion-123-WEB').trim();
 const REUNION_SYNC_TOKEN = String(process.env.REUNION_SYNC_TOKEN || '').trim();
@@ -447,7 +449,7 @@ async function initDatabase() {
 
   pool = new Pool({
     connectionString: DATABASE_URL,
-    ssl: { rejectUnauthorized: false },
+    ssl: DATABASE_SSL,
     max: 3,
     idleTimeoutMillis: 10000, // idle connections close quickly so Neon can go to sleep
     connectionTimeoutMillis: 15000,

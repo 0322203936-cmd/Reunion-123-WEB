@@ -133,7 +133,8 @@ async function main() {
   const reference = JSON.parse(fs.readFileSync(refPath, 'utf8')).sheets[SHEET];
   if (!reference) throw new Error(`La copia ${refPath} no tiene la hoja ${SHEET}`);
 
-  const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: { rejectUnauthorized: false }, max: 2 });
+  const local = /@(localhost|127\.0\.0\.1)[:/]/.test(process.env.DATABASE_URL);
+  const pool = new Pool({ connectionString: process.env.DATABASE_URL, ssl: local ? false : { rejectUnauthorized: false }, max: 2 });
   try {
     const book = await NeonStore.loadBook(pool, PREFIX);
     if (!book || !book.sheets[SHEET]) throw new Error(`No se encontró la hoja ${SHEET} en Neon`);

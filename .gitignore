@@ -21,3 +21,6 @@ data/backup/
 logs/
 data/.detener
 data/.apagar
+
+# PC server: database backups (tools/respaldo_bd.ps1)
+respaldos/
