@@ -255,7 +255,7 @@
     window.addEventListener(type, () => { lastInteraction = performance.now(); }, { capture: true, passive: true });
   }
   // sheet properties that never change a formula's result
-  const LAYOUT_PROPS = new Set(['colWidths', 'rowHeights', 'maxRow', 'maxCol', 'freeze', 'styleBounds', 'defaultStyle', 'merges', 'condFormats', 'images']);
+  const LAYOUT_PROPS = new Set(['colWidths', 'rowHeights', 'maxRow', 'maxCol', 'freeze', 'styleBounds', 'defaultStyle', 'merges', 'condFormats', 'images', 'pivotAreas']);
   // other modules (Cor, Append) listen on this same connection instead of opening their own
   const liveHandlers = [];
   window.MauriEvents = {

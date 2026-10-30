@@ -415,9 +415,18 @@
     const loc = parseRange(p.location);
     const top = anchor ? anchor.row : loc.r1 - ((p.filters || []).length ? (p.filters.length + 1) : 0);
     const left = anchor ? anchor.col : loc.c1;
-    // clear the previous output
+    // clear the previous output. p.area lives in the book's pivot list, which another open page can
+    // overwrite with an older copy: the sheet also remembers what was written (sheet.pivotAreas, saved
+    // with its cells) and the larger of both is cleared, so no rows / columns of an older layout remain
     const old = p.area ? parseRange(p.area) : null;
-    const clearArea = old || { r1: Math.max(1, top), r2: loc ? loc.r2 : top, c1: left, c2: loc ? loc.c2 : left };
+    const written = sheet.pivotAreas && sheet.pivotAreas[p.id] ? parseRange(sheet.pivotAreas[p.id]) : null;
+    let clearArea = old || { r1: Math.max(1, top), r2: loc ? loc.r2 : top, c1: left, c2: loc ? loc.c2 : left };
+    if (written) {
+      clearArea = {
+        r1: Math.min(clearArea.r1, written.r1), r2: Math.max(clearArea.r2, written.r2),
+        c1: Math.min(clearArea.c1, written.c1), c2: Math.max(clearArea.c2, written.c2)
+      };
+    }
     const gapRow = (p.filters || []).length ? top + p.filters.length : null; // not part of the pivot: user text there stays
     for (let r = clearArea.r1; r <= clearArea.r2; r++) {
       // The spacer row belongs to the pivot's generated layout. Clear it too
@@ -445,6 +454,7 @@
     p.anchor = `${indexToCol(left)}${Math.max(1, top)}`;
     p.location = `${indexToCol(left)}${top + tableTop}:${indexToCol(left + maxC)}${bottom}`;
     p.area = `${indexToCol(left)}${Math.max(1, top)}:${indexToCol(left + maxC)}${bottom}`;
+    sheet.pivotAreas = { ...(sheet.pivotAreas || {}), [p.id]: p.area };
     sheet.maxRow = Math.max(sheet.maxRow || 100, bottom + 20);
     sheet.maxCol = Math.max(sheet.maxCol || 20, left + maxC + 3);
     const widths = sheet.colWidths = sheet.colWidths || {};
@@ -781,9 +791,12 @@
       const pv = currentPivot();
       if (!pv || !confirm(`¿Eliminar la tabla dinámica "${pv.name}"?`)) return;
       App().pushUndo([pv.sheet]);
-      const a = areaOf(pv);
       const sheet = wb().sheets[pv.sheet];
-      if (a && sheet) for (let r = a.r1; r <= a.r2; r++) for (let c = a.c1; c <= a.c2; c++) delete sheet.cells[`${indexToCol(c)}${r}`];
+      const written = sheet && sheet.pivotAreas && sheet.pivotAreas[pv.id];
+      for (const a of [areaOf(pv), written ? parseRange(written) : null]) {
+        if (a && sheet) for (let r = a.r1; r <= a.r2; r++) for (let c = a.c1; c <= a.c2; c++) delete sheet.cells[`${indexToCol(c)}${r}`];
+      }
+      if (written) { sheet.pivotAreas = { ...sheet.pivotAreas }; delete sheet.pivotAreas[pv.id]; }
       wb().pivots = pivots().filter(x => x.id !== pv.id);
       App().markDirty(pv.sheet);
       App().recalcAndRender();
