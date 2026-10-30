@@ -151,17 +151,32 @@
   }
 
   // ---------------------------------------------------------------- week = sum of its days
-  function syncWeekTotals(workbook) {
+  // changed: null = look at every row; otherwise only the rows of the changed "Sheet!A1" keys
+  // (the week cells it turns into formulas are added to the list)
+  function syncWeekTotals(workbook, changed) {
     for (const [name, sheet] of Object.entries(workbook.sheets || {})) {
       const wd = sheet.weekDays;
       if (!wd) continue;
-      let last = wd.lastRow;
-      for (const coord of Object.keys(sheet.cells)) {
-        const r = Number(coord.replace(/^[A-Z]+/, ''));
-        if (r > last) last = r;
+      let rows;
+      if (changed) {
+        rows = new Set();
+        for (const key of changed) {
+          const bang = key.lastIndexOf('!');
+          if (key.slice(0, bang) === name) rows.add(Number(key.slice(bang + 1).replace(/^[A-Z]+/, '')));
+        }
+        if (!rows.size) continue;
+      } else {
+        let last = wd.lastRow;
+        for (const coord of Object.keys(sheet.cells)) {
+          const r = Number(coord.replace(/^[A-Z]+/, ''));
+          if (r > last) last = r;
+        }
+        rows = [];
+        for (let r = FIRST_ROW; r <= last; r++) rows.push(r);
       }
       for (const [weekCol, g] of Object.entries(wd.groups)) {
-        for (let r = FIRST_ROW; r <= last; r++) {
+        for (const r of rows) {
+          if (r < FIRST_ROW) continue;
           const has = g.cols.some(c => {
             const e = sheet.cells[`${c}${r}`];
             return e && ((e.v !== undefined && e.v !== null && e.v !== '') || e.f);
@@ -173,20 +188,17 @@
           if (cell.f === formula) continue;
           cell.f = formula;
           delete cell.v;
+          if (changed) changed.push(`${name}!${coord}`);
           if (App() && App().markDirty) App().markDirty(name);
         }
       }
     }
   }
 
-  const proto = window.FormulaEngine && window.FormulaEngine.prototype;
-  if (proto && !proto.__weeksPatched) {
-    const recalc = proto.recalculateAll;
-    proto.recalculateAll = function () {
-      try { syncWeekTotals(this.workbook); } catch (e) { console.error(e); }
-      return recalc.apply(this, arguments);
-    };
-    proto.__weeksPatched = true;
+  const Engine = window.FormulaEngine;
+  if (Engine && !Engine.__weeksPatched) {
+    Engine.beforeRecalc.push(syncWeekTotals);
+    Engine.__weeksPatched = true;
   }
 
   document.addEventListener('mousedown', (e) => {

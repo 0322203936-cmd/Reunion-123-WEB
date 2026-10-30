@@ -413,6 +413,64 @@ class FormulaEngine {
     this.usedRows = new Map();
   }
 
+  // ---- dependency tracking (incremental recalculation)
+  // While a formula is evaluated every reference it reads is recorded against it, so a change only
+  // recalculates the formulas that read a changed cell, then the ones reading those, and so on.
+  // Whole columns / rows and table columns are open-ended (they grow with the data).
+  resetDeps() {
+    this.deps = {
+      byKey: new Map(),    // formula key -> [[set, entry], ...] where its entries live (removed when it re-records)
+      cells: new Map(),    // "Sheet!col" -> Map(row -> Set(entries))  single-cell references
+      cols: new Map(),     // "Sheet!col" -> Set(entries)               narrow ranges, per column
+      wide: new Map(),     // sheet -> Set(entries)                     ranges spanning many columns
+      volatile: new Set()  // formulas recalculated on every change (TODAY)
+    };
+    this.curDeps = null;
+  }
+
+  recordRange(sheet, r1, c1, r2, c2) {
+    if (this.curDeps) this.curDeps.push([sheet, r1, c1, r2, c2]);
+  }
+
+  registerDeps(key, refs, volatile) {
+    const d = this.deps;
+    const old = d.byKey.get(key);
+    if (old) for (const [set, entry] of old) set.delete(entry);
+    if (volatile) d.volatile.add(key); else d.volatile.delete(key);
+    const placed = [];
+    const add = (map, k, entry) => {
+      let set = map.get(k);
+      if (!set) { set = new Set(); map.set(k, set); }
+      set.add(entry);
+      placed.push([set, entry]);
+    };
+    for (const [sheet, r1, c1, r2, c2] of refs) {
+      if (r1 === r2 && c1 === c2) {
+        let rows = d.cells.get(`${sheet}!${c1}`);
+        if (!rows) { rows = new Map(); d.cells.set(`${sheet}!${c1}`, rows); }
+        add(rows, r1, { key });
+      } else if (c2 - c1 < 16) {
+        const entry = { key, r1, r2 };
+        for (let c = c1; c <= c2; c++) add(d.cols, `${sheet}!${c}`, entry);
+      } else {
+        add(d.wide, sheet, { key, r1, r2, c1, c2 });
+      }
+    }
+    if (placed.length) d.byKey.set(key, placed); else d.byKey.delete(key);
+  }
+
+  // formulas that read cell (row, col) of a sheet
+  dependentsOf(sheet, row, col, out) {
+    const d = this.deps;
+    const exact = d.cells.get(`${sheet}!${col}`);
+    const atRow = exact && exact.get(row);
+    if (atRow) for (const e of atRow) out.push(e.key);
+    const narrow = d.cols.get(`${sheet}!${col}`);
+    if (narrow) for (const e of narrow) if (row >= e.r1 && row <= e.r2) out.push(e.key);
+    const wide = d.wide.get(sheet);
+    if (wide) for (const e of wide) if (row >= e.r1 && row <= e.r2 && col >= e.c1 && col <= e.c2) out.push(e.key);
+  }
+
   // ---- cell access
   sheetOf(name) { return this.workbook.sheets[name]; }
 
@@ -472,8 +530,15 @@ class FormulaEngine {
     }
     const key = `${sheetName}!${coord}`;
     if (this.memo.has(key)) return this.memo.get(key);
+    // incremental pass: formulas outside the affected set keep the value they already have
+    // (after any recalculation every stored value is current, so reads in between trust them too)
+    if ((this.dirty ? !this.dirty.has(key) : this.trustStored) && cell.v !== undefined) return cell.e ? new XlError(cell.v) : cell.v;
     if (this.visiting.has(key)) return 0; // circular reference -> 0 like Excel
     this.visiting.add(key);
+    const outerDeps = this.curDeps;
+    const outerVolatile = this.curVolatile;
+    const tracking = !!this.deps;
+    if (tracking) { this.curDeps = []; this.curVolatile = false; }
     let val;
     try {
       val = this.evalAst(compile(cell.f), sheetName, row, col);
@@ -485,6 +550,11 @@ class FormulaEngine {
       val = isErr(e) ? e : ERR.VALUE;
     } finally {
       this.visiting.delete(key);
+      if (tracking) {
+        this.registerDeps(key, this.curDeps, this.curVolatile);
+        this.curDeps = outerDeps;
+        this.curVolatile = outerVolatile;
+      }
     }
     this.memo.set(key, val);
     return val;
@@ -539,19 +609,86 @@ class FormulaEngine {
     return v;
   }
 
+  runHooks(changed) {
+    for (const hook of FormulaEngine.beforeRecalc) {
+      try { hook(this.workbook, changed); } catch (e) { console.error(e); }
+    }
+  }
+
+  storeValue(cell, v) {
+    if (isErr(v)) { cell.v = v.code; cell.e = true; }
+    else { cell.v = v === null ? 0 : v; if (cell.e) delete cell.e; }
+  }
+
   recalculateAll() {
+    this.runHooks(null);
     this.resetPass();
+    this.resetDeps();
+    this.dirty = null;
+    this.trustStored = false;
     for (const [sheetName, sheet] of Object.entries(this.workbook.sheets)) {
       if (!sheet.cells) continue;
       for (const [coord, cell] of Object.entries(sheet.cells)) {
         if (!cell || !cell.f) continue;
         const p = parseCoord(coord);
         if (!p) continue;
-        const v = this.cellValue(sheetName, p.row, p.col);
-        if (isErr(v)) { cell.v = v.code; cell.e = true; }
-        else { cell.v = v === null ? 0 : v; if (cell.e) delete cell.e; }
+        this.storeValue(cell, this.cellValue(sheetName, p.row, p.col));
       }
     }
+    this.trustStored = true;
+  }
+
+  // Recalculates only what depends on the changed cells: `changes` = [[sheetName, coord], ...] whose
+  // value or formula changed. Anything structural (rows/columns moved, sheets renamed or deleted, filters,
+  // tables) still goes through recalculateAll. Returns the keys ("Sheet!A1") of every cell whose value may
+  // have changed (the changed ones and the formulas recalculated), or null when it recalculated everything.
+  recalculateCells(changes) {
+    if (!this.deps) { this.recalculateAll(); return null; }
+    const changed = changes.map(([s, c]) => `${s}!${c}`);
+    this.runHooks(changed); // hooks may change more cells: they add them to `changed`
+    const dirty = new Set();
+    const queue = [];
+    const visit = key => { if (!dirty.has(key)) { dirty.add(key); queue.push(key); } };
+    const seen = new Set();
+    for (const key of changed) {
+      if (seen.has(key)) continue;
+      seen.add(key);
+      const bang = key.lastIndexOf('!');
+      const cell = this.cellAtKey(key, bang);
+      if (cell && cell.f) visit(key);
+      else this.expandFrom(key, bang, visit);
+    }
+    for (const key of this.deps.volatile) visit(key);
+    for (let i = 0; i < queue.length; i++) this.expandFrom(queue[i], queue[i].lastIndexOf('!'), visit);
+
+    this.resetPass();
+    this.dirty = dirty;
+    try {
+      for (const key of dirty) {
+        const bang = key.lastIndexOf('!');
+        const cell = this.cellAtKey(key, bang);
+        if (!cell || !cell.f) continue;
+        const p = parseCoord(key.slice(bang + 1));
+        this.storeValue(cell, this.cellValue(key.slice(0, bang), p.row, p.col));
+      }
+    } finally {
+      this.dirty = null;
+    }
+    for (const key of changed) dirty.add(key);
+    return dirty;
+  }
+
+  cellAtKey(key, bang) {
+    const sheet = this.sheetOf(key.slice(0, bang));
+    return sheet && sheet.cells ? sheet.cells[key.slice(bang + 1)] : undefined;
+  }
+
+  expandFrom(key, bang, visit) {
+    const p = parseCoord(key.slice(bang + 1));
+    if (!p) return;
+    const out = [];
+    this.dependentsOf(key.slice(0, bang), p.row, p.col, out);
+    for (const k of out) visit(k);
   }
 
   // ---- evaluation
@@ -622,11 +759,23 @@ class FormulaEngine {
       case 'missing': return null;
       case 'ref': {
         const s = node.sheet || sheet;
+        this.recordRange(s, node.r, node.c, node.r, node.c);
         if (!this.sheetOf(s)) return ERR.REF;
         return new RangeRef(s, node.r, node.c, node.r, node.c);
       }
-      case 'range': return this.resolveRange(node, sheet);
-      case 'sref': return this.resolveStructured(node, sheet, row);
+      case 'range': {
+        const s = node.sheet || sheet;
+        if (node.wholeCol) this.recordRange(s, 1, node.c1, Infinity, node.c2);
+        else if (node.wholeRow) this.recordRange(s, node.r1, 1, node.r2, Infinity);
+        else this.recordRange(s, Math.min(node.r1, node.r2), Math.min(node.c1, node.c2), Math.max(node.r1, node.r2), Math.max(node.c1, node.c2));
+        return this.resolveRange(node, sheet);
+      }
+      case 'sref': {
+        const range = this.resolveStructured(node, sheet, row);
+        // table columns grow with the data: open-ended unless it is "this row"
+        this.recordRange(range.sheet, range.r1, range.c1, /@|#this row/i.test(node.spec) ? range.r2 : Infinity, range.c2);
+        return range;
+      }
       case 'name': return ERR.NAME;
       case 'un': {
         // unary plus is a no-op in Excel (=+A1 keeps text as text)
@@ -1081,6 +1230,7 @@ class FormulaEngine {
 
         // ---- dates (Excel serial numbers)
         case 'TODAY': {
+          this.curVolatile = true;
           const d = new Date();
           return Math.floor((Date.UTC(d.getFullYear(), d.getMonth(), d.getDate()) - Date.UTC(1899, 11, 30)) / 86400000);
         }
@@ -1117,6 +1267,10 @@ class FormulaEngine {
     }
   }
 }
+
+// functions run before every recalculation: hook(workbook, changed) where `changed` is null for a full
+// recalculation, or the list of changed "Sheet!A1" keys, to which a hook adds the cells it changes itself
+FormulaEngine.beforeRecalc = [];
 
 const ExcelUtils = { colToIndex, indexToCol, parseCoord, ERROR_CODES, isErr, compareXl, toNum };
 

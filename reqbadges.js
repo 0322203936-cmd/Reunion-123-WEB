@@ -151,14 +151,14 @@
     return Math.ceil(need);
   }
 
-  window.MauriReq = { cellExtra, minColPx, reload: () => loadReq().then(() => App().recalcAndRender()) };
+  window.MauriReq = { cellExtra, minColPx, reload: () => loadReq().then(() => App().render()) }; // badges only
 
   loadReq().then(() => {
     const wait = setInterval(() => {
       const app = App();
       if (!app || !app.getWorkbook() || !app.getEngine()) return;
       clearInterval(wait);
-      app.recalcAndRender();
+      app.render();
     }, 300);
   }).catch(err => console.error('Req de Reunion:', err));
 })();

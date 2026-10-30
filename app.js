@@ -15,6 +15,7 @@
   let fillPreviewTargetCoord = null;
   let clipboardState = null; // { sheetName, minRow, maxRow, minCol, maxCol, isCut, grid, tsv }
   let inlineEditor = null;
+  let staleRows = false; // values changed while a cell was being typed: redraw everything afterwards
   let zoomLevel = 100;
   let formatPainterActive = false;
   let formatPainterSource = null;
@@ -242,6 +243,19 @@
   let liveKey = null;
   let liveConnectedOnce = false;
   let remoteRenderTimer = null;
+  // what other people changed since the last render: only those cells are recalculated
+  // (remoteChanges), unless something structural arrived (remoteFull)
+  let remoteChanges = [];
+  let remoteFull = false;
+  let remoteRedraw = false; // sheet properties changed (sizes, styles, freeze...): draw the whole sheet
+  let remoteWaitSince = 0;
+  // the user moving around (keys, clicks, wheel): remote changes are drawn in the next pause
+  let lastInteraction = 0;
+  for (const type of ['keydown', 'mousedown', 'wheel']) {
+    window.addEventListener(type, () => { lastInteraction = performance.now(); }, { capture: true, passive: true });
+  }
+  // sheet properties that never change a formula's result
+  const LAYOUT_PROPS = new Set(['colWidths', 'rowHeights', 'maxRow', 'maxCol', 'freeze', 'styleBounds', 'defaultStyle', 'merges', 'condFormats', 'images']);
   // other modules (Cor, Append) listen on this same connection instead of opening their own
   const liveHandlers = [];
   window.MauriEvents = {
@@ -270,7 +284,7 @@
   // undo must not bring back an old copy over what someone else changed meanwhile
   function dropUndoFor(names) {
     if (!names.size) return;
-    const touches = snap => Object.keys(snap.saved).some(n => names.has(n));
+    const touches = snap => Object.keys(snap.saved).concat(Object.keys(snap.cells || {})).some(n => names.has(n));
     for (const stack of [undoStack, redoStack]) {
       for (let i = stack.length - 1; i >= 0; i--) if (touches(stack[i])) stack.splice(i, 1);
     }
@@ -290,11 +304,14 @@
         for (const [coord, cell] of Object.entries(delta.cells)) {
           if ((mine && mine.has(coord)) || (name === activeSheet && coord === editing)) continue;
           cells[coord] = cell;
+          remoteChanges.push([name, coord]);
           if (sent) { if (cell === null) sent.snap.known.delete(coord); else sent.snap.known.set(coord, JSON.stringify(cell)); }
         }
         window.SheetDelta.applyDelta(sheet, { cells });
       }
       if (delta.props || delta.removed) {
+        if (Object.keys(delta.props || {}).concat(delta.removed || []).some(k => !LAYOUT_PROPS.has(k))) remoteFull = true;
+        remoteRedraw = true;
         window.SheetDelta.applyDelta(sheet, { props: delta.props, removed: delta.removed });
         if (sent) {
           for (const [k, v] of Object.entries(delta.props || {})) sent.snap.knownProps.set(k, JSON.stringify(v));
@@ -304,9 +321,10 @@
       changed.add(name);
     }
     for (const name of data.sheets || []) { changed.add(name); fetchRemoteSheet(name); }
-    for (const name of data.deleted || []) { changed.add(name); delete workbook.sheets[name]; }
+    for (const name of data.deleted || []) { changed.add(name); delete workbook.sheets[name]; remoteFull = true; }
     if (data.meta) {
       for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) if (data.meta[k] !== undefined) workbook[k] = data.meta[k];
+      if (data.meta.tables !== undefined) remoteFull = true;
     }
     dropUndoFor(changed);
     scheduleRemoteRender();
@@ -318,17 +336,28 @@
     const sheet = await res.json();
     workbook.sheets[name] = sheet;
     learnSent(sheet, name);
+    remoteFull = true;
     scheduleRemoteRender();
   }
   function scheduleRemoteRender() {
     clearTimeout(remoteRenderTimer);
+    if (!remoteWaitSince) remoteWaitSince = performance.now();
     remoteRenderTimer = setTimeout(() => {
       if (inlineEditor) { scheduleRemoteRender(); return; } // never interrupt someone typing
+      // while the user moves around, wait for a pause (at most ~3 s)
+      const now = performance.now();
+      if (now - lastInteraction < 400 && now - remoteWaitSince < 3000) { scheduleRemoteRender(); return; }
+      remoteWaitSince = 0;
       if (!workbook.sheets[activeSheet] || workbook.sheets[activeSheet].hidden) activeSheet = visibleSheets()[0] || activeSheet;
-      engine.recalculateAll();
+      const changes = remoteChanges;
+      remoteChanges = [];
+      const full = remoteFull;
+      const redraw = remoteRedraw;
+      remoteFull = remoteRedraw = false;
+      if (full) engine.recalculateAll();
+      const affected = full ? null : engine.recalculateCells(changes);
       renderSheetTabs();
-      renderSheet();
-      highlightSelectedCellInDOM();
+      if (redraw) renderSheet(); else refreshValues(affected);
       updateStatusMetrics();
     }, 150);
   }
@@ -386,7 +415,28 @@
     return { order: [...(workbook.sheetOrder || [])], keys: Object.keys(workbook.sheets), saved, bytes: bytes + pivotsJson.length, pivots: pivotsJson };
   }
 
+  // Typing in one cell keeps only that cell in the history (copying a big sheet on every edit is slow):
+  // cells = { sheet: { coord: JSON of the cell, or null when empty } }
+  function captureCells(sheetName, coords) {
+    const sheet = workbook.sheets[sheetName];
+    const saved = {};
+    for (const c of coords) saved[c] = sheet && sheet.cells[c] !== undefined ? JSON.stringify(sheet.cells[c]) : null;
+    return { order: [...(workbook.sheetOrder || [])], keys: Object.keys(workbook.sheets), saved: {}, cells: { [sheetName]: saved }, bytes: 200 * coords.length };
+  }
+
   function restoreState(snap) {
+    if (snap.cells) {
+      for (const [n, saved] of Object.entries(snap.cells)) {
+        const sheet = workbook.sheets[n];
+        if (!sheet) continue;
+        for (const [c, json] of Object.entries(saved)) {
+          if (json === null) delete sheet.cells[c];
+          else sheet.cells[c] = JSON.parse(json);
+        }
+        markSheetDirty(n, Object.keys(saved));
+      }
+      return;
+    }
     const keys = new Set(snap.keys);
     for (const n of Object.keys(workbook.sheets)) {
       if (!keys.has(n)) { delete workbook.sheets[n]; markSheetDirty(n); }
@@ -409,10 +459,21 @@
     while (stack.length > MAX_HISTORY || (stack.length > 1 && total > UNDO_BYTES_BUDGET)) total -= stack.shift().bytes;
   }
 
+  function pushUndoCells(sheetName, coords) {
+    undoStack.push(captureCells(sheetName, coords));
+    trimHistory(undoStack);
+    redoStack.length = 0;
+    updateUndoRedoButtons();
+  }
+
   function pushUndoState(sheetNames = [activeSheet]) {
     const snap = captureState(sheetNames);
     const last = undoStack[undoStack.length - 1];
-    if (last && JSON.stringify(last.saved) === JSON.stringify(snap.saved) && last.order.join('|') === snap.order.join('|') && snap.bytes < 2e6) return;
+    const sameSaved = (a, b) => {
+      const ka = Object.keys(a), kb = Object.keys(b);
+      return ka.length === kb.length && ka.every(k => k in b && a[k] === b[k]);
+    };
+    if (last && !last.cells && snap.bytes < 2e6 && sameSaved(last.saved, snap.saved) && last.order.join('|') === snap.order.join('|')) return;
     undoStack.push(snap);
     trimHistory(undoStack);
     redoStack.length = 0;
@@ -420,6 +481,10 @@
   }
 
   function mirrorOf(snap) {
+    if (snap.cells) {
+      const [n, saved] = Object.entries(snap.cells)[0];
+      return captureCells(n, Object.keys(saved));
+    }
     const current = new Set(Object.keys(workbook.sheets));
     const names = new Set(Object.keys(snap.saved));
     for (const n of current) if (!snap.keys.includes(n)) names.add(n);
@@ -437,10 +502,19 @@
     redoStack.push(mirrorOf(prev));
     trimHistory(redoStack);
     restoreState(prev);
+    updateUndoRedoButtons();
+    if (prev.cells) {
+      const changes = Object.entries(prev.cells).flatMap(([n, saved]) => Object.keys(saved).map(c => [n, c]));
+      refreshValues(engine.recalculateCells(changes));
+      selectCell(selectedCoord, false);
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(queueWorkbookSave, 300);
+      showToast('Action undone (Ctrl+Z)');
+      return;
+    }
     if (!workbook.sheets[activeSheet] || workbook.sheets[activeSheet].hidden) activeSheet = visibleSheets()[0];
     engine = new window.FormulaEngine(workbook);
     engine.recalculateAll();
-    updateUndoRedoButtons();
     renderSheetTabs();
     renderSheet();
     selectCell(selectedCoord, false);
@@ -454,10 +528,19 @@
     undoStack.push(mirrorOf(next));
     trimHistory(undoStack);
     restoreState(next);
+    updateUndoRedoButtons();
+    if (next.cells) {
+      const changes = Object.entries(next.cells).flatMap(([n, saved]) => Object.keys(saved).map(c => [n, c]));
+      refreshValues(engine.recalculateCells(changes));
+      selectCell(selectedCoord, false);
+      clearTimeout(saveTimeout);
+      saveTimeout = setTimeout(queueWorkbookSave, 300);
+      showToast('Action redone (Ctrl+Y)');
+      return;
+    }
     if (!workbook.sheets[activeSheet] || workbook.sheets[activeSheet].hidden) activeSheet = visibleSheets()[0];
     engine = new window.FormulaEngine(workbook);
     engine.recalculateAll();
-    updateUndoRedoButtons();
     renderSheetTabs();
     renderSheet();
     selectCell(selectedCoord, false);
@@ -830,11 +913,15 @@
     const sheet = workbook.sheets[sheetName];
     if (!sheet || !sheet.cells) return 1;
     let lastRow = 1;
-    for (const [coord, cell] of Object.entries(sheet.cells)) {
-      if (cell && cell.v !== '' && cell.v !== null && cell.v !== undefined) {
-        const p = parseCoord(coord);
-        if (p && p.row > lastRow) lastRow = p.row;
-      }
+    const cells = sheet.cells;
+    // runs on every render of big sheets: read the row number straight from the key's digits
+    for (const coord in cells) {
+      const cell = cells[coord];
+      if (!cell || cell.v === '' || cell.v === null || cell.v === undefined) continue;
+      let i = coord.length;
+      while (i > 0 && coord.charCodeAt(i - 1) >= 48 && coord.charCodeAt(i - 1) <= 57) i--;
+      const row = Number(coord.slice(i));
+      if (row > lastRow) lastRow = row;
     }
     return lastRow;
   }
@@ -887,7 +974,10 @@
   // Excel number formats and conditional formatting)
   // ============================================================================
   const VIRTUAL_THRESHOLD = 250;   // visible rows above which only a window is rendered
-  const OVERSCAN_ROWS = 12;
+  const OVERSCAN_ROWS = 14;
+  // rows are added / dropped as soon as fewer than this many are left beyond the screen: small, even
+  // steps while scrolling instead of a big rebuild every so often
+  const MIN_BUFFER_ROWS = 8;
   const COL_VIRTUAL_THRESHOLD = 40; // visible columns above which only the columns on screen are rendered
   const OVERSCAN_COLS = 10;
   const DEFAULT_ROW_PX = 20;
@@ -1249,8 +1339,10 @@
     for (let r = area.r1; r <= area.r2; r++) {
       const label = sheet.cells[`A${r}`];
       if (!label || label.v === undefined || label.v === '') continue;
+      // stored values (formulas keep their last result there): no engine lookups per cell
       const allZero = cols.every(col => {
-        const v = engine.getCellValue(activeSheet, `${col}${r}`);
+        const cell = sheet.cells[`${col}${r}`];
+        const v = cell ? cell.v : undefined;
         return v === 0 || v === '' || v === null || v === undefined;
       });
       if (allZero) out.push(r);
@@ -1269,10 +1361,11 @@
     btn.querySelector('.lbl').textContent = `Ocultar flores en 0 (${count})`;
   }
 
-  function computeLayout(sheet) {
+  // keepRows: the rows already built stay cached (refreshValues decides which ones to drop)
+  function computeLayout(sheet, keepRows = false) {
     const hiddenRows = new Set([...(sheet.hiddenRows || []), ...(sheet.filterHiddenRows || [])]);
     const hiddenCols = new Set(sheet.hiddenCols || []);
-    view.rowCache = new Map(); // data or layout may have changed: rows are rebuilt
+    if (!keepRows) view.rowCache = new Map(); // data or layout may have changed: rows are rebuilt
     const zeros = zeroRows(sheet, hiddenCols);
     if (!sheet.showZeroRows) zeros.forEach(r => hiddenRows.add(r));
     updateZeroRowsButton(sheet, zeros.length);
@@ -1463,10 +1556,12 @@
   // the horizontal window moved past the rendered columns: rebuild header and rows
   function refreshColWindow() {
     const sheet = workbook.sheets[activeSheet];
+    // measure before writing: reading the scroll position after changing the table forces a full relayout
+    const win = computeWindow();
     view.colWin = computeColWindow();
     view.rowCache = new Map();
     renderHead(sheet);
-    renderBody();
+    renderBody(win);
   }
 
   function computeWindow() {
@@ -1503,9 +1598,9 @@
     return { start, end, ...core };
   }
 
-  function renderBody() {
+  function renderBody(win = computeWindow()) {
     const sheet = workbook.sheets[activeSheet];
-    const { start, end } = computeWindow();
+    const { start, end } = win;
     view.winStart = start;
     view.winEnd = end;
     const parts = [];
@@ -1524,6 +1619,35 @@
     const bottomPad = view.offsets[view.visRows.length] - view.offsets[end + 1];
     if (view.virtual) parts.push(`<tr class="v-spacer v-bottom" style="height:${Math.max(0, bottomPad)}px"><td colspan="${colCount}"></td></tr>`);
     gridBody.innerHTML = parts.join('');
+    schedulePrebuild();
+  }
+
+  // While the page is idle the rows just above / below the rendered window are built ahead of time,
+  // so scrolling or moving with the keys only inserts ready rows instead of building them mid-frame
+  const PREBUILD_ROWS = 80;
+  let prebuildPending = false;
+  const whenIdle = window.requestIdleCallback
+    ? fn => window.requestIdleCallback(fn, { timeout: 1000 })
+    : fn => setTimeout(() => fn({ timeRemaining: () => 8 }), 60);
+  function schedulePrebuild() {
+    if (prebuildPending || !view.virtual) return;
+    prebuildPending = true;
+    whenIdle(deadline => {
+      prebuildPending = false;
+      const sheet = workbook && workbook.sheets[activeSheet];
+      if (!sheet || view.sheetName !== activeSheet || !view.colWin || inlineEditor) return;
+      const cache = view.rowCache || (view.rowCache = new Map());
+      const n = view.visRows.length;
+      for (let d = 1; d <= PREBUILD_ROWS; d++) {
+        for (const i of [view.winEnd + d, view.winStart - d]) {
+          if (i < view.frozenRows || i >= n) continue;
+          const r = view.visRows[i];
+          if (cache.has(r)) continue;
+          cache.set(r, renderRowHtml(sheet, r, null));
+          if (deadline.timeRemaining() < 3) { schedulePrebuild(); return; }
+        }
+      }
+    });
   }
 
   // Scrolling a virtualized sheet: only the rows entering / leaving the window change in the DOM
@@ -1556,6 +1680,7 @@
     botSp.style.height = `${Math.max(0, view.offsets[view.visRows.length] - view.offsets[end + 1])}px`;
     view.winStart = start;
     view.winEnd = end;
+    schedulePrebuild();
   }
 
   // Render Active Sheet Grid
@@ -1565,17 +1690,76 @@
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
 
-    const lastReal = getLastRealRow(activeSheet);
-    sheet.maxCol = Math.max(sheet.maxCol || 20, 20);
-    sheet.maxRow = Math.max(sheet.maxRow || 100, lastReal + 40, 100);
-
+    fitSheetSize(sheet);
     computeLayout(sheet);
+    staleRows = false;
 
+    const win = computeWindow(); // before the header changes (see refreshColWindow)
     view.colWin = computeColWindow();
     renderHead(sheet);
 
-    renderBody();
+    renderBody(win);
     renderSheetImages(sheet);
+    highlightSelectedCellInDOM();
+  }
+
+  function fitSheetSize(sheet) {
+    const lastReal = getLastRealRow(activeSheet);
+    sheet.maxCol = Math.max(sheet.maxCol || 20, 20);
+    sheet.maxRow = Math.max(sheet.maxRow || 100, lastReal + 40, 100);
+  }
+
+  // what decides where every row and column goes: when it is unchanged after an edit, the rows on
+  // screen can be patched one by one instead of redrawing the sheet
+  function layoutKey(sheet) {
+    return [view.sheetName, view.visRows.join(','), view.visCols.join(','), view.totalWidth, view.frozenRows,
+      view.frozenCols, (sheet.merges || []).join(), sheet.maxRow].join('|');
+  }
+  // conditional formats that look at other cells can change color in rows nobody edited
+  function condFormatsReadOtherCells(sheet) {
+    return (sheet.condFormats || []).some(cf => cf.rules.some(rule =>
+      rule.type === 'expression' || (rule.formulas || []).some(f => /[A-Za-z]{1,3}\$?\d|!/.test(String(f)))));
+  }
+
+  // After values changed (affected = keys "Sheet!A1" from engine.recalculateCells, null = unknown):
+  // only the rows of the active sheet holding an affected cell are rebuilt
+  function refreshValues(affected) {
+    const sheet = workbook.sheets[activeSheet];
+    if (staleRows || !affected || !sheet || view.sheetName !== activeSheet || !view.colWin) { renderSheet(); return; }
+    const prefix = `${activeSheet}!`;
+    const rows = new Set();
+    for (const key of affected) if (key.startsWith(prefix)) rows.add(Number(key.slice(prefix.length).replace(/^[A-Z]+/, '')));
+    const before = layoutKey(sheet);
+    // the grid only grows: a value below the last rows adds room (same rule as fitSheetSize)
+    let lastChanged = 0;
+    for (const r of rows) if (r > lastChanged) lastChanged = r;
+    sheet.maxRow = Math.max(sheet.maxRow || 100, lastChanged + 40, 100);
+    computeLayout(sheet, true);
+    if (layoutKey(sheet) !== before) { renderSheet(); return; }
+    const cache = view.rowCache;
+    const frozen = new Set(view.visRows.slice(0, view.frozenRows));
+    if ([...rows].some(r => frozen.has(r))) { view.rowCache = new Map(); renderBody(); highlightSelectedCellInDOM(); return; }
+    // conditional formats that look at other cells can recolor rows nobody edited: every row on screen
+    // is rebuilt as text, but only the ones that came out different are replaced on the page
+    const crossCf = condFormatsReadOtherCells(sheet);
+    const check = crossCf ? view.visRows.slice(view.winStart, view.winEnd + 1) : [...rows];
+    for (const r of check) {
+      const idx = view.rowIdx.get(r);
+      const onScreen = idx !== undefined && idx >= view.winStart && idx <= view.winEnd;
+      if (!onScreen) { cache.delete(r); continue; }
+      const html = renderRowHtml(sheet, r, null);
+      if (html === cache.get(r)) continue;
+      cache.set(r, html);
+      const tr = gridBody.querySelector(`tr[data-row="${r}"]`);
+      if (tr) tr.outerHTML = html;
+    }
+    if (crossCf) { // rows built ahead may be stale: only the ones on screen are kept
+      for (const r of [...cache.keys()]) {
+        const idx = view.rowIdx.get(r);
+        if (idx === undefined || idx < view.winStart || idx > view.winEnd) cache.delete(r);
+      }
+      schedulePrebuild();
+    }
     highlightSelectedCellInDOM();
   }
 
@@ -1627,7 +1811,9 @@
       }
       if (!view.virtual) return;
       const { coreStart, coreEnd } = computeWindow();
-      if (coreStart >= view.winStart && coreEnd <= view.winEnd) return; // still inside the rendered rows
+      const topOk = coreStart - view.winStart >= MIN_BUFFER_ROWS || view.winStart <= view.frozenRows;
+      const bottomOk = view.winEnd - coreEnd >= MIN_BUFFER_ROWS || view.winEnd >= view.visRows.length - 1;
+      if (topOk && bottomOk) return; // enough rendered rows around the screen
       shiftWindow();
       highlightSelectedCellInDOM(false);
     });
@@ -1955,13 +2141,25 @@
     }
   }
 
+  // recalculates only the formulas that depend on cells minRow..maxRow x minCol..maxCol of a sheet
+  // (formulaEngine.js recalculateCells); a huge block is cheaper to recalculate whole
+  // (returns what engine.recalculateCells returns, for refreshValues)
+  function recalcRange(sheetName, minRow, maxRow, minCol, maxCol, more = []) {
+    if ((maxRow - minRow + 1) * (maxCol - minCol + 1) > 50000) { engine.recalculateAll(); return null; }
+    const changes = more.slice();
+    for (let r = minRow; r <= maxRow; r++) {
+      for (let c = minCol; c <= maxCol; c++) changes.push([sheetName, `${indexToCol(c)}${r}`]);
+    }
+    return engine.recalculateCells(changes);
+  }
+
   function setCellContent(sheetName, coord, rawInput) {
     const sheet = workbook.sheets[sheetName];
     if (!sheet) return;
-    pushUndoState();
+    pushUndoCells(sheetName, [coord]);
     applyCellValueRaw(sheetName, coord, rawInput);
-    engine.recalculateAll();
-    renderSheet();
+    const affected = engine.recalculateCells([[sheetName, coord]]);
+    if (sheetName === activeSheet) refreshValues(affected); else renderSheet();
     selectCell(coord, false);
     saveWorkbookState([coord]);
   }
@@ -1976,9 +2174,7 @@
         applyCellValueRaw(activeSheet, `${indexToCol(c)}${r}`, '');
       }
     }
-    engine.recalculateAll();
-    renderSheet();
-    highlightSelectedCellInDOM();
+    refreshValues(recalcRange(activeSheet, minRow, maxRow, minCol, maxCol));
     updateStatusMetrics();
     saveWorkbookState();
   }
@@ -2409,12 +2605,17 @@
       }
     }
 
+    const cutCells = [];
+    if (clip.isCut && srcSheet) {
+      for (let r = clip.minRow; r <= clip.maxRow; r++) {
+        for (let c = clip.minCol; c <= clip.maxCol; c++) cutCells.push([clip.sheetName, `${indexToCol(c)}${r}`]);
+      }
+    }
     if (clip.isCut) clipboardState = null;
     if (endR + 5 > sheet.maxRow) sheet.maxRow = endR + 20;
     if (endC + 2 > sheet.maxCol) sheet.maxCol = endC + 5;
 
-    engine.recalculateAll();
-    renderSheet();
+    refreshValues(recalcRange(activeSheet, bounds.minRow, endR, bounds.minCol, endC, cutCells));
     selectedCoord = `${indexToCol(bounds.minCol)}${bounds.minRow}`;
     selectionEndCoord = `${indexToCol(endC)}${endR}`;
     selectCell(selectionEndCoord, true, false); // Excel keeps the view after pasting
@@ -2451,8 +2652,7 @@
     if (endR + 5 > sheet.maxRow) sheet.maxRow = endR + 20;
     if (endC + 2 > sheet.maxCol) sheet.maxCol = endC + 5;
 
-    engine.recalculateAll();
-    renderSheet();
+    refreshValues(recalcRange(activeSheet, bounds.minRow, endR, bounds.minCol, endC));
     selectedCoord = `${indexToCol(bounds.minCol)}${bounds.minRow}`;
     selectionEndCoord = `${indexToCol(endC)}${endR}`;
     highlightSelectedCellInDOM();
@@ -2468,9 +2668,7 @@
     for (let c = minCol; c <= maxCol; c++) {
       for (let r = minRow + 1; r <= maxRow; r++) copyCellWithFormat(sheet, minRow, c, r, c);
     }
-    engine.recalculateAll();
-    renderSheet();
-    highlightSelectedCellInDOM();
+    refreshValues(recalcRange(activeSheet, minRow + 1, maxRow, minCol, maxCol));
     updateStatusMetrics();
     saveWorkbookState();
     showToast('Filled down (Ctrl+D)');
@@ -2484,9 +2682,7 @@
     for (let r = minRow; r <= maxRow; r++) {
       for (let c = minCol + 1; c <= maxCol; c++) copyCellWithFormat(sheet, r, minCol, r, c);
     }
-    engine.recalculateAll();
-    renderSheet();
-    highlightSelectedCellInDOM();
+    refreshValues(recalcRange(activeSheet, minRow, maxRow, minCol + 1, maxCol));
     updateStatusMetrics();
     saveWorkbookState();
     showToast('Filled right (Ctrl+R)');
@@ -2919,8 +3115,7 @@
       }
     }
 
-    engine.recalculateAll();
-    renderSheet();
+    refreshValues(recalcRange(activeSheet, minR, maxR, minC, maxC));
     selectedCoord = `${indexToCol(minC)}${minR}`;
     selectionEndCoord = `${indexToCol(maxC)}${maxR}`;
     highlightSelectedCellInDOM();
@@ -4105,6 +4300,18 @@
       renderSheet();
       highlightSelectedCellInDOM();
       updateStatusMetrics();
+    },
+    // only the formulas depending on `changes` ([[sheet, coord], ...]; recalculation hooks add theirs)
+    recalcCellsAndRender: (changes = []) => {
+      const affected = engine.recalculateCells(changes);
+      if (inlineEditor) { staleRows = true; return; } // drawn when the edit ends
+      refreshValues(affected);
+      updateStatusMetrics();
+    },
+    // repaint only (marks, badges, colors that don't change any value)
+    render: () => {
+      renderSheet();
+      highlightSelectedCellInDOM();
     },
     switchSheet: name => switchSheet(name),
     cellDisplayText: (sheetName, coord) => {

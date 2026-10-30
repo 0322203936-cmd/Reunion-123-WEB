@@ -444,7 +444,7 @@
   }
   function repaintGrid() {
     const app = App();
-    if (app && app.getWorkbook() && app.getEngine()) app.recalcAndRender();
+    if (app && app.getWorkbook() && app.getEngine()) app.render(); // colors only
   }
 
   let stateLoaded = false;

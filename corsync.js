@@ -19,35 +19,32 @@
     const sheet = app.getWorkbook() && app.getWorkbook().sheets[update.sheet];
     if (!sheet) return;
     Object.assign(sheet.cells, update.cells);
-    app.recalcAndRender();
+    app.recalcCellsAndRender(Object.keys(update.cells).map(coord => [update.sheet, coord]));
   });
   if (!window.CosechaCor) return; // The real-time Cor bridge is optional.
   let feed = null;
   let quiet = false; // applying a server update (not a user edit)
 
-  const proto = window.FormulaEngine && window.FormulaEngine.prototype;
-  if (proto && !proto.__corPatched) {
-    const recalc = proto.recalculateAll;
-    proto.recalculateAll = function () {
-      if (feed && this.workbook && this.workbook.sheets && this.workbook.sheets.Reunion) {
-        try {
-          const n = window.CosechaCor.applyFeed(this.workbook, feed);
-          if (n && App()) {
-            App().markDirty('Reunion');
-            if (!quiet) App().toast(`Ese Cor solo acepta números (viene de Plan de cosecha ${feed.sheet.trim()})`, true);
-          }
-        } catch (e) { console.error(e); }
+  const Engine = window.FormulaEngine;
+  if (Engine && !Engine.__corPatched) {
+    Engine.beforeRecalc.push((workbook, changed) => {
+      if (!feed || !workbook || !workbook.sheets || !workbook.sheets.Reunion) return;
+      const coords = changed ? [] : undefined;
+      const n = window.CosechaCor.applyFeed(workbook, feed, coords);
+      if (coords) for (const c of coords) changed.push(`Reunion!${c}`);
+      if (n && App()) {
+        App().markDirty('Reunion');
+        if (!quiet) App().toast(`Ese Cor solo acepta números (viene de Plan de cosecha ${feed.sheet.trim()})`, true);
       }
-      return recalc.apply(this, arguments);
-    };
-    proto.__corPatched = true;
+    });
+    Engine.__corPatched = true;
   }
 
   function applyNow() {
     const app = App();
     if (!app || !app.getWorkbook() || !app.getEngine()) return false;
     quiet = true;
-    try { app.recalcAndRender(); } finally { quiet = false; }
+    try { app.recalcCellsAndRender(); } finally { quiet = false; } // the feed hook adds the Cor it changes
     return true;
   }
   function setFeed(next) {
@@ -149,7 +146,7 @@
       <div class="cm-row cm-hist">Historial: ${chain}</div>`;
   }
   function refreshPanel() { if (panelKey) renderPanel(); }
-  function rerender() { const app = App(); if (app && app.getEngine()) { quiet = true; try { app.recalcAndRender(); } finally { quiet = false; } } }
+  function rerender() { const app = App(); if (app && app.getEngine()) app.render(); } // marks only
   function onSelect(sheetName, coord) {
     const app = App();
     const sheet = app && app.getWorkbook() && app.getWorkbook().sheets[sheetName];
