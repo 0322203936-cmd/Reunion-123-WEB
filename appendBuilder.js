@@ -268,6 +268,8 @@ function inventarioRows(reunionBook, flagOf, products, sheetName = 'Inventario',
     row[COL.Descripcion] = `A${label}`;
     row[COL['Total Tallos 1']] = qty;
     row[COL['Semana Prod']] = week;
+    // the Friday inventory also carries its day, so it shows in "Weeks x FechaProduccion Dias"
+    if (label === 'INVENTARIO VIERNES') row[COL['Fecha Produccion']] = day;
     row[COL['Status orden (Formula)']] = 'FIRME';
     row[COL['Flor General (Formula)']] = flagOf(flor);
     row[COL['Total de tallos 2']] = 0;
