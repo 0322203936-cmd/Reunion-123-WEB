@@ -32,10 +32,7 @@
       const coords = changed ? [] : undefined;
       const n = window.CosechaCor.applyFeed(workbook, feed, coords);
       if (coords) for (const c of coords) changed.push(`Reunion!${c}`);
-      if (n && App()) {
-        App().markDirty('Reunion');
-        if (!quiet) App().toast(`Ese Cor solo acepta números (viene de Plan de cosecha ${feed.sheet.trim()})`, true);
-      }
+      if (n && App()) App().markDirty('Reunion');
     });
     Engine.__corPatched = true;
   }
