@@ -7,6 +7,9 @@ const packagedChromium = require('@sparticuz/chromium');
 
 const POSCO_URL = 'http://3.132.9.174/Posco/';
 const SHEET_NAME = 'Inventario';
+// "Actualizar Inventario Viernes": the same POSCO report kept apart (hidden sheet) so it only feeds
+// the Append of Requerimiento Vs Proyeccion as INVENTARIO VIERNES; Inventario / Reunion's Inv stay as they are
+const FRIDAY_SHEET_NAME = 'Inventario Viernes';
 const SOURCE_HEADERS = ['flor', 'color', 'tallos_por_ramo', 'tallos_en_existencia'];
 
 function requiredEnv(name) {
@@ -145,9 +148,9 @@ function clearCell(sheet, coord) {
   delete cell.f;
 }
 
-function applyToInventory(workbook, rows) {
-  const sheet = workbook.sheets?.[SHEET_NAME];
-  if (!sheet) throw new Error('No existe la hoja Inventario en el sistema.');
+function applyToInventory(workbook, rows, sheetName = SHEET_NAME) {
+  const sheet = workbook.sheets?.[sheetName];
+  if (!sheet) throw new Error(`No existe la hoja ${sheetName} en el sistema.`);
   const header = column => String(sheet.cells?.[`${column}1`]?.v ?? '').trim().toLowerCase();
   const expected = { A: 'flor', B: 'color', D: 'tallos_por_ramo', E: 'tallos_en_existencia' };
   for (const [column, expectedValue] of Object.entries(expected)) {
@@ -192,4 +195,30 @@ async function runActualizarInventario(workbook) {
   }
 }
 
-module.exports = { runActualizarInventario, readInventoryRows, applyToInventory };
+// the hidden "Inventario Viernes" sheet starts as a copy of Inventario's headers and formats
+function fridaySheet(workbook) {
+  if (!workbook.sheets[FRIDAY_SHEET_NAME]) {
+    const base = workbook.sheets[SHEET_NAME];
+    if (!base) throw new Error('No existe la hoja Inventario en el sistema.');
+    const cells = {};
+    for (const [coord, cell] of Object.entries(base.cells || {})) if (/^[A-Z]+[12]$/.test(coord)) cells[coord] = clone(cell);
+    workbook.sheets[FRIDAY_SHEET_NAME] = { maxRow: 100, maxCol: 6, colWidths: clone(base.colWidths || {}), merges: [], cells, hidden: true };
+    if (Array.isArray(workbook.sheetOrder) && !workbook.sheetOrder.includes(FRIDAY_SHEET_NAME)) workbook.sheetOrder.push(FRIDAY_SHEET_NAME);
+  }
+  return workbook.sheets[FRIDAY_SHEET_NAME];
+}
+
+async function runActualizarInventarioViernes(workbook) {
+  const report = await downloadInventoryReport();
+  try {
+    const rows = readInventoryRows(report.path);
+    const updatedWorkbook = clone(workbook);
+    fridaySheet(updatedWorkbook);
+    const stats = applyToInventory(updatedWorkbook, rows, FRIDAY_SHEET_NAME);
+    return { workbook: updatedWorkbook, ...stats };
+  } finally {
+    fs.rmSync(report.temporaryDirectory, { recursive: true, force: true });
+  }
+}
+
+module.exports = { runActualizarInventario, runActualizarInventarioViernes, readInventoryRows, applyToInventory, FRIDAY_SHEET_NAME };

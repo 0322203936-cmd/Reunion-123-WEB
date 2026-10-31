@@ -240,8 +240,9 @@ function serialOfIso(iso) {
 
 // Inventario (Reunion): stock already cut (STATUS "Inventario", Total Tallos 1) counts in the week the inventory was taken
 // (the week, Sat..Fri, of the day "Actualizar Inventario" ran; today if it was never run)
-function inventarioRows(reunionBook, flagOf, products) {
-  const sheet = reunionBook.sheets.Inventario;
+// sheetName / label: "Inventario" -> INVENTARIO, "Inventario Viernes" -> INVENTARIO VIERNES (same rules)
+function inventarioRows(reunionBook, flagOf, products, sheetName = 'Inventario', label = 'INVENTARIO') {
+  const sheet = reunionBook.sheets[sheetName];
   if (!sheet) return [];
   const c = sheet.cells;
   const v = (col, r) => (c[`${col}${r}`] || {}).v;
@@ -258,13 +259,13 @@ function inventarioRows(reunionBook, flagOf, products) {
     const withColor = normName(`${text(flor)} ${text(color)}`);
     const key = [pack, withColor, normName(flor)].find(k => products.has(k));
     const row = new Array(HEADERS.length).fill(null);
-    row[COL.STATUS] = 'Inventario';
-    row[COL.Distribuidor] = 'INVENTARIO';
-    row[COL['Cust Name']] = 'INVENTARIO';
-    row[COL['No.']] = 'INVENTARIO';
+    row[COL.STATUS] = sheetName;
+    row[COL.Distribuidor] = label;
+    row[COL['Cust Name']] = label;
+    row[COL['No.']] = label;
     row[COL.FLOR] = flor;
     row[COL['Flor Color']] = color ?? null;
-    row[COL.Descripcion] = 'AINVENTARIO';
+    row[COL.Descripcion] = `A${label}`;
     row[COL['Total Tallos 1']] = qty;
     row[COL['Semana Prod']] = week;
     row[COL['Status orden (Formula)']] = 'FIRME';
@@ -283,6 +284,7 @@ function buildAppendRows(reunionBook, cosechaBook, rvpBook) {
   return [
     ...proyeccionRows(cosechaBook, flagOf),
     ...inventarioRows(reunionBook, flagOf, products),
+    ...inventarioRows(reunionBook, flagOf, products, 'Inventario Viernes', 'INVENTARIO VIERNES'),
     ...requerimientoRows(reunionBook, flagOf, products)
   ];
 }

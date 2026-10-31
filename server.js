@@ -5,7 +5,7 @@ const path = require('path');
 const zlib = require('zlib');
 const { Pool } = require('pg');
 const { runActualizarData } = require('./actualizar_data');
-const { runActualizarInventario } = require('./actualizar_inventario');
+const { runActualizarInventario, runActualizarInventarioViernes, FRIDAY_SHEET_NAME } = require('./actualizar_inventario');
 const CosechaCor = require('./cosechaCor');
 const AppendBuilder = require('./appendBuilder');
 const NeonStore = require('./neonStore');
@@ -132,6 +132,7 @@ function compressedBook(key, workbook) {
 }
 let actualizarDataRunning = false;
 let actualizarInventarioRunning = false;
+let actualizarInventarioViernesRunning = false;
 const actualizarDataState = {
   status: 'idle',
   startedAt: null,
@@ -158,6 +159,12 @@ function publicActualizarDataState() {
 
 function publicActualizarInventarioState() {
   return { ...actualizarInventarioState, ok: actualizarInventarioState.status === 'succeeded' };
+}
+
+// "Actualizar Inventario Viernes": same report, only for the Append (INVENTARIO VIERNES)
+const actualizarInventarioViernesState = { status: 'idle', startedAt: null, finishedAt: null, rows: null, lastRow: null, error: null };
+function publicActualizarInventarioViernesState() {
+  return { ...actualizarInventarioViernesState, ok: actualizarInventarioViernesState.status === 'succeeded' };
 }
 
 function resetWorkbookCache(key) {
@@ -346,6 +353,25 @@ async function runActualizarDataInBackground() {
     console.error(' Actualizar Data falló:', error);
   } finally {
     actualizarDataRunning = false;
+  }
+}
+
+async function runActualizarInventarioViernesInBackground() {
+  const state = actualizarInventarioViernesState;
+  try {
+    console.log(' Iniciando Actualizar Inventario Viernes: POSCO -> Inventario Viernes (solo Append)...');
+    const result = await runActualizarInventarioViernes(await loadWorkbook('reunion'));
+    // its week (Sat..Fri) is the week of the day it ran, like Actualizar Inventario
+    result.workbook.sheets[FRIDAY_SHEET_NAME].updatedAt = new Date().toISOString();
+    await saveWholeWorkbook('reunion', result.workbook);
+    scheduleCorSync(); // marks the Append to be rebuilt
+    Object.assign(state, { status: 'succeeded', finishedAt: new Date().toISOString(), rows: result.rows, lastRow: result.lastRow, error: null });
+    console.log(` Actualizar Inventario Viernes completado: ${result.rows} filas.`);
+  } catch (error) {
+    Object.assign(state, { status: 'failed', finishedAt: new Date().toISOString(), error: error.message || 'No se pudo actualizar Inventario Viernes.' });
+    console.error(' Actualizar Inventario Viernes falló:', error);
+  } finally {
+    actualizarInventarioViernesRunning = false;
   }
 }
 
@@ -796,6 +822,15 @@ async function handleRequest(req, res) {
     }
     void runActualizarDataInBackground();
     return sendJson(res, 202, publicActualizarDataState());
+  }
+
+  if (pathname === '/api/actualizar-inventario-viernes' && (req.method === 'GET' || req.method === 'POST')) {
+    if (key !== 'reunion') return sendJson(res, 400, { error: 'Actualizar Inventario Viernes solo está disponible para Reunion.' });
+    if (req.method === 'GET' || actualizarInventarioViernesRunning) return sendJson(res, req.method === 'GET' ? 200 : 202, publicActualizarInventarioViernesState());
+    actualizarInventarioViernesRunning = true;
+    Object.assign(actualizarInventarioViernesState, { status: 'running', startedAt: new Date().toISOString(), finishedAt: null, rows: null, lastRow: null, error: null });
+    void runActualizarInventarioViernesInBackground();
+    return sendJson(res, 202, publicActualizarInventarioViernesState());
   }
 
   if (pathname === '/api/actualizar-inventario' && (req.method === 'GET' || req.method === 'POST')) {

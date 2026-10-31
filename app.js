@@ -169,6 +169,8 @@
     if (btnActualizarData) btnActualizarData.hidden = WB_KEY !== 'reunion';
     const btnActualizarInventario = document.getElementById('btnActualizarInventario');
     if (btnActualizarInventario) btnActualizarInventario.hidden = WB_KEY !== 'reunion';
+    const btnInventarioViernes = document.getElementById('btnActualizarInventarioViernes');
+    if (btnInventarioViernes) btnInventarioViernes.hidden = WB_KEY !== 'reunion';
     updateStatusMetrics();
     window.dispatchEvent(new CustomEvent('mauri:workbook-switch', { detail: { key: WB_KEY } }));
   }
@@ -406,6 +408,7 @@
     bindWorkspaceNavigation();
     pollActualizarData();
     pollActualizarInventario();
+    if (WB_KEY === 'reunion') pollInventarioViernes();
 
     // Other apartados are warmed only when the user points to or focuses a
     // tab. Never download/recalculate the other large workbooks during the
@@ -833,6 +836,53 @@
     } catch (error) {
       setActualizarInventarioButtonState({ status: 'idle' });
       showToast(`Actualizar Inventario falló: ${error.message}`, true);
+    }
+  }
+
+  // "Actualizar Inventario Viernes": the same POSCO report as Actualizar Inventario, kept in the hidden
+  // sheet "Inventario Viernes" (server.js); it only reaches the Append of Requerimiento Vs Proyeccion
+  let inventarioViernesPollTimer = null;
+  const inventarioViernesNoticeKey = 'reunion123_inventario_viernes_notice';
+  function setInventarioViernesButtonState(state) {
+    const button = document.getElementById('btnActualizarInventarioViernes');
+    if (!button) return;
+    const running = state && state.status === 'running';
+    button.disabled = running;
+    button.classList.toggle('is-running', running);
+    button.textContent = running ? 'Actualizando Inventario Viernes…' : 'Actualizar Inventario Viernes';
+  }
+  async function pollInventarioViernes() {
+    clearTimeout(inventarioViernesPollTimer);
+    try {
+      const response = await fetch('/api/actualizar-inventario-viernes?wb=reunion', { cache: 'no-store' });
+      const state = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(state.error || `Error ${response.status}`);
+      setInventarioViernesButtonState(state);
+      if (state.status === 'running') { inventarioViernesPollTimer = setTimeout(pollInventarioViernes, 2000); return; }
+      const noticeId = state.finishedAt || '';
+      if (!noticeId || noticeId === (localStorage.getItem(inventarioViernesNoticeKey) || '')) return;
+      localStorage.setItem(inventarioViernesNoticeKey, noticeId);
+      if (state.status === 'succeeded') showToast(`Inventario Viernes actualizado: ${state.rows} filas (va al Append de Requerimiento Vs Proyeccion).`);
+      else if (state.status === 'failed') showToast(`Actualizar Inventario Viernes falló: ${state.error || 'error desconocido'}`, true);
+    } catch (error) {
+      setInventarioViernesButtonState({ status: 'idle' });
+      showToast(`No se pudo consultar Actualizar Inventario Viernes: ${error.message}`, true);
+    }
+  }
+  async function actualizarInventarioViernes() {
+    const button = document.getElementById('btnActualizarInventarioViernes');
+    if (!button || button.disabled) return;
+    setInventarioViernesButtonState({ status: 'running' });
+    showToast('Descargando el inventario de POSCO (Inventario Viernes)…');
+    try {
+      await flushPendingSave();
+      const response = await fetch('/api/actualizar-inventario-viernes?wb=reunion', { method: 'POST' });
+      const state = await response.json().catch(() => ({}));
+      if (!response.ok && response.status !== 202) throw new Error(state.error || `Error ${response.status}`);
+      await pollInventarioViernes();
+    } catch (error) {
+      setInventarioViernesButtonState({ status: 'idle' });
+      showToast(`Actualizar Inventario Viernes falló: ${error.message}`, true);
     }
   }
 
@@ -4125,6 +4175,7 @@
     document.getElementById('btnExportCsv').addEventListener('click', exportActiveSheetCsv);
     document.getElementById('btnActualizarData')?.addEventListener('click', actualizarDataDesdePosco);
     document.getElementById('btnActualizarInventario')?.addEventListener('click', actualizarInventarioDesdePosco);
+    document.getElementById('btnActualizarInventarioViernes')?.addEventListener('click', actualizarInventarioViernes);
 
     document.getElementById('btnResetWorkbook')?.addEventListener('click', async () => {
       if (!confirm('Clear and reset workbook to blank?')) return;
