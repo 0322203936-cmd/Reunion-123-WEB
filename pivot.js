@@ -618,11 +618,25 @@
   let panel = null;
   let panelPivotId = null;
 
+  // the panel can be shrunk to a thin strip (›); the choice is remembered in this browser, so moving
+  // around a pivot or changing sheets doesn't open it again until the strip is clicked
+  const MIN_KEY = 'reunion123_pivot_panel_min';
+  const isMinimized = () => { try { return localStorage.getItem(MIN_KEY) === '1'; } catch (e) { return false; } };
+  function applyMinimized(min) {
+    if (panel) panel.classList.toggle('pv-min', min);
+    document.body.classList.toggle('pv-panel-min', !!panel && min);
+  }
+  function setMinimized(min) {
+    try { if (min) localStorage.setItem(MIN_KEY, '1'); else localStorage.removeItem(MIN_KEY); } catch (e) { /* not remembered */ }
+    applyMinimized(min);
+    App().render(); // the grid gets / gives back the width
+  }
+
   function closePanel() {
     if (panel) panel.remove();
     panel = null;
     panelPivotId = null;
-    document.body.classList.remove('pv-panel-open');
+    document.body.classList.remove('pv-panel-open', 'pv-panel-min');
   }
 
   function openPanel(p) {
@@ -633,6 +647,10 @@
       panel.className = 'pv-panel no-print';
       document.body.appendChild(panel);
       document.body.classList.add('pv-panel-open');
+      panel.addEventListener('click', e => {
+        if (e.target.closest('[data-minimize]')) setMinimized(true);
+        else if (e.target.closest('[data-expand]')) setMinimized(false);
+      });
     }
     panelPivotId = p.id;
     const used = new Set([...p.rows, ...p.cols, ...p.values.map(v => v.field), ...p.filters.map(f => f.field)]);
@@ -650,12 +668,16 @@
     const filterBtn = (zone, f) => `<button type="button" class="pv-filter-btn${((p.hidden || {})[f] || []).length || (zone === 'filters' && (p.filters.find(x => x.field === f) || {}).selected) ? ' active' : ''}" data-filter="${escapeHtml(f)}" title="Filtrar">⏷</button>`;
 
     panel.innerHTML = `
+      <button type="button" class="pv-strip" data-expand title="Mostrar campos de la tabla dinámica"><span>‹ Campos</span></button>
       <header class="pv-panel-head">
         <div>
           <div class="pv-panel-title">Campos de tabla dinámica</div>
           <div class="pv-panel-sub">${escapeHtml(p.name)} · origen ${escapeHtml(p.source.sheet)}!${escapeHtml(p.source.ref)}</div>
         </div>
-        <button type="button" class="pv-close" data-close title="Cerrar">✕</button>
+        <div class="pv-head-btns">
+          <button type="button" class="pv-close" data-minimize title="Minimizar">›</button>
+          <button type="button" class="pv-close" data-close title="Cerrar">✕</button>
+        </div>
       </header>
       <input type="search" class="pv-search" placeholder="Buscar campo" />
       <div class="pv-fields">
@@ -672,6 +694,7 @@
         <button type="button" class="pv-btn primary" data-refresh>Actualizar</button>
       </footer>`;
     bindPanel(p, fields);
+    applyMinimized(isMinimized());
   }
 
   function currentPivot() { return pivots().find(x => x.id === panelPivotId); }

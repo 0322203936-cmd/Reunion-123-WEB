@@ -2104,6 +2104,52 @@ body.pv-panel-open .spreadsheet-viewport {
   margin-right: 300px;
 }
 
+/* minimized field list: a thin strip on the right edge */
+body.pv-panel-open.pv-panel-min .spreadsheet-viewport {
+  margin-right: 28px;
+}
+
+.pv-panel.pv-min {
+  width: 28px;
+}
+
+.pv-panel.pv-min > :not(.pv-strip) {
+  display: none !important;
+}
+
+.pv-strip {
+  display: none;
+}
+
+.pv-panel.pv-min .pv-strip {
+  display: flex;
+  flex: 1;
+  align-items: flex-start;
+  justify-content: center;
+  padding: 14px 0 0;
+  border: none;
+  background: #f8fafc;
+  color: var(--excel-green);
+  font-weight: 700;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.pv-panel.pv-min .pv-strip:hover {
+  background: #e8f5ee;
+}
+
+.pv-strip span {
+  writing-mode: vertical-rl;
+  letter-spacing: 0.5px;
+}
+
+.pv-head-btns {
+  display: flex;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
 .pv-panel {
   position: fixed;
   top: 0;
