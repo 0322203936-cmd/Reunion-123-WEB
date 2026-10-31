@@ -71,7 +71,7 @@ function dateRange() {
   const start = new Date(today);
   start.setDate(start.getDate() - daysBack);
   const end = new Date(start);
-  end.setDate(end.getDate() + 21);
+  end.setDate(end.getDate() + 42); // 6 weeks of Load Date, Friday to Friday
   return { start, end };
 }
 
