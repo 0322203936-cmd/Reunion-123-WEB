@@ -5,11 +5,10 @@
 //     sheet "Reunion", row = product, columns titled "Req" (row 2), date = the "Fecha" column before it
 //   * Day columns: Sabado..Viernes (the sheet's week) and the days opened with + (weeks.js);
 //     week columns (44, 45...): the sum of that week's Sat..Fri
+//   * Recomputed every time Plan de cosecha is opened (also when switching from Reunion in the same page)
 // ============================================================================
 
 (function () {
-  const params = new URLSearchParams(location.search);
-  if (params.get('wb') !== 'cosecha') return;
   const { indexToCol, parseCoord } = window.ExcelUtils;
   const App = () => window.MauriApp;
   const HEADER_ROW = 4;
@@ -25,15 +24,27 @@
   let req = null; // Map product -> Map(serial -> req)
   let reqDates = new Set();
 
+  // Reunion already open in this page (its values are current, Cor typed a moment ago included);
+  // otherwise it is downloaded and calculated here
   async function loadReq() {
-    const res = await fetch('/api/workbook?wb=reunion');
-    if (!res.ok) throw new Error('No se pudo leer Reunion');
-    const book = await res.json();
-    const sheet = book.sheets && book.sheets.Reunion;
-    if (!sheet) return;
-    const engine = new window.FormulaEngine(book);
-    engine.recalculateAll();
+    const app = App();
+    let book = app && app.getCachedWorkbook ? app.getCachedWorkbook('reunion') : null;
+    let value;
+    if (book && book.sheets && book.sheets.Reunion) {
+      const live = book.sheets.Reunion.cells;
+      value = coord => { const cell = live[coord]; return cell && !cell.e ? cell.v : null; };
+    } else {
+      const res = await fetch('/api/workbook?wb=reunion');
+      if (!res.ok) throw new Error('No se pudo leer Reunion');
+      book = await res.json();
+      if (!book.sheets || !book.sheets.Reunion) return;
+      const engine = new window.FormulaEngine(book);
+      engine.recalculateAll();
+      value = coord => engine.getCellValue('Reunion', coord);
+    }
+    const sheet = book.sheets.Reunion;
     const cells = sheet.cells;
+    const dates = new Set();
     // Req columns: header "Req" in row 2; their date is the "Fecha" column just before
     const reqCols = [];
     for (let c = 2; c <= (sheet.maxCol || 80); c++) {
@@ -46,14 +57,14 @@
       if (m && Number(m[1]) > last) last = Number(m[1]);
     }
     for (const c of reqCols) {
-      const date = engine.getCellValue('Reunion', `${indexToCol(c - 1)}3`);
+      const date = value(`${indexToCol(c - 1)}3`);
       if (typeof date !== 'number') continue;
       const serial = Math.floor(date);
-      reqDates.add(serial);
+      dates.add(serial);
       for (let r = 3; r <= last; r++) {
         const name = norm((cells[`A${r}`] || {}).v);
         if (!name) continue;
-        const v = engine.getCellValue('Reunion', `${indexToCol(c)}${r}`);
+        const v = value(`${indexToCol(c)}${r}`);
         if (typeof v !== 'number') continue;
         if (!map.has(name)) map.set(name, new Map());
         const days = map.get(name);
@@ -61,6 +72,7 @@
       }
     }
     req = map;
+    reqDates = dates;
   }
 
   // per sheet: Flor 123 column, day columns (col -> serial) and week columns (col -> [serials])
@@ -151,14 +163,16 @@
     return Math.ceil(need);
   }
 
-  window.MauriReq = { cellExtra, minColPx, reload: () => loadReq().then(() => App().render()) }; // badges only
-
-  loadReq().then(() => {
-    const wait = setInterval(() => {
+  // badges only: Plan de cosecha is repainted when the Req are ready (the newest request wins)
+  let loading = 0;
+  function refresh() {
+    const ticket = ++loading;
+    return loadReq().then(() => {
       const app = App();
-      if (!app || !app.getWorkbook() || !app.getEngine()) return;
-      clearInterval(wait);
-      app.render();
-    }, 300);
-  }).catch(err => console.error('Req de Reunion:', err));
+      if (ticket === loading && app && app.getWorkbookKey() === 'cosecha') app.render();
+    }).catch(err => console.error('Req de Reunion:', err));
+  }
+  window.MauriReq = { cellExtra, minColPx, reload: refresh };
+  window.addEventListener('mauri:workbook-switch', e => { if (e.detail && e.detail.key === 'cosecha') refresh(); });
+  if (App() && App().getWorkbookKey && App().getWorkbookKey() === 'cosecha' && App().getWorkbook()) refresh();
 })();

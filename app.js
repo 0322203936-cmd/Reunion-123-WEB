@@ -106,6 +106,7 @@
 
   async function fetchWorkbookForKey(key) {
     let response = await fetch(`/api/workbook?wb=${key}`, { cache: 'no-store' });
+    if (response.ok) storeBook(key, response.clone()); // its ETag lets a later visit ask "changed?" cheaply
     if (!response.ok) {
       response = await fetch(initialWorkbookPath(key), { cache: 'force-cache' });
     }
@@ -361,6 +362,16 @@
       updateStatusMetrics();
     }, 150);
   }
+  // A book kept in memory from an earlier visit can be behind: its changes (other people, the Cor
+  // written from Reunion) only arrive while it is open. It is shown at once, read-only, while the server
+  // says whether it changed (ETag: nothing is downloaded when it didn't).
+  async function revalidateCurrentBook() {
+    const key = WB_KEY;
+    setStale(true);
+    try { await reloadFromServer(); } catch (e) { /* the copy shown stays */ }
+    finally { if (key === WB_KEY) setStale(false); }
+  }
+
   async function reloadFromServer() {
     await flushPendingSave();
     const key = WB_KEY;
@@ -3148,6 +3159,7 @@
       closeInlineEditor(true);
 
       let nextWorkbook = workbookCache.get(key);
+      const fromMemory = !!nextWorkbook;
       if (!nextWorkbook) nextWorkbook = await prefetchWorkbook(key);
       if (!nextWorkbook) {
         setWorkbookKey(previousKey);
@@ -3161,6 +3173,7 @@
       activateWorkbook(nextWorkbook, key);
       updateUndoRedoButtons();
       if (updateHistory) history.pushState({ wb: key }, '', `/?wb=${key}`);
+      if (fromMemory) revalidateCurrentBook();
       if (WB_KEY === 'reunion') {
         pollActualizarData();
         pollActualizarInventario();
@@ -4294,6 +4307,8 @@
     pushUndo: names => pushUndoState(names),
     markDirty: name => markSheetDirty(name),
     save: () => saveWorkbookState(),
+    // a book already loaded in this page (null when it isn't): reqbadges.js reads Reunion from here
+    getCachedWorkbook: key => workbookCache.get(key) || null,
     recalcAndRender: () => {
       engine.recalculateAll();
       renderSheetTabs();
