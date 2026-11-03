@@ -11,6 +11,8 @@
   let selectedCoord = 'A1';
   let selectionEndCoord = 'A1';
   let isDraggingSelection = false;
+  // dragging over the row numbers / column letters selects whole rows / columns, like Excel
+  let headerDrag = null; // { axis: 'row' | 'col', anchor: row number | column letters, lastRow, lastCol }
   let isDraggingFillHandle = false;
   let fillPreviewTargetCoord = null;
   let clipboardState = null; // { sheetName, minRow, maxRow, minCol, maxCol, isCut, grid, tsv }
@@ -3558,12 +3560,14 @@
       const colStr = colTh.getAttribute('data-col');
       const sheet = workbook.sheets[activeSheet];
       const maxR = Math.max(getLastRealRow(activeSheet), sheet.maxRow || 100);
-      if (e.shiftKey) {
-        const startP = parseCoord(selectedCoord) || { colStr: 'A' };
-        selectRange(`${startP.colStr}1`, `${colStr}${maxR}`, true);
-      } else {
-        selectRange(`${colStr}1`, `${colStr}${maxR}`, true);
-      }
+      const anchor = e.shiftKey ? (parseCoord(selectedCoord) || { colStr: 'A' }).colStr : colStr;
+      selectRange(`${anchor}1`, `${colStr}${maxR}`, true);
+      if (e.button === 0) headerDrag = { axis: 'col', anchor, lastRow: maxR, lastCol: colStr };
+    });
+    gridHead.addEventListener('mouseover', (e) => {
+      if (!headerDrag || headerDrag.axis !== 'col') return;
+      const th = e.target.closest('th[data-col]');
+      if (th) dragHeaderTo(null, th.getAttribute('data-col'));
     });
 
     // Grid click, drag-to-select, fill handle drag & row header click
@@ -3587,12 +3591,9 @@
         const r = Number(rowTh.getAttribute('data-row'));
         const sheet = workbook.sheets[activeSheet];
         const maxColStr = indexToCol(sheet.maxCol || 20);
-        if (e.shiftKey) {
-          const startP = parseCoord(selectedCoord) || { row: r };
-          selectRange(`A${startP.row}`, `${maxColStr}${r}`, true);
-        } else {
-          selectRange(`A${r}`, `${maxColStr}${r}`, true);
-        }
+        const anchor = e.shiftKey ? (parseCoord(selectedCoord) || { row: r }).row : r;
+        selectRange(`A${anchor}`, `${maxColStr}${r}`, true);
+        headerDrag = { axis: 'row', anchor, lastCol: maxColStr, lastRow: r };
         return;
       }
 
@@ -3626,10 +3627,26 @@
       }
     });
 
-    const dragActive = () => isDraggingSelection || isDraggingFillHandle || !!(refPick && refPick.dragging);
+    // extend a whole-row / whole-column selection to `row` or `col` (whichever applies)
+    const dragHeaderTo = (row, col) => {
+      const d = headerDrag;
+      if (d.axis === 'row' && row && row !== d.lastRow) {
+        d.lastRow = row;
+        selectRange(`A${d.anchor}`, `${d.lastCol}${row}`, true);
+      } else if (d.axis === 'col' && col && col !== d.lastCol) {
+        d.lastCol = col;
+        selectRange(`${d.anchor}1`, `${col}${d.lastRow}`, true);
+      }
+    };
+    const dragActive = () => isDraggingSelection || isDraggingFillHandle || !!headerDrag || !!(refPick && refPick.dragging);
     const dragOverCell = (td) => {
       if (!td) return;
       const coord = td.getAttribute('data-coord');
+      if (headerDrag) {
+        const p = parseCoord(coord);
+        if (p) dragHeaderTo(p.row, p.colStr);
+        return;
+      }
       if (refPick && refPick.dragging) {
         if (coord !== refPick.focus) {
           refPick.focus = coord;
@@ -3648,6 +3665,11 @@
 
     gridBody.addEventListener('mouseover', (e) => {
       if (!dragActive()) return;
+      if (headerDrag && headerDrag.axis === 'row') {
+        const tr = e.target.closest('tr[data-row]');
+        if (tr) dragHeaderTo(Number(tr.dataset.row), null);
+        return;
+      }
       dragOverCell(e.target.closest('td[data-coord]'));
     });
 
@@ -3709,6 +3731,7 @@
         isDraggingSelection = false;
         if (formatPainterActive) applyFormatPainterToSelection();
       }
+      headerDrag = null;
     });
 
     gridBody.addEventListener('dblclick', (e) => {
