@@ -122,8 +122,45 @@
       ready.sheetOrder = Object.keys(ready.sheets || {});
     }
     // learn what the server has, so even the first save of a sheet sends only what changed
-    for (const [name, sheet] of Object.entries(ready.sheets || {})) if (!sentSheets.has(sheet)) learnSent(sheet, name);
+    for (const [name, sheet] of Object.entries(ready.sheets || {})) {
+      if (sentSheets.has(sheet)) continue;
+      applyPersonalFilters(key, name, sheet);
+      learnSent(sheet, name);
+    }
     return ready;
+  }
+
+  // ---- personal filters: what each computer filters stays in that browser (localStorage). The sheet
+  //   everybody shares keeps the filter buttons (filters[].ref) but not the choices (filters[].columns)
+  //   nor the rows they hide (filterHiddenRows), so filtering "Isabela" here doesn't filter it elsewhere.
+  const FILTERS_KEY = 'reunion123_filtros';
+  function personalFilters() {
+    try { return JSON.parse(localStorage.getItem(FILTERS_KEY) || '{}') || {}; } catch (e) { return {}; }
+  }
+  function rememberFilters(key, name, sheet) {
+    const all = personalFilters();
+    const mine = {};
+    (sheet.filters || []).forEach((f, fi) => { if (f.columns && Object.keys(f.columns).length) mine[fi] = f.columns; });
+    all[key] = all[key] || {};
+    if (Object.keys(mine).length) all[key][name] = mine; else delete all[key][name];
+    try { localStorage.setItem(FILTERS_KEY, JSON.stringify(all)); } catch (e) { /* kept for this visit only */ }
+  }
+  function applyPersonalFilters(key, name, sheet) {
+    if (!sheet) return;
+    if (!sheet.filters || !sheet.filters.length) { delete sheet.filterHiddenRows; return; }
+    const mine = (personalFilters()[key] || {})[name] || {};
+    sheet.filters.forEach((f, fi) => {
+      if (mine[fi]) f.columns = JSON.parse(JSON.stringify(mine[fi]));
+      else delete f.columns;
+    });
+    recomputeFilterHidden(sheet);
+  }
+  // the sheet as it is shared (saved / compared with the server): without this computer's filter
+  function sharedView(sheet) {
+    const view = { ...sheet };
+    delete view.filterHiddenRows;
+    if (sheet.filters) view.filters = sheet.filters.map(({ columns, ...rest }) => rest);
+    return view;
   }
 
   function prefetchWorkbook(key) {
@@ -327,6 +364,10 @@
           for (const [k, v] of Object.entries(delta.props || {})) sent.snap.knownProps.set(k, JSON.stringify(v));
           for (const k of delta.removed || []) sent.snap.knownProps.delete(k);
         }
+        // a page that still shares its filter must not change this computer's own filter
+        if ('filters' in (delta.props || {}) || 'filterHiddenRows' in (delta.props || {}) || (delta.removed || []).includes('filterHiddenRows')) {
+          applyPersonalFilters(WB_KEY, name, sheet);
+        }
       }
       changed.add(name);
     }
@@ -345,6 +386,7 @@
     if (!res.ok || key !== WB_KEY) return;
     const sheet = await res.json();
     workbook.sheets[name] = sheet;
+    applyPersonalFilters(key, name, sheet);
     learnSent(sheet, name);
     remoteFull = true;
     scheduleRemoteRender();
@@ -588,7 +630,7 @@
   // until it is complete the snapshot is "partial" (touched cells can still be sent as a delta)
   const LEARN_CHUNK = 3000;
   function learnSent(sheet, name) {
-    const snap = { known: new Map(), knownProps: window.SheetDelta.propsOf(sheet), partial: true };
+    const snap = { known: new Map(), knownProps: window.SheetDelta.propsOf(sharedView(sheet)), partial: true };
     const entry = { name, snap };
     sentSheets.set(sheet, entry);
     const coords = Object.keys(sheet.cells || {});
@@ -638,13 +680,13 @@
       const coords = touched.get(n) || null;
       // sent whole only when the server knows it by another name or not at all
       if (!sent || sent.name !== n) {
-        payload.sheets[n] = sheet;
+        payload.sheets[n] = sharedView(sheet);
         learnSent(sheet, n);
         continue;
       }
       // a whole-sheet change while this page is still learning the sheet: wait a moment
       if (!coords && sent.snap.partial) { later.push(n); continue; }
-      const diff = window.SheetDelta.diffSheet(sent.snap, sheet, coords);
+      const diff = window.SheetDelta.diffSheet(sent.snap, sharedView(sheet), coords);
       if (diff) payload.deltas[n] = diff.delta;
     }
     if (later.length) {
@@ -702,7 +744,7 @@
   async function reloadWorkbookAfterActualizarData() {
     const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
     if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
-    workbook = await workbookResponse.json();
+    workbook = workbookReady(await workbookResponse.json(), WB_KEY);
     workbookCache.set(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
     activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
@@ -781,7 +823,7 @@
   async function reloadWorkbookAfterActualizarInventario() {
     const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
     if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro con el inventario actualizado.');
-    workbook = await workbookResponse.json();
+    workbook = workbookReady(await workbookResponse.json(), WB_KEY);
     workbookCache.set(WB_KEY, workbook);
     workbookEngineCache.delete(WB_KEY);
     activeSheet = workbook.sheets.Inventario && !workbook.sheets.Inventario.hidden ? 'Inventario' : activeSheet;
@@ -1332,6 +1374,7 @@
       }
       closeFilterMenu();
       recomputeFilterHidden(sheet);
+      rememberFilters(WB_KEY, activeSheet, sheet); // this computer only
       engine.recalculateAll(); // SUBTOTAL / AGGREGATE skip the rows the filter hides
       renderSheet();
       updateStatusMetrics();
