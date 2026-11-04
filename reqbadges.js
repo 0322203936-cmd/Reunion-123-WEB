@@ -3,6 +3,9 @@
 //   * Sheets with a "Flor 123" column (row 4): each row's Flor 123 is a Reunion product
 //   * Req comes from Reunion itself (its own engine), so it is exactly what Reunion shows:
 //     sheet "Reunion", row = product, columns titled "Req" (row 2), date = the "Fecha" column before it
+//   * Reunion only has a few days of Req columns: for every other production date in PegarData the
+//     row's own Req formula (=SUMIFS(PegarData!N, PegarData!O, date, PegarData!U or E, $A)) is applied
+//     to that date, and title rows (=+H5+H6...) add up their rows, so the boxes reach as far as PegarData
 //   * Day columns: Sabado..Viernes (the sheet's week) and the days opened with + (weeks.js);
 //     week columns (44, 45...): the sum of that week's Sat..Fri
 //   * Recomputed every time Plan de cosecha is opened (also when switching from Reunion in the same page)
@@ -31,8 +34,10 @@
     let book = app && app.getCachedWorkbook ? app.getCachedWorkbook('reunion') : null;
     let value;
     if (book && book.sheets && book.sheets.Reunion) {
-      const live = book.sheets.Reunion.cells;
-      value = coord => { const cell = live[coord]; return cell && !cell.e ? cell.v : null; };
+      value = (sheetName, coord) => {
+        const cell = (book.sheets[sheetName] || { cells: {} }).cells[coord];
+        return cell && !cell.e ? cell.v : null;
+      };
     } else {
       const res = await fetch('/api/workbook?wb=reunion');
       if (!res.ok) throw new Error('No se pudo leer Reunion');
@@ -40,7 +45,7 @@
       if (!book.sheets || !book.sheets.Reunion) return;
       const engine = new window.FormulaEngine(book);
       engine.recalculateAll();
-      value = coord => engine.getCellValue('Reunion', coord);
+      value = (sheetName, coord) => engine.getCellValue(sheetName, coord);
     }
     const sheet = book.sheets.Reunion;
     const cells = sheet.cells;
@@ -57,22 +62,82 @@
       if (m && Number(m[1]) > last) last = Number(m[1]);
     }
     for (const c of reqCols) {
-      const date = value(`${indexToCol(c - 1)}3`);
+      const date = value('Reunion', `${indexToCol(c - 1)}3`);
       if (typeof date !== 'number') continue;
       const serial = Math.floor(date);
       dates.add(serial);
       for (let r = 3; r <= last; r++) {
         const name = norm((cells[`A${r}`] || {}).v);
         if (!name) continue;
-        const v = value(`${indexToCol(c)}${r}`);
+        const v = value('Reunion', `${indexToCol(c)}${r}`);
         if (typeof v !== 'number') continue;
         if (!map.has(name)) map.set(name, new Map());
         const days = map.get(name);
         days.set(serial, (days.get(serial) || 0) + v);
       }
     }
+    if (reqCols.length) extendFromPegarData(book, cells, indexToCol(reqCols[0]), last, value, map, dates);
     req = map;
     reqDates = dates;
+  }
+
+  // the days Reunion has no Req column for, with each row's own formula (see the header)
+  const SUMIFS_RE = /^=\s*SUMIFS\(\s*PegarData!\$?([A-Z]+)\$?(\d+):\$?[A-Z]+\$?(\d+)\s*,\s*PegarData!\$?([A-Z]+)\$?\d+:\$?[A-Z]+\$?\d+\s*,\s*\$?[A-Z]+\$?\d+\s*,\s*PegarData!\$?([A-Z]+)\$?\d+:\$?[A-Z]+\$?\d+\s*,\s*\$?A\$?(\d+)\s*\)\s*$/i;
+  function extendFromPegarData(book, cells, reqCol, last, value, map, dates) {
+    if (!book.sheets.PegarData) return;
+    const low = v => String(v === undefined || v === null ? '' : v).trim().toLowerCase();
+    const indexes = new Map(); // one pass over PegarData per (sum, date, key columns, rows)
+    const indexOf = (sumC, dateC, keyC, r1, r2) => {
+      const id = [sumC, dateC, keyC, r1, r2].join('|');
+      if (indexes.has(id)) return indexes.get(id);
+      const byKey = new Map();
+      for (let r = r1; r <= r2; r++) {
+        const d = value('PegarData', `${dateC}${r}`);
+        const key = low(value('PegarData', `${keyC}${r}`));
+        if (typeof d !== 'number' || !key) continue;
+        const n = value('PegarData', `${sumC}${r}`);
+        const days = byKey.get(key) || new Map();
+        days.set(d, (days.get(d) || 0) + (typeof n === 'number' ? n : 0));
+        byKey.set(key, days);
+      }
+      indexes.set(id, byKey);
+      return byKey;
+    };
+    const rowDays = new Map(); // Reunion row -> Map(serial -> req) for the extra days
+    const allDates = new Set();
+    for (let r = 3; r <= last; r++) {
+      const m = SUMIFS_RE.exec(String((cells[`${reqCol}${r}`] || {}).f || ''));
+      if (!m) continue;
+      const [, sumC, r1, r2, dateC, keyC, aRow] = m;
+      const days = indexOf(sumC, dateC, keyC, Number(r1), Number(r2)).get(low((cells[`A${aRow}`] || {}).v));
+      const extra = new Map();
+      for (const [d, n] of days || []) if (!dates.has(Math.floor(d))) extra.set(Math.floor(d), n);
+      rowDays.set(r, extra);
+    }
+    for (const idx of indexes.values()) for (const ds of idx.values()) for (const d of ds.keys()) allDates.add(Math.floor(d));
+    // title rows: =+H5+H6+... (only references to rows of the same Req column, added up)
+    const titleRe = new RegExp(`^=\\s*\\+?\\s*${reqCol}\\d+(\\s*\\+\\s*${reqCol}\\d+)*\\s*$`);
+    for (let r = 3; r <= last; r++) {
+      const f = String((cells[`${reqCol}${r}`] || {}).f || '').replace(/\$/g, '');
+      if (rowDays.has(r) || !titleRe.test(f)) continue;
+      const extra = new Map();
+      for (const ref of f.match(new RegExp(`${reqCol}(\\d+)`, 'g'))) {
+        for (const [d, n] of rowDays.get(Number(ref.slice(reqCol.length))) || []) extra.set(d, (extra.get(d) || 0) + n);
+      }
+      rowDays.set(r, extra);
+    }
+    for (const [r, extra] of rowDays) {
+      const name = norm((cells[`A${r}`] || {}).v);
+      if (!name) continue;
+      if (!map.has(name)) map.set(name, new Map());
+      const days = map.get(name);
+      for (const [d, n] of extra) days.set(d, (days.get(d) || 0) + n);
+    }
+    // every production day from the first to the last one in PegarData has data (zero when nothing)
+    if (allDates.size) {
+      const lo = Math.min(...allDates), hi = Math.max(...allDates);
+      for (let d = lo; d <= hi; d++) dates.add(d);
+    }
   }
 
   // per sheet: Flor 123 column, day columns (col -> serial) and week columns (col -> [serials])
