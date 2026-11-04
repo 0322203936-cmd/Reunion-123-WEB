@@ -212,6 +212,11 @@
     window.addEventListener(type, e => { if (staleView) { e.preventDefault(); e.stopImmediatePropagation(); } }, true);
   }
   function replaceWorkbookKeepingView(fresh) {
+    // the undo history belongs to the copy being replaced: undoing over the new one could delete
+    // tabs (or cells) that the old copy didn't have
+    undoStack.length = 0;
+    redoStack.length = 0;
+    updateUndoRedoButtons();
     const keepSheet = activeSheet;
     const keepCoord = selectedCoord;
     const vp = document.getElementById('spreadsheetViewport');

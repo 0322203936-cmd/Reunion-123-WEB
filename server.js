@@ -511,6 +511,16 @@ async function initDatabase() {
 
 // ---------------------------------------------------------------- workbook persistence
 const loadingBooks = {};
+// every sheet the book has stays in its tab order: a page with an old copy of the book sends an
+// order without the tabs created after it was loaded, which would hide them (they are only removed
+// from the order when the sheet itself is deleted)
+function keepEveryTab(workbook) {
+  if (!workbook || !workbook.sheets) return;
+  const order = Array.isArray(workbook.sheetOrder) ? workbook.sheetOrder.filter(n => workbook.sheets[n]) : [];
+  for (const n of Object.keys(workbook.sheets)) if (!order.includes(n)) order.push(n);
+  workbook.sheetOrder = order;
+}
+
 async function loadWorkbook(key) {
   if (caches[key] && persistenceReady) return caches[key];
   if (!pool || !persistenceReady) {
@@ -524,6 +534,7 @@ async function loadWorkbook(key) {
       const meta = book ? book.meta : splitWorkbook(initialWorkbook(key)).meta;
       const sheets = book ? book.sheets : {};
       caches[key] = { ...meta, sheets };
+      keepEveryTab(caches[key]);
       rememberStored(key, meta, sheets, book ? book.deltaCounts : {});
       return caches[key];
     })().finally(() => { delete loadingBooks[key]; });
@@ -690,6 +701,7 @@ async function patchWorkbook(key, patch) {
   const deleted = Array.isArray(patch.deleted) ? patch.deleted : [];
   for (const [name, data] of Object.entries(changed)) workbook.sheets[name] = data;
   for (const name of deleted) delete workbook.sheets[name];
+  keepEveryTab(workbook);
   // deltas (only the cells that changed); a sheet the server doesn't have is reported back
   const missing = [];
   const touched = {};
