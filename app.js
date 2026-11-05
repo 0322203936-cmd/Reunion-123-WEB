@@ -403,20 +403,36 @@
         const sheet = book && book.sheets[name];
         if (sheet) learnSent(sheet, name);
         progressiveSheets.delete(progressiveSheetId(key, name));
+        if (key === WB_KEY && name === activeSheet) {
+          staleView = false;
+          document.body.classList.remove('wb-stale');
+          if (statusInfo) statusInfo.textContent = `${book.workbookName || 'Reunion 123'} • Otras hojas cargando…`;
+        }
       },
       done: async () => {
         const book = workbookCache.get(key);
         if (!book) return;
+        const before = {};
+        if (key === WB_KEY && book.sheets[activeSheet]) {
+          for (const [coord, cell] of Object.entries(book.sheets[activeSheet].cells || {})) {
+            if (cell && cell.f) before[coord] = `${cell.v}|${cell.e || ''}`;
+          }
+        }
         const readyEngine = new window.FormulaEngine(book);
         readyEngine.recalculateAll();
         workbookEngineCache.set(key, readyEngine);
         if (key === WB_KEY) {
           workbook = book;
           engine = readyEngine;
-          setStale(false);
+          const affected = [];
+          for (const [coord, cell] of Object.entries(book.sheets[activeSheet]?.cells || {})) {
+            if (cell && cell.f && before[coord] !== `${cell.v}|${cell.e || ''}`) affected.push(`${activeSheet}!${coord}`);
+          }
+          if (affected.length) refreshValues(affected);
+          staleView = false;
+          document.body.classList.remove('wb-stale');
           editsWhileStale.clear();
           renderSheetTabs();
-          renderSheet();
           if (statusInfo) statusInfo.textContent = `${book.workbookName || 'Reunion 123'} • Excel Engine Active`;
         }
       }
@@ -3523,6 +3539,10 @@
 
   function switchSheet(sheetName) {
     if (!workbook.sheets[sheetName]) return;
+    if (progressiveSheets.has(progressiveSheetId(WB_KEY, sheetName))) {
+      showToast('Espera unos segundos: esta hoja todavía se está cargando', true);
+      return;
+    }
     activeSheet = sheetName;
     renderSheetTabs();
     renderSheet();
