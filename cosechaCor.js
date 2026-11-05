@@ -1,6 +1,8 @@
 // ============================================================================
 // PLAN DE COSECHA -> COR DE REUNION (shared by server.js and the Reunion page)
 //   * Source: the LAST "P Cosecha" tab that has a "Flor 123" column (row 4)
+//   * The week in progress (Sat..Fri of today): when the last tab doesn't have it yet (it starts with
+//     next week), it comes from the newest tab that has it (e.g. week 45 from 2645 while 2646 starts at 46)
 //   * Each row's Flor 123 is a Reunion product; its days are the Sat..Fri columns opened with +
 //     (sheet.weekDays, weeks.js). Rows of the same product (fincas) add up.
 //   * Every date of the weeks in that tab is "covered": Reunion's Cor for that product and date
@@ -41,14 +43,38 @@
     return out;
   }
 
-  function lastCosechaSheet(book) {
+  // the "P Cosecha" tabs with Flor 123, in tab order
+  function cosechaSheets(book) {
     const order = (book && book.sheetOrder) || [];
-    for (let i = order.length - 1; i >= 0; i--) {
-      const name = order[i];
+    const out = [];
+    for (const name of order) {
       const sheet = book.sheets[name];
       if (!sheet || sheet.hidden || !/^\s*p\s*cosecha/i.test(name)) continue;
       const flor = headerRow(sheet).find(h => norm(h.cell.v) === 'FLOR 123');
-      if (flor) return { name, sheet, florCol: flor.col };
+      if (flor) out.push({ name, sheet, florCol: flor.col });
+    }
+    return out;
+  }
+  function lastCosechaSheet(book) {
+    const all = cosechaSheets(book);
+    return all.length ? all[all.length - 1] : null;
+  }
+  function todaySerial() {
+    const n = new Date();
+    return Math.round((Date.UTC(n.getFullYear(), n.getMonth(), n.getDate()) - EPOCH) / 86400000);
+  }
+  // the week in progress when the last tab doesn't have it: { found, dates: Set (Sat..Fri) } or null
+  function currentWeekSource(book, main) {
+    const today = todaySerial();
+    if (!main || dayColumns(main).dates.has(today)) return null;
+    const all = cosechaSheets(book);
+    for (let i = all.length - 2; i >= 0; i--) {
+      if (!dayColumns(all[i]).dates.has(today)) continue;
+      const dow = new Date(EPOCH + today * 86400000).getUTCDay(); // Saturday = 6
+      const sat = today - ((dow + 1) % 7);
+      const dates = new Set();
+      for (let k = 0; k < 7; k++) dates.add(sat + k);
+      return { found: all[i], dates };
     }
     return null;
   }
@@ -102,9 +128,26 @@
         if (v) days[d.serial] = (days[d.serial] || 0) + v;
       }
     }
+    // the week in progress from the previous tab (only its 7 days)
+    const cw = currentWeekSource(cosechaBook, found);
+    if (cw) {
+      const cwCells = cw.found.sheet.cells || {};
+      const cwDays = dayColumns(cw.found).dayCols.filter(d => cw.dates.has(d.serial));
+      const cwLast = lastRowOf(cw.found.sheet, cw.found.florCol);
+      for (let r = FIRST_ROW; r <= cwLast; r++) {
+        const product = norm((cwCells[`${cw.found.florCol}${r}`] || {}).v);
+        if (!product) continue;
+        const days = values[product] || (values[product] = {});
+        for (const d of cwDays) {
+          const v = num((cwCells[`${d.col}${r}`] || {}).v);
+          if (v) days[d.serial] = (days[d.serial] || 0) + v;
+        }
+      }
+      cw.dates.forEach(d => dates.add(d));
+    }
     const sortedDates = [...dates].sort((a, b) => a - b);
-    const sig = JSON.stringify([name, sortedDates[0], sortedDates[sortedDates.length - 1], values]);
-    return { sheet: name, dates: sortedDates, values, sig };
+    const sig = JSON.stringify([name, cw ? cw.found.name : null, sortedDates[0], sortedDates[sortedDates.length - 1], values]);
+    return { sheet: name, weekSheet: cw ? cw.found.name : null, dates: sortedDates, values, sig };
   }
 
   // Cor typed in Reunion -> Plan de cosecha: the day cell of the only finca with a number that day,
@@ -113,8 +156,13 @@
   //   Returns { cells: { coord: cell } } or { error }
   const WRITE_FINCA = 'ISABELA';
   function writeCor(cosechaBook, product, serial, value) {
-    const found = lastCosechaSheet(cosechaBook);
+    let found = lastCosechaSheet(cosechaBook);
     if (!found) return { error: 'No hay pestaña P Cosecha con Flor 123' };
+    // a day of the week in progress that the last tab doesn't have: written in the tab it comes from
+    if (!dayColumns(found).dayCols.some(d => d.serial === serial)) {
+      const cw = currentWeekSource(cosechaBook, found);
+      if (cw && cw.dates.has(serial)) found = cw.found;
+    }
     const { sheet, florCol } = found;
     const cells = sheet.cells || (sheet.cells = {});
     const day = dayColumns(found).dayCols.find(d => d.serial === serial);

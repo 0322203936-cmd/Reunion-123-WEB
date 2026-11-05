@@ -388,6 +388,7 @@ function broadcastCor() {
   const msg = `event: cor\ndata: ${JSON.stringify(publicCorFeed())}\n\n`;
   for (const res of corClients) res.write(msg);
 }
+setInterval(() => scheduleCorSync(), 60 * 60 * 1000).unref(); // the week in progress changes on Saturday
 function scheduleCorSync(delay = 150) {
   clearTimeout(corTimer);
   corTimer = setTimeout(() => { syncCor().catch(err => console.error('Sync Cor:', err)); }, delay);
