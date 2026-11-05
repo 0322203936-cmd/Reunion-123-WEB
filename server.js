@@ -809,6 +809,51 @@ async function handleRequest(req, res) {
     return sendJson(res, 200, Object.entries(WORKBOOKS).map(([k, c]) => ({ key: k, name: c.name })));
   }
 
+  // Progressive read-only stream: sends the workbook structure first, then one complete sheet
+  // at a time. It never changes persistence; it only lets the browser render while the response
+  // is still arriving.
+  if (pathname === '/api/workbook-stream' && req.method === 'GET') {
+    if (key === 'rvp' && persistenceReady) await ensureAppend();
+    const workbook = await loadWorkbook(key);
+    const orderedNames = [
+      ...(Array.isArray(workbook.sheetOrder) ? workbook.sheetOrder : []),
+      ...Object.keys(workbook.sheets || {})
+    ].filter((name, index, all) => workbook.sheets[name] && all.indexOf(name) === index);
+    const skeletons = {};
+    for (const name of orderedNames) {
+      const { cells, ...header } = workbook.sheets[name] || {};
+      skeletons[name] = { ...header, cells: {} };
+    }
+    const meta = { ...workbook, sheets: skeletons };
+    const names = orderedNames.slice();
+    const active = names.indexOf(workbook.activeSheet);
+    if (active > 0) names.unshift(...names.splice(active, 1));
+
+    const acceptsGzip = String(req.headers['accept-encoding'] || '').includes('gzip');
+    const gzip = acceptsGzip ? zlib.createGzip({ level: 1 }) : null;
+    if (gzip) {
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-store' });
+      gzip.pipe(res);
+    } else {
+      res.writeHead(200, { 'Content-Type': 'application/x-ndjson; charset=utf-8', 'Cache-Control': 'no-store' });
+    }
+    const writeLine = async value => {
+      const line = `${JSON.stringify(value)}\n`;
+      const target = gzip || res;
+      if (!target.write(line)) await new Promise(resolve => target.once('drain', resolve));
+    };
+    try {
+      await writeLine({ type: 'meta', workbook: meta, totalSheets: names.length });
+      for (const name of names) await writeLine({ type: 'sheet', name, sheet: workbook.sheets[name] });
+      await writeLine({ type: 'done' });
+      if (gzip) await new Promise(resolve => { gzip.once('end', resolve); gzip.end(); });
+      else res.end();
+    } catch (error) {
+      if (!res.writableEnded) res.destroy(error);
+    }
+    return;
+  }
+
   if (pathname === '/api/actualizar-data' && (req.method === 'GET' || req.method === 'POST')) {
     if (key !== 'reunion') return sendJson(res, 400, { error: 'Actualizar Data solo está disponible para Reunion.' });
     if (req.method === 'GET') return sendJson(res, 200, publicActualizarDataState());

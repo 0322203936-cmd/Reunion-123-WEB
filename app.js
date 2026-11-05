@@ -116,6 +116,37 @@
     return response.json();
   }
 
+  async function streamWorkbookForKey(key, handlers = {}) {
+    const response = await fetch(`/api/workbook-stream?wb=${key}`, { cache: 'no-store' });
+    if (!response.ok || !response.body) throw new Error(`No se pudo transmitir ${key}`);
+    const reader = response.body.getReader();
+    const decoder = new TextDecoder();
+    let buffer = '';
+    const consume = async text => {
+      buffer += text;
+      let newline;
+      while ((newline = buffer.indexOf('\n')) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line) continue;
+        const record = JSON.parse(line);
+        if (record.type === 'meta' && handlers.meta) await handlers.meta(record.workbook, record.totalSheets);
+        else if (record.type === 'sheet' && handlers.sheet) await handlers.sheet(record.name, record.sheet);
+        else if (record.type === 'done' && handlers.done) await handlers.done();
+      }
+    };
+    while (true) {
+      const part = await reader.read();
+      if (part.done) break;
+      await consume(decoder.decode(part.value, { stream: true }));
+    }
+    await consume(decoder.decode());
+    if (buffer.trim()) {
+      const record = JSON.parse(buffer.trim());
+      if (record.type === 'done' && handlers.done) await handlers.done();
+    }
+  }
+
   function workbookReady(nextWorkbook, key) {
     const ready = nextWorkbook || { workbookName: key, sheetOrder: [], sheets: {} };
     if (!ready.sheetOrder || ready.sheetOrder.length === 0) {
@@ -304,32 +335,87 @@
     if (keepCoord) selectCell(keepCoord, false, false);
   }
   async function loadFirstWorkbook() {
-    const cached = await cachedBook(WB_KEY);
+    const key = WB_KEY;
+    const cached = await cachedBook(key);
     let shown = false;
     if (cached) {
-      try { activateWorkbook(await cached.clone().json(), WB_KEY); setStale(true); shown = true; } catch (e) { shown = false; }
+      try {
+        activateWorkbook(await cached.clone().json(), key);
+        setStale(true);
+        shown = true;
+      } catch (e) { shown = false; }
     }
-    const etag = shown && cached.headers.get('ETag');
-    const res = await fetch(bookUrl(WB_KEY), { cache: 'no-store', headers: etag ? { 'If-None-Match': etag } : {} });
-    if (res.status === 304 && shown) {
-      setStale(false);
-      editsWhileStale.clear();
-      const statusInfo = document.getElementById('statusFormulaInfo');
-      if (statusInfo) statusInfo.textContent = 'Cargando Reunion, Plan de cosecha y RVP…';
-      await preloadOtherBooks();
-      if (statusInfo) statusInfo.textContent = `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
-      return;
-    }
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
-    storeBook(WB_KEY, res.clone());
-    const fresh = await res.json();
-    if (shown) await replaceWithFresh(fresh);
-    else activateWorkbook(fresh, WB_KEY);
-    setStale(false);
+
+    let resolveFirstSheet;
+    const firstSheetReady = new Promise(resolve => { resolveFirstSheet = resolve; });
+    if (shown) resolveFirstSheet();
     const statusInfo = document.getElementById('statusFormulaInfo');
-    if (statusInfo) statusInfo.textContent = 'Cargando Reunion, Plan de cosecha y RVP…';
-    await preloadOtherBooks();
-    if (statusInfo) statusInfo.textContent = `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
+    if (statusInfo) statusInfo.textContent = 'Actualizando datos…';
+
+    const stream = streamWorkbookForKey(key, {
+      meta: async (meta) => {
+        if (!shown) {
+          activateWorkbook(meta, key);
+          setStale(true);
+          shown = true;
+        } else if (workbookCache.get(key)) {
+          const book = workbookCache.get(key);
+          for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) {
+            if (meta[k] !== undefined) book[k] = meta[k];
+          }
+          for (const [name, sheet] of Object.entries(meta.sheets || {})) {
+            if (!book.sheets[name]) book.sheets[name] = sheet;
+          }
+          renderSheetTabs();
+        }
+        if (statusInfo) statusInfo.textContent = 'Actualizando datos…';
+      },
+      sheet: async (name, sheet) => {
+        const book = workbookCache.get(key);
+        if (!book) return;
+        forgetSent([name], book);
+        applyPersonalFilters(key, name, sheet);
+        book.sheets[name] = sheet;
+        learnSent(sheet, name);
+        if (key === WB_KEY && name === activeSheet) {
+          renderSheet();
+          selectCell('A1', false);
+          resolveFirstSheet();
+        }
+      },
+      done: async () => {
+        const book = workbookCache.get(key);
+        if (!book) return;
+        const readyEngine = new window.FormulaEngine(book);
+        readyEngine.recalculateAll();
+        workbookEngineCache.set(key, readyEngine);
+        if (key === WB_KEY) {
+          workbook = book;
+          engine = readyEngine;
+          setStale(false);
+          editsWhileStale.clear();
+          renderSheetTabs();
+          renderSheet();
+          if (statusInfo) statusInfo.textContent = `${book.workbookName || 'Reunion 123'} • Excel Engine Active`;
+        }
+      }
+    }).catch(async error => {
+      if (shown) {
+        setStale(false);
+        if (statusInfo) statusInfo.textContent = `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
+        return;
+      }
+      const fallback = await fetchWorkbookForKey(key);
+      activateWorkbook(fallback, key);
+      setStale(false);
+      resolveFirstSheet();
+    });
+
+    // The active sheet becomes interactive as soon as its streamed chunk arrives; the remaining
+    // sheets and the formula engine continue rebuilding in the background.
+    await firstSheetReady;
+    void stream;
+    void preloadOtherBooks();
   }
 
   // ---- live sync: what other computers change in this book shows up here within a second or two
