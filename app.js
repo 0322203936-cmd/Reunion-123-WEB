@@ -240,17 +240,51 @@
     staleView = on;
     document.body.classList.toggle('wb-stale', on);
     const statusInfo = document.getElementById('statusFormulaInfo');
-    if (statusInfo) statusInfo.textContent = on ? 'Actualizando datos… (solo lectura)' : `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
+    if (statusInfo) statusInfo.textContent = on ? 'Actualizando datos…' : `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
   }
-  // while the copy shown is the old one: moving around and copying is fine, editing waits
-  const STALE_OK_KEYS = new Set(['ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'PageUp', 'PageDown', 'Home', 'End', 'Tab', 'Shift', 'Control', 'Alt', 'Meta']);
+  // While the copy shown is not confirmed with the server yet ("Actualizando datos…"): values can be
+  // typed (only those cells are sent, and they are put back on top of the new copy when it arrives);
+  // what depends on how the whole sheet looks waits a few seconds: rows, tabs, sorting, undo, big pastes.
+  const STALE_MAX_CELLS = 50;
+  const editsWhileStale = new Map(); // sheet -> Set(coord) typed on the copy being confirmed
+  function waitWhileUpdating(cells = Infinity) {
+    if (!staleView || cells <= STALE_MAX_CELLS) return false;
+    showToast('Espera unos segundos: se está actualizando el libro', true);
+    return true;
+  }
   window.addEventListener('keydown', e => {
-    if (!staleView || STALE_OK_KEYS.has(e.key) || ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'c')) return;
+    const k = e.key.toLowerCase();
+    if (!staleView || !(e.ctrlKey || e.metaKey) || (k !== 'z' && k !== 'y')) return;
     e.preventDefault();
     e.stopImmediatePropagation();
+    waitWhileUpdating();
   }, true);
-  for (const type of ['dblclick', 'paste', 'cut', 'drop']) {
-    window.addEventListener(type, e => { if (staleView) { e.preventDefault(); e.stopImmediatePropagation(); } }, true);
+  for (const type of ['cut', 'drop']) {
+    window.addEventListener(type, e => { if (staleView) { e.preventDefault(); e.stopImmediatePropagation(); waitWhileUpdating(); } }, true);
+  }
+  // the new copy arrived: what was typed meanwhile goes on top of it and is sent once more (same values)
+  async function replaceWithFresh(fresh) {
+    await flushPendingSave();
+    const kept = [];
+    for (const [name, coords] of editsWhileStale) {
+      const from = workbook.sheets[name], to = fresh.sheets && fresh.sheets[name];
+      if (!from || !to) continue;
+      const cells = {};
+      for (const c of coords) {
+        if (from.cells[c] === undefined) { delete to.cells[c]; cells[c] = null; }
+        else { to.cells[c] = JSON.parse(JSON.stringify(from.cells[c])); cells[c] = to.cells[c]; }
+      }
+      kept.push([name, cells]);
+    }
+    editsWhileStale.clear();
+    replaceWorkbookKeepingView(fresh);
+    if (!kept.length) return;
+    const key = WB_KEY;
+    saving = saving.then(() => fetch(`/api/workbook?wb=${key}`, {
+      method: 'PATCH',
+      headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
+      body: JSON.stringify({ deltas: Object.fromEntries(kept.map(([n, cells]) => [n, { cells }])) })
+    })).catch(() => showToast('No se pudo confirmar lo capturado mientras se actualizaba; vuelve a capturarlo', true));
   }
   function replaceWorkbookKeepingView(fresh) {
     // the undo history belongs to the copy being replaced: undoing over the new one could delete
@@ -277,13 +311,14 @@
     }
     const etag = shown && cached.headers.get('ETag');
     const res = await fetch(bookUrl(WB_KEY), { cache: 'no-store', headers: etag ? { 'If-None-Match': etag } : {} });
-    if (res.status === 304 && shown) { setStale(false); return; }
+    if (res.status === 304 && shown) { setStale(false); editsWhileStale.clear(); preloadOtherBooks(); return; }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     storeBook(WB_KEY, res.clone());
     const fresh = await res.json();
-    if (shown) replaceWorkbookKeepingView(fresh);
+    if (shown) await replaceWithFresh(fresh);
     else activateWorkbook(fresh, WB_KEY);
     setStale(false);
+    preloadOtherBooks();
   }
 
   // ---- live sync: what other computers change in this book shows up here within a second or two
@@ -300,6 +335,7 @@
   const trackedBooks = new Set();  // followed without gaps since they were last open
   const staleBooks = new Set();    // must be checked with the server when opened
   const pendingBg = new Map();     // key -> { changes: [[sheet, coord]], full } recalculated when opened
+  const checkingBooks = new Set(); // preloaded books being confirmed with the server
   let remoteRenderTimer = null;
   // what other people changed since the last render: only those cells are recalculated
   // (remoteChanges), unless something structural arrived (remoteFull)
@@ -368,7 +404,7 @@
   function applyBackground(key, data) {
     const book = workbookCache.get(key);
     if (!book || !book.sheets) return;
-    if (!trackedBooks.has(key)) return; // it will be checked with the server when opened
+    if (!trackedBooks.has(key)) { if (checkingBooks.has(key)) staleBooks.add(key); return; } // checked when opened
     const pend = pendingBg.get(key) || { changes: [], full: false };
     pendingBg.set(key, pend);
     for (const [name, delta] of Object.entries(data.deltas || {})) {
@@ -492,7 +528,38 @@
     const key = WB_KEY;
     setStale(true);
     try { await reloadFromServer(); } catch (e) { /* the copy shown stays */ }
-    finally { if (key === WB_KEY) setStale(false); }
+    finally { if (key === WB_KEY) { setStale(false); editsWhileStale.clear(); } }
+  }
+
+  // once the open book is ready, the other books are downloaded quietly, so opening them is instant
+  // (they are followed live from then on; one last cheap check makes sure nothing was missed meanwhile)
+  let preloadStarted = false;
+  function preloadOtherBooks() {
+    if (preloadStarted) return;
+    preloadStarted = true;
+    setTimeout(async () => {
+      for (const key of VALID_WB_KEYS) {
+        if (key === WB_KEY || workbookCache.has(key)) continue;
+        try { await prefetchWorkbook(key); } catch (e) { /* opened normally later */ }
+      }
+      connectLive(); // now following them too
+      // changes between their download and the new connection: a cheap "changed?" (ETag) before
+      // trusting them; anything arriving meanwhile also sends them to be checked when opened
+      const preloaded = VALID_WB_KEYS.filter(k => k !== WB_KEY && workbookCache.has(k) && !trackedBooks.has(k));
+      preloaded.forEach(k => checkingBooks.add(k));
+      for (let i = 0; i < 50 && !(liveSource && liveSource.readyState === 1); i++) await new Promise(r => setTimeout(r, 200));
+      for (const k of preloaded) {
+        try {
+          const saved = await cachedBook(k);
+          const etag = saved && saved.headers.get('ETag');
+          const ctrl = new AbortController();
+          const res = await fetch(bookUrl(k), { cache: 'no-store', signal: ctrl.signal, headers: etag ? { 'If-None-Match': etag } : {} });
+          if (res.status === 304 && !staleBooks.has(k) && k !== WB_KEY) trackedBooks.add(k);
+          else { staleBooks.add(k); ctrl.abort(); }
+        } catch (e) { staleBooks.add(k); }
+        checkingBooks.delete(k);
+      }
+    }, 3000);
   }
 
   async function reloadFromServer() {
@@ -504,7 +571,7 @@
     if (key !== WB_KEY || res.status === 304 || !res.ok) return;
     storeBook(key, res.clone());
     const fresh = await res.json();
-    if (key === WB_KEY) replaceWorkbookKeepingView(fresh);
+    if (key === WB_KEY) await replaceWithFresh(fresh);
   }
 
   async function init() {
@@ -632,6 +699,7 @@
   }
 
   function undo() {
+    if (waitWhileUpdating()) return;
     if (undoStack.length === 0) return;
     const prev = undoStack.pop();
     redoStack.push(mirrorOf(prev));
@@ -658,6 +726,7 @@
   }
 
   function redo() {
+    if (waitWhileUpdating()) return;
     if (redoStack.length === 0) return;
     const next = redoStack.pop();
     undoStack.push(mirrorOf(next));
@@ -733,8 +802,9 @@
     touchedCells.clear();
     const savedWorkbook = workbook;
     const savedWbKey = WB_KEY;
+    // a copy not confirmed with the server yet sends only its cells: its tab order / pivots may be old
     const payload = {
-      meta: {
+      meta: staleView ? {} : {
         workbookName: savedWorkbook.workbookName,
         sheetOrder: savedWorkbook.sheetOrder,
         tables: savedWorkbook.tables || {},
@@ -1457,6 +1527,7 @@
 
   // Sort the visible rows of a filter range by one column (hidden rows stay where they are)
   function sortFilterRange(fi, colId, desc) {
+    if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     const f = sheet.filters[fi];
     const rg = parseRef(f.ref);
@@ -2287,6 +2358,10 @@
   }
 
   function applyCellValueRaw(sheetName, coord, rawInput) {
+    if (staleView) {
+      if (!editsWhileStale.has(sheetName)) editsWhileStale.set(sheetName, new Set());
+      editsWhileStale.get(sheetName).add(coord);
+    }
     writeCellValue(sheetName, coord, rawInput);
     if (window.MauriCorMarks && window.MauriCorMarks.onUserEdit) window.MauriCorMarks.onUserEdit(sheetName, coord);
   }
@@ -2348,6 +2423,7 @@
   }
 
   function clearSelectedRange() {
+    { const b = getSelectionBounds(); if (waitWhileUpdating((b.maxRow - b.minRow + 1) * (b.maxCol - b.minCol + 1))) return; }
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     pushUndoState();
@@ -2470,6 +2546,7 @@
   }
 
   function toggleMergeCenterSelection() {
+    if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     sheet.merges = sheet.merges || [];
@@ -2733,6 +2810,7 @@
 
   // Excel-style paste: full cells (value, formula, format, merges), relative formula shift, tiling.
   function pasteInternalClipboard() {
+    if (waitWhileUpdating()) return;
     const clip = clipboardState;
     const sheet = workbook.sheets[activeSheet];
     if (!clip || !sheet) return;
@@ -2808,6 +2886,7 @@
   // Plain text paste from outside the app: values only, destination formatting is kept.
   function pasteDataMatrix(matrix) {
     if (!matrix || matrix.length === 0) return;
+    if (waitWhileUpdating(matrix.length * Math.max(...matrix.map(r => r.length)))) return;
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
 
@@ -2844,6 +2923,7 @@
   }
 
   function fillSelectionDown() {
+    if (waitWhileUpdating()) return;
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     if (maxRow <= minRow) return;
     const sheet = workbook.sheets[activeSheet];
@@ -2858,6 +2938,7 @@
   }
 
   function fillSelectionRight() {
+    if (waitWhileUpdating()) return;
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     if (maxCol <= minCol) return;
     const sheet = workbook.sheets[activeSheet];
@@ -3175,6 +3256,7 @@
   }
 
   function insertRowsAt(insertRow, count = 1) {
+    if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     if (!sheet || count < 1) return;
     pushUndoState(sheetsReferencing(activeSheet));
@@ -3203,6 +3285,7 @@
   }
 
   function deleteSelectedRows() {
+    if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     const { minRow, maxRow } = getSelectionBounds();
@@ -3267,6 +3350,7 @@
   }
 
   function commitFillHandleDrag() {
+    if (waitWhileUpdating()) return;
     if (!fillPreviewTargetCoord) return;
     const pHover = parseCoord(fillPreviewTargetCoord);
     fillPreviewTargetCoord = null;
@@ -3335,6 +3419,11 @@
 
       let nextWorkbook = workbookCache.get(key);
       const fromMemory = !!nextWorkbook;
+      let fromBrowser = false;
+      if (!nextWorkbook && !workbookLoading.has(key)) {
+        const saved = await cachedBook(key); // the copy this browser kept from an earlier visit
+        if (saved) { try { nextWorkbook = await saved.clone().json(); fromBrowser = true; } catch (e) { nextWorkbook = null; } }
+      }
       if (!nextWorkbook) nextWorkbook = await prefetchWorkbook(key);
       if (!nextWorkbook) {
         setWorkbookKey(previousKey);
@@ -3349,7 +3438,7 @@
       updateUndoRedoButtons();
       if (updateHistory) history.pushState({ wb: key }, '', `/?wb=${key}`);
       // followed without gaps since it was left: already up to date, nothing to download
-      if (fromMemory && (staleBooks.has(key) || !trackedBooks.has(key))) revalidateCurrentBook();
+      if (fromBrowser || (fromMemory && (staleBooks.has(key) || !trackedBooks.has(key)))) revalidateCurrentBook();
       staleBooks.delete(key);
       trackedBooks.delete(key);
       if (WB_KEY === 'reunion') {
@@ -3374,6 +3463,7 @@
   }
 
   function addNewSheet() {
+    if (waitWhileUpdating()) return;
     pushUndoState();
     let idx = (workbook.sheetOrder?.length || 1) + 1;
     let newName = `Sheet${idx}`;
@@ -3395,6 +3485,7 @@
   }
 
   function renameSheet(oldName) {
+    if (waitWhileUpdating()) return;
     const nextName = prompt('New sheet name:', oldName);
     if (!nextName) return;
     const trimmed = nextName.trim();
@@ -3436,6 +3527,7 @@
   }
 
   function deleteSheet(sheetName) {
+    if (waitWhileUpdating()) return;
     const order = workbook.sheetOrder || Object.keys(workbook.sheets);
     if (visibleSheets().length <= 1 && !workbook.sheets[sheetName]?.hidden) {
       showToast('A workbook must contain at least one visible worksheet', true);
@@ -3467,6 +3559,7 @@
   }
 
   function duplicateSheet(sheetName) {
+    if (waitWhileUpdating()) return;
     const src = workbook.sheets[sheetName];
     if (!src) return;
     pushUndoState();
