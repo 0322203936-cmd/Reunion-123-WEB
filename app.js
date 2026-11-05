@@ -3743,6 +3743,10 @@
       undoStack.length = 0;
       redoStack.length = 0;
       dirtySheets.clear();
+      // "updating" belonged to the book being left (it may still be loading in the background): the
+      // book being opened sets its own below if it needs it
+      setStale(false);
+      editsWhileStale.clear();
       activateWorkbook(nextWorkbook, key);
       updateUndoRedoButtons();
       if (updateHistory) history.pushState({ wb: key }, '', `/?wb=${key}`);
