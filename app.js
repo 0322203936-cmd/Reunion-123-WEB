@@ -401,11 +401,15 @@
       sheetDone: async (name) => {
         const book = workbookCache.get(key);
         const sheet = book && book.sheets[name];
-        if (sheet) learnSent(sheet, name);
+        if (sheet) {
+          if (sheet.filters && sheet.filters.length) recomputeFilterHidden(sheet);
+          learnSent(sheet, name);
+        }
         progressiveSheets.delete(progressiveSheetId(key, name));
         if (key === WB_KEY && name === activeSheet) {
           staleView = false;
           document.body.classList.remove('wb-stale');
+          renderSheet();
           if (statusInfo) statusInfo.textContent = `${book.workbookName || 'Reunion 123'} • Otras hojas cargando…`;
         }
       },
@@ -565,6 +569,10 @@
         if (Object.keys(delta.props || {}).concat(delta.removed || []).some(k => !LAYOUT_PROPS.has(k))) pend.full = true;
       }
     }
+    for (const name of Object.keys(data.deltas || {})) {
+      const sheet = book.sheets[name];
+      if (sheet && sheet.filters && sheet.filters.length) recomputeFilterHidden(sheet);
+    }
     if ((data.sheets || []).length || (data.deleted || []).length) staleBooks.add(key); // whole sheets: checked when opened
     if (data.meta) {
       for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) if (data.meta[k] !== undefined) book[k] = data.meta[k];
@@ -616,6 +624,10 @@
     }
     for (const name of data.sheets || []) { changed.add(name); fetchRemoteSheet(name); }
     for (const name of data.deleted || []) { changed.add(name); delete workbook.sheets[name]; remoteFull = true; }
+    for (const name of changed) {
+      const sheet = workbook.sheets[name];
+      if (sheet && sheet.filters && sheet.filters.length) recomputeFilterHidden(sheet);
+    }
     if (data.meta) {
       for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) if (data.meta[k] !== undefined) workbook[k] = data.meta[k];
       if (data.meta.tables !== undefined) remoteFull = true;
@@ -630,6 +642,7 @@
     const sheet = await res.json();
     workbook.sheets[name] = sheet;
     applyPersonalFilters(key, name, sheet);
+    if (sheet.filters && sheet.filters.length) recomputeFilterHidden(sheet);
     learnSent(sheet, name);
     remoteFull = true;
     scheduleRemoteRender();
