@@ -259,9 +259,14 @@ function publicCorFeed() {
   return { ...corFeed, history: { source: h.source, entries: h.entries } };
 }
 // live sync: `event` to every page with book `key` open, except the one that made the change
+// every event says which book it belongs to (wb): a page also follows the books it opened earlier
+// (?also=...) to keep them up to date in the background
 function broadcastBook(key, event, data, exceptClient) {
-  const msg = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-  for (const res of corClients) if (res.wbKey === key && (!exceptClient || res.clientId !== exceptClient)) res.write(msg);
+  const msg = `event: ${event}\ndata: ${JSON.stringify({ ...data, wb: key })}\n\n`;
+  for (const res of corClients) {
+    if (res.wbKey !== key && !(res.alsoKeys && res.alsoKeys.has(key))) continue;
+    if (!exceptClient || res.clientId !== exceptClient) res.write(msg);
+  }
 }
 function broadcastCor() {
   const msg = `event: cor\ndata: ${JSON.stringify(publicCorFeed())}\n\n`;
@@ -992,6 +997,7 @@ data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
     res.write(': ok\n\n');
     res.wbKey = key;
+    res.alsoKeys = new Set(String(urlObj.searchParams.get('also') || '').split(',').filter(k => WORKBOOKS[k] && k !== key));
     res.clientId = urlObj.searchParams.get('client') || '';
     corClients.add(res);
     if (key === 'rvp' && appendDirty) scheduleAppend(500);

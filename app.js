@@ -196,7 +196,11 @@
     activeSheet = workbook.activeSheet && workbook.sheets[workbook.activeSheet] && !workbook.sheets[workbook.activeSheet].hidden
       ? workbook.activeSheet : firstVisible;
     engine = workbookEngineCache.get(WB_KEY) || new window.FormulaEngine(workbook);
+    const pend = pendingBg.get(WB_KEY);
+    pendingBg.delete(WB_KEY);
     if (!workbookEngineCache.has(WB_KEY)) engine.recalculateAll();
+    else if (pend && pend.full) engine.recalculateAll();
+    else if (pend && pend.changes.length) engine.recalculateCells(pend.changes); // changes that arrived in the background
     renderSheetTabs();
     renderSheet();
     selectCell('A1', false);
@@ -289,6 +293,13 @@
   let liveSource = null;
   let liveKey = null;
   let liveConnectedOnce = false;
+  // ---- books opened earlier in this page stay up to date in the background: the live connection also
+  //   follows them and their small changes are applied to the copy in memory, so going back to them
+  //   needs no download. Anything uncertain (a dropped connection, whole sheets, "reload", a book never
+  //   followed) makes it be checked with the server when it is opened, as before.
+  const trackedBooks = new Set();  // followed without gaps since they were last open
+  const staleBooks = new Set();    // must be checked with the server when opened
+  const pendingBg = new Map();     // key -> { changes: [[sheet, coord]], full } recalculated when opened
   let remoteRenderTimer = null;
   // what other people changed since the last render: only those cells are recalculated
   // (remoteChanges), unless something structural arrived (remoteFull)
@@ -312,21 +323,82 @@
     }
   };
   function connectLive() {
-    if (liveSource && liveKey === WB_KEY) return;
-    if (liveSource) liveSource.close();
-    liveKey = WB_KEY;
+    const also = [...workbookCache.keys()].filter(k => k !== WB_KEY && VALID_WB_KEYS.includes(k)).sort();
+    const sig = `${WB_KEY}|${also.join(',')}`;
+    if (liveSource && liveKey === sig) return;
+    // the old connection stays open until the new one is: no event is lost in between (one that arrives
+    // on both is applied twice, which changes nothing)
+    const previous = liveSource;
+    liveKey = sig;
     liveConnectedOnce = false;
-    const es = new EventSource(`/api/events?wb=${WB_KEY}&client=${CLIENT_ID}`);
+    const es = new EventSource(`/api/events?wb=${WB_KEY}&client=${CLIENT_ID}${also.length ? `&also=${also.join(',')}` : ''}`);
     liveSource = es;
     for (const [event, fn] of liveHandlers) es.addEventListener(event, fn);
-    es.addEventListener('live', e => { try { applyRemote(JSON.parse(e.data)); } catch (err) { console.error('live', err); } });
-    es.addEventListener('reload', () => { reloadFromServer().catch(err => console.error('reload', err)); });
-    // back after a connection drop: something may have been missed, check the book (cheap when unchanged)
-    es.onopen = () => { if (liveConnectedOnce) reloadFromServer().catch(() => {}); liveConnectedOnce = true; };
+    es.addEventListener('live', e => {
+      try {
+        const data = JSON.parse(e.data);
+        if (data.wb && data.wb !== WB_KEY) applyBackground(data.wb, data);
+        else applyRemote(data);
+      } catch (err) { console.error('live', err); }
+    });
+    es.addEventListener('reload', e => {
+      let wb = null;
+      try { wb = JSON.parse(e.data).wb; } catch (err) { /* old server: the open book */ }
+      if (wb && wb !== WB_KEY) { staleBooks.add(wb); return; }
+      reloadFromServer().catch(err => console.error('reload', err));
+    });
+    es.addEventListener('append', () => { if (WB_KEY !== 'rvp') staleBooks.add('rvp'); }); // open RVP: rvpsync.js
+    es.onopen = () => {
+      if (previous && previous !== es) previous.close();
+      if (liveConnectedOnce) {
+        // back after a connection drop: something may have been missed
+        trackedBooks.clear();
+        reloadFromServer().catch(() => {});
+      }
+      liveConnectedOnce = true;
+    };
     es.onerror = () => {
-      if (es.readyState !== EventSource.CLOSED) return; // the browser retries by itself
+      if (es.readyState !== EventSource.CLOSED) return; // the browser retries by itself (onopen above)
+      trackedBooks.clear();
       if (liveSource === es) { liveSource = null; setTimeout(connectLive, 3000); }
     };
+  }
+
+  // a change of a book that is not the open one: applied to its copy in memory
+  function applyBackground(key, data) {
+    const book = workbookCache.get(key);
+    if (!book || !book.sheets) return;
+    if (!trackedBooks.has(key)) return; // it will be checked with the server when opened
+    const pend = pendingBg.get(key) || { changes: [], full: false };
+    pendingBg.set(key, pend);
+    for (const [name, delta] of Object.entries(data.deltas || {})) {
+      const sheet = book.sheets[name];
+      if (!sheet) { staleBooks.add(key); continue; }
+      const sent = sentSheets.get(sheet);
+      if (delta.cells) {
+        window.SheetDelta.applyDelta(sheet, { cells: delta.cells });
+        for (const [coord, cell] of Object.entries(delta.cells)) {
+          pend.changes.push([name, coord]);
+          if (sent) { if (cell === null) sent.snap.known.delete(coord); else sent.snap.known.set(coord, JSON.stringify(cell)); }
+        }
+      }
+      if (delta.props || delta.removed) {
+        window.SheetDelta.applyDelta(sheet, { props: delta.props, removed: delta.removed });
+        if (sent) {
+          for (const [k, v] of Object.entries(delta.props || {})) sent.snap.knownProps.set(k, JSON.stringify(v));
+          for (const k of delta.removed || []) sent.snap.knownProps.delete(k);
+        }
+        if ('filters' in (delta.props || {}) || 'filterHiddenRows' in (delta.props || {}) || (delta.removed || []).includes('filterHiddenRows')) {
+          applyPersonalFilters(key, name, sheet);
+        }
+        if (Object.keys(delta.props || {}).concat(delta.removed || []).some(k => !LAYOUT_PROPS.has(k))) pend.full = true;
+      }
+    }
+    if ((data.sheets || []).length || (data.deleted || []).length) staleBooks.add(key); // whole sheets: checked when opened
+    if (data.meta) {
+      for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) if (data.meta[k] !== undefined) book[k] = data.meta[k];
+      if (data.meta.tables !== undefined) pend.full = true;
+    }
   }
   // undo must not bring back an old copy over what someone else changed meanwhile
   function dropUndoFor(names) {
@@ -3252,6 +3324,9 @@
     workspaceSwitchPromise = (async () => {
       const previousKey = WB_KEY;
       await flushPendingSave();
+      // the book being left keeps its engine and is followed in the background from now on
+      if (workbook && engine) workbookEngineCache.set(previousKey, engine);
+      trackedBooks.add(previousKey);
       clearTimeout(actualizarDataPollTimer);
       clearTimeout(actualizarInventarioPollTimer);
       actualizarDataPollTimer = null;
@@ -3273,7 +3348,10 @@
       activateWorkbook(nextWorkbook, key);
       updateUndoRedoButtons();
       if (updateHistory) history.pushState({ wb: key }, '', `/?wb=${key}`);
-      if (fromMemory) revalidateCurrentBook();
+      // followed without gaps since it was left: already up to date, nothing to download
+      if (fromMemory && (staleBooks.has(key) || !trackedBooks.has(key))) revalidateCurrentBook();
+      staleBooks.delete(key);
+      trackedBooks.delete(key);
       if (WB_KEY === 'reunion') {
         pollActualizarData();
         pollActualizarInventario();
