@@ -98,6 +98,12 @@
   //   server's change number (rev) it is at. Opening / reloading asks the server only for what changed
   //   after it (a few cells, usually a few KB) instead of downloading the whole book.
   const bookRevs = new Map();           // key -> rev the copy in memory is at (at least)
+  const BOOK_NAMES = { reunion: 'Reunion 123', cosecha: 'Plan de cosecha', rvp: 'Requerimiento Vs Proyeccion' };
+  // false when the copy is clearly another book (its name is the name of a different one)
+  function bookBelongsTo(book, key) {
+    const name = book && book.workbookName;
+    return !name || !Object.values(BOOK_NAMES).includes(name) || BOOK_NAMES[key] === name;
+  }
   const BOOK_MAX_AGE = 24 * 3600 * 1000; // older copies kept in the browser are downloaded again
   function copyFresh(saved) {
     const at = Number(saved.headers.get('X-Stored-At')) || Date.parse(saved.headers.get('Date') || '') || 0;
@@ -315,6 +321,7 @@
   }
 
   function activateWorkbook(nextWorkbook, key) {
+    if (!bookBelongsTo(nextWorkbook, key)) throw new Error(`El libro ${nextWorkbook.workbookName} no es ${key}`);
     setWorkbookKey(key);
     workbook = workbookReady(nextWorkbook, key);
     workbookCache.set(WB_KEY, workbook);
@@ -400,8 +407,9 @@
     window.addEventListener(type, e => { if (staleView) { e.preventDefault(); e.stopImmediatePropagation(); waitWhileUpdating(); } }, true);
   }
   // the new copy arrived: what was typed meanwhile goes on top of it and is sent once more (same values)
-  async function replaceWithFresh(fresh) {
+  async function replaceWithFresh(fresh, key = WB_KEY) {
     await flushPendingSave();
+    if (key !== WB_KEY) return false; // the page changed book meanwhile: this copy is not for the open one
     const kept = [];
     for (const [name, coords] of editsWhileStale) {
       const from = workbook.sheets[name], to = fresh.sheets && fresh.sheets[name];
@@ -415,13 +423,13 @@
     }
     editsWhileStale.clear();
     replaceWorkbookKeepingView(fresh);
-    if (!kept.length) return;
-    const key = WB_KEY;
+    if (!kept.length) return true;
     saving = saving.then(() => fetch(`/api/workbook?wb=${key}`, {
       method: 'PATCH',
       headers: { 'Content-Type': 'application/json', 'X-Client-Id': CLIENT_ID },
       body: JSON.stringify({ deltas: Object.fromEntries(kept.map(([n, cells]) => [n, { cells }])) })
     })).catch(() => showToast('No se pudo confirmar lo capturado mientras se actualizaba; vuelve a capturarlo', true));
+    return true;
   }
   function replaceWorkbookKeepingView(fresh) {
     // the undo history belongs to the copy being replaced: undoing over the new one could delete
@@ -855,7 +863,7 @@
     storeBook(key, res.clone());
     const fresh = await res.json();
     if (key !== WB_KEY) return;
-    await replaceWithFresh(fresh);
+    if (!(await replaceWithFresh(fresh, key))) return;
     if (rev) bookRevs.set(key, rev); else bookRevs.delete(key);
   }
 
@@ -1089,7 +1097,7 @@
     const savedWbKey = WB_KEY;
     // a copy not confirmed with the server yet sends only its cells: its tab order / pivots may be old
     const payload = {
-      meta: staleView ? {} : {
+      meta: staleView ? { workbookName: savedWorkbook.workbookName } : {
         workbookName: savedWorkbook.workbookName,
         sheetOrder: savedWorkbook.sheetOrder,
         tables: savedWorkbook.tables || {},
@@ -1131,7 +1139,12 @@
         });
         if (res.status === 409) {
           // the server doesn't have some sheet the deltas were for: send them whole
-          const { missing = [] } = await res.json().catch(() => ({}));
+          const { missing = [], wrongBook } = await res.json().catch(() => ({}));
+          if (wrongBook) {
+            showToast('Este libro se mezcló con otro en esta página; se recarga para no guardar nada equivocado', true);
+            setTimeout(() => location.reload(), 2000);
+            return;
+          }
           forgetSent(missing, savedWorkbook);
           missing.forEach(n => markSheetDirty(n));
           if (missing.length) saveWorkbookState();

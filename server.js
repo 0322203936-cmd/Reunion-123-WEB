@@ -1051,6 +1051,12 @@ async function handleRequest(req, res) {
     } catch (error) {
       return sendJson(res, 400, { error: 'Cambio inválido' });
     }
+    // a page that mixed up books (another book's name) must not write into this one
+    const sentName = parsed.meta && parsed.meta.workbookName;
+    if (sentName && sentName !== cfg(key).name && Object.values(WORKBOOKS).some(w => w.name === sentName)) {
+      console.warn(` Guardado rechazado: llegó "${sentName}" para el libro ${key}`);
+      return sendJson(res, 409, { error: 'Libro equivocado', wrongBook: true });
+    }
     const missing = await patchWorkbook(key, parsed);
     scheduleCorSync();
     // the other pages get the same change: cells as deltas, whole sheets to be fetched, sheet order / pivots
