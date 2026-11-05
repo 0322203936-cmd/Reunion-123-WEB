@@ -313,7 +313,7 @@
     return changed;
   }
 
-  const api = { computeFeed, writeCor, applyFeed, lastCosechaSheet, reunionCorColumns, trackChanges, keyOf, norm };
+  const api = { computeFeed, writeCor, applyFeed, lastCosechaSheet, currentWeekSource, reunionCorColumns, trackChanges, keyOf, norm };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   else root.CosechaCor = api;
 })(typeof window !== 'undefined' ? window : globalThis);

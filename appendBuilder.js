@@ -1,7 +1,8 @@
 // ============================================================================
 // REQUERIMIENTO VS PROYECCION - sheet "Append" (same columns as the Excel's Append1)
 //   * Requerimiento: every order of Reunion's PegarData (Total de tallos 2 = Total Tallos)
-//   * Proyeccion: Plan de cosecha's last tab (Total Tallos 1): one row per captured day,
+//   * Proyeccion: Plan de cosecha's last tab (Total Tallos 1) + the week in progress from the previous
+//     tab when the last one starts with next week (same rule as the Cor, cosechaCor.js): one row per captured day,
 //     or per week when that week has no days captured. Distribuidor / Cust Name / No. = "CORTE"
 //   * Calculated like the Excel: Semana Prod / Semana Load = WEEKNUM(date, 16) (Sat..Fri weeks),
 //     Status orden = ESTIMADO when No. contains "Est", Flor General = Flag!J:K lookup ("*FLOR*").
@@ -87,11 +88,13 @@ function productNames(reunionBook, cosechaBook) {
     }
   }
   const found = cosechaBook && CosechaCor.lastCosechaSheet(cosechaBook);
-  if (found) {
-    const last = lastRowOf(found.sheet.cells, found.florCol);
+  const cw = found && CosechaCor.currentWeekSource(cosechaBook, found);
+  for (const tab of [found, cw && cw.found]) {
+    if (!tab) continue;
+    const last = lastRowOf(tab.sheet.cells, tab.florCol);
     for (let r = 5; r <= last; r++) {
-      const n = text((found.sheet.cells[`${found.florCol}${r}`] || {}).v).trim();
-      if (n) names.set(normName(n), n);
+      const n = text((tab.sheet.cells[`${tab.florCol}${r}`] || {}).v).trim();
+      if (n && (tab === found || !names.has(normName(n)))) names.set(normName(n), n);
     }
   }
   return names;
@@ -148,6 +151,15 @@ function requerimientoRows(reunionBook, flagOf, products) {
 function proyeccionRows(cosechaBook, flagOf) {
   const found = CosechaCor.lastCosechaSheet(cosechaBook);
   if (!found) return [];
+  const rows = tabProyeccionRows(found, flagOf, null);
+  // the week in progress, when the last tab doesn't have it yet: only that week, from the tab that has it
+  const cw = CosechaCor.currentWeekSource(cosechaBook, found);
+  if (cw) rows.push(...tabProyeccionRows(cw.found, flagOf, Math.min(...cw.dates)));
+  return rows;
+}
+
+// CORTE rows of one tab; onlySat: only the week that starts that Saturday (serial)
+function tabProyeccionRows(found, flagOf, onlySat) {
   const { name, sheet, florCol } = found;
   const c = sheet.cells;
   const v = (col, r) => (c[`${col}${r}`] || {}).v;
@@ -192,6 +204,7 @@ function proyeccionRows(cosechaBook, flagOf) {
     };
     for (const w of weekCols) {
       const y = w.week < sheetWeek - 26 ? year + 1 : year;
+      if (onlySat !== null && saturdaySerial(y, w.week) !== onlySat) continue;
       const g = groups[w.col];
       const days = g && Array.isArray(g.cols) ? g.cols.map(col => num(v(col, r))) : [];
       if (days.some(x => x)) {
