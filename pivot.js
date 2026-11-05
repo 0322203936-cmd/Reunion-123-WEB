@@ -416,7 +416,18 @@
         rr++;
       }
     };
-    if (rowFields.length) (tabular ? walkTabular : walkTree)(rowTree, 0);
+    // flat (tabular): one row per combination, every label on its row, no "Total X" rows (like a list)
+    const walkFlat = (node, depth, labels) => {
+      for (const ch of node.list) {
+        const next = labels.concat([ch.value]);
+        if (depth < rowFields.length - 1) { walkFlat(ch, depth + 1, next); continue; }
+        next.forEach((v, i) => put(rr, i, v === null || v === undefined ? '' : v, STYLE.item));
+        emitValues(ch.records, STYLE.item);
+        rr++;
+      }
+    };
+    if (rowFields.length && tabular && p.flat) walkFlat(rowTree, 0, []);
+    else if (rowFields.length) (tabular ? walkTabular : walkTree)(rowTree, 0);
     else if (valueList.length) { put(rr, 0, '', STYLE.item); emitValues(data, STYLE.item); rr++; }
 
     // grand total row

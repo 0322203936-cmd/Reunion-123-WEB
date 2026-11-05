@@ -172,6 +172,8 @@ function tabProyeccionRows(found, flagOf, onlySat) {
     if (h === 'FLOR' && !head.flor) head.flor = m[1];
     else if (h === 'COLOR' && !head.color) head.color = m[1];
     else if (h === 'FINCA' && !head.finca) head.finca = m[1];
+    else if (h === 'VARIEDAD' && !head.variedad) head.variedad = m[1];
+    else if (h === 'GRADO' && !head.grado) head.grado = m[1];
     if (!cell.f && Number.isInteger(cell.v) && cell.v >= 1 && cell.v <= 53) weekCols.push({ col: m[1], week: cell.v });
   }
   weekCols.sort((a, b) => colToIndex(a.col) - colToIndex(b.col));
@@ -200,6 +202,8 @@ function tabProyeccionRows(found, flagOf, onlySat) {
       row[COL.Finca] = head.finca ? v(head.finca, r) ?? null : null;
       row[COL['Flor 123']] = flor123;
       row[COL['Flor y Color']] = florYColor(flor123);
+      // not in Append: only for the TD sheet of Plan de cosecha (server.js)
+      row.extra = { VARIEDAD: head.variedad ? v(head.variedad, r) ?? null : null, Grado: head.grado ? v(head.grado, r) ?? null : null };
       return row;
     };
     for (const w of weekCols) {
@@ -377,8 +381,28 @@ function buildAppendSheet(reunionBook, cosechaBook, rvpBook) {
 }
 
 // only the CORTE rows of Plan de cosecha (sheet TD<week> of Plan de cosecha, server.js)
+// the week in progress may come from the previous tab: its flower lines take Flor / Color / Variedad / Grado
+// of the last tab (so a flower is one line, as in the last tab)
 function buildCorteRows(reunionBook, cosechaBook, rvpBook) {
-  return proyeccionRows(cosechaBook, flagLookup(reunionBook, rvpBook));
+  const flagOf = flagLookup(reunionBook, rvpBook);
+  const found = CosechaCor.lastCosechaSheet(cosechaBook);
+  if (!found) return [];
+  const rows = tabProyeccionRows(found, flagOf, null);
+  const key = row => upper(row[COL['Flor 123']]).replace(/\s+/g, ' ').trim();
+  const info = new Map();
+  for (const row of rows) if (!info.has(key(row))) info.set(key(row), row);
+  const cw = CosechaCor.currentWeekSource(cosechaBook, found);
+  if (cw) {
+    for (const row of tabProyeccionRows(cw.found, flagOf, Math.min(...cw.dates))) {
+      const same = info.get(key(row));
+      if (same) {
+        for (const h of ['FLOR', 'Flor Color', 'Flor 123', 'Flor General (Formula)']) row[COL[h]] = same[COL[h]];
+        row.extra = { ...same.extra };
+      }
+      rows.push(row);
+    }
+  }
+  return rows;
 }
 
 module.exports = { buildAppendSheet, buildAppendRows, buildCorteRows, HEADERS, weeknum16 };
