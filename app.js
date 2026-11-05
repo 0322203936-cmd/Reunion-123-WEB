@@ -2710,6 +2710,21 @@
     saveWorkbookState([coord]);
   }
 
+  // rows / columns not on screen (filter, rows in 0, hidden by hand, closed day columns): whatever is done
+  // to a selection skips them, like Excel, so nothing that can't be seen gets changed
+  function rowShown(r) {
+    const sh = workbook && workbook.sheets[activeSheet];
+    return !(sh && view.sheetName === activeSheet && view.rowIdx && r <= (sh.maxRow || 0) && !view.rowIdx.has(r));
+  }
+  function colShown(c) {
+    const sh = workbook && workbook.sheets[activeSheet];
+    return !(sh && view.sheetName === activeSheet && view.colIdx && c <= (sh.maxCol || 0) && !view.colIdx.has(c));
+  }
+  function shownRows(a, b) { const out = []; for (let r = a; r <= b; r++) if (rowShown(r)) out.push(r); return out; }
+  function shownCols(a, b) { const out = []; for (let c = a; c <= b; c++) if (colShown(c)) out.push(c); return out; }
+  // `count` visible rows (or columns) starting at `from`
+  function takeShown(from, count, shown) { const out = []; for (let i = from; out.length < count && i < from + count + 100000; i++) if (shown(i)) out.push(i); return out; }
+
   function clearSelectedRange() {
     { const b = getSelectionBounds(); if (waitWhileUpdating((b.maxRow - b.minRow + 1) * (b.maxCol - b.minCol + 1))) return; }
     const sheet = workbook.sheets[activeSheet];
@@ -2717,7 +2732,9 @@
     pushUndoState();
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     for (let r = minRow; r <= maxRow; r++) {
+      if (!rowShown(r)) continue;
       for (let c = minCol; c <= maxCol; c++) {
+        if (!colShown(c)) continue;
         applyCellValueRaw(activeSheet, `${indexToCol(c)}${r}`, '');
       }
     }
@@ -2736,7 +2753,9 @@
     if (withUndo) pushUndoState();
     const { minRow, maxRow, minCol, maxCol } = bounds;
     for (let r = minRow; r <= maxRow; r++) {
+      if (!rowShown(r)) continue;
       for (let c = minCol; c <= maxCol; c++) {
+        if (!colShown(c)) continue;
         const coord = `${indexToCol(c)}${r}`;
         if (!sheet.cells[coord]) sheet.cells[coord] = {};
         if (!sheet.cells[coord].s) sheet.cells[coord].s = baseStyle(sheet);
@@ -2878,7 +2897,9 @@
     pushUndoState();
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     for (let r = minRow; r <= maxRow; r++) {
+      if (!rowShown(r)) continue;
       for (let c = minCol; c <= maxCol; c++) {
+        if (!colShown(c)) continue;
         const coord = `${indexToCol(c)}${r}`;
         if (preset === 'none') {
           const cellObj = sheet.cells[coord];
@@ -2935,7 +2956,9 @@
     pushUndoState();
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     for (let r = minRow; r <= maxRow; r++) {
+      if (!rowShown(r)) continue;
       for (let c = minCol; c <= maxCol; c++) {
+        if (!colShown(c)) continue;
         const coord = `${indexToCol(c)}${r}`;
         const cellObj = sheet.cells[coord];
         if (cellObj && cellObj.s) {
@@ -2975,7 +2998,9 @@
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     const hasStyle = Object.keys(formatPainterSource || {}).length > 0;
     for (let r = minRow; r <= maxRow; r++) {
+      if (!rowShown(r)) continue;
       for (let c = minCol; c <= maxCol; c++) {
+        if (!colShown(c)) continue;
         const coord = `${indexToCol(c)}${r}`;
         if (!sheet.cells[coord]) sheet.cells[coord] = {};
         if (hasStyle) {
@@ -3032,11 +3057,15 @@
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     const grid = [];
     const tsvRows = [];
+    // only what is on screen (Excel copies the visible cells of a filtered range)
+    const rows = shownRows(minRow, maxRow);
+    const cols = shownCols(minCol, maxCol);
+    if (!rows.length || !cols.length) return;
 
-    for (let r = minRow; r <= maxRow; r++) {
+    for (const r of rows) {
       const rowCells = [];
       const rowText = [];
-      for (let c = minCol; c <= maxCol; c++) {
+      for (const c of cols) {
         const cellObj = sheet.cells[`${indexToCol(c)}${r}`];
         rowCells.push(cellObj ? JSON.parse(JSON.stringify(cellObj)) : null);
         rowText.push(cellDisplayText(cellObj));
@@ -3047,8 +3076,9 @@
 
     const merges = (sheet.merges || [])
       .map(m => m.split(':').map(parseCoord))
-      .filter(([a, b]) => a && b && a.row >= minRow && b.row <= maxRow && a.col >= minCol && b.col <= maxCol)
-      .map(([a, b]) => ({ r1: a.row - minRow, c1: a.col - minCol, r2: b.row - minRow, c2: b.col - minCol }));
+      .filter(([a, b]) => a && b && rows.includes(a.row) && rows.includes(b.row) && cols.includes(a.col) && cols.includes(b.col)
+        && rows.indexOf(b.row) - rows.indexOf(a.row) === b.row - a.row && cols.indexOf(b.col) - cols.indexOf(a.col) === b.col - a.col)
+      .map(([a, b]) => ({ r1: rows.indexOf(a.row), c1: cols.indexOf(a.col), r2: rows.indexOf(b.row), c2: cols.indexOf(b.col) }));
 
     const tsv = tsvRows.join('\r\n');
     clipboardState = {
@@ -3057,6 +3087,8 @@
       maxRow,
       minCol,
       maxCol,
+      rows,
+      cols,
       isCut,
       grid,
       merges,
@@ -3068,7 +3100,7 @@
     }
 
     highlightSelectedCellInDOM();
-    const count = (maxRow - minRow + 1) * (maxCol - minCol + 1);
+    const count = rows.length * cols.length;
     showToast(`${isCut ? 'Cut' : 'Copied'}: ${count} cell(s) (${indexToCol(minCol)}${minRow}:${indexToCol(maxCol)}${maxRow})`);
   }
 
@@ -3109,18 +3141,23 @@
     const bounds = getSelectionBounds();
     const srcRows = clip.grid.length;
     const srcCols = clip.grid[0].length;
-    const selRows = bounds.maxRow - bounds.minRow + 1;
-    const selCols = bounds.maxCol - bounds.minCol + 1;
-    const tile = selRows % srcRows === 0 && selCols % srcCols === 0;
-    const targetRows = tile ? selRows : srcRows;
-    const targetCols = tile ? selCols : srcCols;
-    const endR = bounds.minRow + targetRows - 1;
-    const endC = bounds.minCol + targetCols - 1;
+    const clipRows = clip.rows || Array.from({ length: srcRows }, (_, i) => clip.minRow + i);
+    const clipCols = clip.cols || Array.from({ length: srcCols }, (_, i) => clip.minCol + i);
+    // destination: only rows / columns on screen
+    const selR = shownRows(bounds.minRow, bounds.maxRow);
+    const selC = shownCols(bounds.minCol, bounds.maxCol);
+    const tile = selR.length && selC.length && selR.length % srcRows === 0 && selC.length % srcCols === 0;
+    const destRows = tile ? selR : takeShown(bounds.minRow, srcRows, rowShown);
+    const destCols = tile ? selC : takeShown(bounds.minCol, srcCols, colShown);
+    const targetRows = destRows.length;
+    const targetCols = destCols.length;
+    const endR = destRows[targetRows - 1];
+    const endC = destCols[targetCols - 1];
 
     // Cut: empty the source first (it may overlap the destination)
     if (clip.isCut && srcSheet) {
-      for (let r = clip.minRow; r <= clip.maxRow; r++) {
-        for (let c = clip.minCol; c <= clip.maxCol; c++) delete srcSheet.cells[`${indexToCol(c)}${r}`];
+      for (const r of clipRows) {
+        for (const c of clipCols) delete srcSheet.cells[`${indexToCol(c)}${r}`];
       }
       srcSheet.merges = (srcSheet.merges || []).filter(m => !mergeRangeOverlaps(m, clip.minRow, clip.maxRow, clip.minCol, clip.maxCol));
     }
@@ -3129,15 +3166,15 @@
 
     for (let dr = 0; dr < targetRows; dr++) {
       for (let dc = 0; dc < targetCols; dc++) {
-        const destR = bounds.minRow + dr;
-        const destC = bounds.minCol + dc;
+        const destR = destRows[dr];
+        const destC = destCols[dc];
         const destCoord = `${indexToCol(destC)}${destR}`;
         const src = clip.grid[dr % srcRows][dc % srcCols];
         if (!src) { delete sheet.cells[destCoord]; continue; }
         const copy = JSON.parse(JSON.stringify(src));
         if (copy.f && !clip.isCut) {
-          const srcR = clip.minRow + (dr % srcRows);
-          const srcC = clip.minCol + (dc % srcCols);
+          const srcR = clipRows[dr % srcRows];
+          const srcC = clipCols[dc % srcCols];
           copy.f = shiftFormula(copy.f, destR - srcR, destC - srcC);
           copy.v = '';
         }
@@ -3148,16 +3185,17 @@
     for (let tr = 0; tr < targetRows; tr += srcRows) {
       for (let tc = 0; tc < targetCols; tc += srcCols) {
         for (const m of clip.merges || []) {
-          const r1 = bounds.minRow + tr + m.r1, c1 = bounds.minCol + tc + m.c1;
-          sheet.merges.push(`${indexToCol(c1)}${r1}:${indexToCol(bounds.minCol + tc + m.c2)}${bounds.minRow + tr + m.r2}`);
+          const r1 = destRows[tr + m.r1], c1 = destCols[tc + m.c1], r2 = destRows[tr + m.r2], c2 = destCols[tc + m.c2];
+          if (r1 === undefined || r2 === undefined || c1 === undefined || c2 === undefined || r2 - r1 !== m.r2 - m.r1 || c2 - c1 !== m.c2 - m.c1) continue;
+          sheet.merges.push(`${indexToCol(c1)}${r1}:${indexToCol(c2)}${r2}`);
         }
       }
     }
 
     const cutCells = [];
     if (clip.isCut && srcSheet) {
-      for (let r = clip.minRow; r <= clip.maxRow; r++) {
-        for (let c = clip.minCol; c <= clip.maxCol; c++) cutCells.push([clip.sheetName, `${indexToCol(c)}${r}`]);
+      for (const r of clipRows) {
+        for (const c of clipCols) cutCells.push([clip.sheetName, `${indexToCol(c)}${r}`]);
       }
     }
     if (clip.isCut) clipboardState = null;
@@ -3185,20 +3223,25 @@
     const selRows = bounds.maxRow - bounds.minRow + 1;
     const selCols = bounds.maxCol - bounds.minCol + 1;
 
-    const targetRows = (srcRows === 1 && srcCols === 1 && (selRows > 1 || selCols > 1)) ? selRows : srcRows;
-    const targetCols = (srcRows === 1 && srcCols === 1 && (selRows > 1 || selCols > 1)) ? selCols : srcCols;
+    // one value over a selection fills its visible cells; a block goes into visible rows / columns
+    const fill = srcRows === 1 && srcCols === 1 && (selRows > 1 || selCols > 1);
+    const destRows = fill ? shownRows(bounds.minRow, bounds.maxRow) : takeShown(bounds.minRow, srcRows, rowShown);
+    const destCols = fill ? shownCols(bounds.minCol, bounds.maxCol) : takeShown(bounds.minCol, srcCols, colShown);
+    if (!destRows.length || !destCols.length) return;
+    const targetRows = destRows.length;
+    const targetCols = destCols.length;
 
     for (let dr = 0; dr < targetRows; dr++) {
       for (let dc = 0; dc < targetCols; dc++) {
-        const destR = bounds.minRow + dr;
-        const destC = bounds.minCol + dc;
+        const destR = destRows[dr];
+        const destC = destCols[dc];
         const destCoord = `${indexToCol(destC)}${destR}`;
         applyCellValueRaw(activeSheet, destCoord, matrix[dr % srcRows][dc % srcCols]);
       }
     }
 
-    const endR = bounds.minRow + targetRows - 1;
-    const endC = bounds.minCol + targetCols - 1;
+    const endR = destRows[targetRows - 1];
+    const endC = destCols[targetCols - 1];
     if (endR + 5 > sheet.maxRow) sheet.maxRow = endR + 20;
     if (endC + 2 > sheet.maxCol) sheet.maxCol = endC + 5;
 
@@ -3217,7 +3260,8 @@
     const sheet = workbook.sheets[activeSheet];
     pushUndoState();
     for (let c = minCol; c <= maxCol; c++) {
-      for (let r = minRow + 1; r <= maxRow; r++) copyCellWithFormat(sheet, minRow, c, r, c);
+      if (!colShown(c)) continue;
+      for (let r = minRow + 1; r <= maxRow; r++) if (rowShown(r)) copyCellWithFormat(sheet, minRow, c, r, c);
     }
     refreshValues(recalcRange(activeSheet, minRow + 1, maxRow, minCol, maxCol));
     updateStatusMetrics();
@@ -3232,7 +3276,8 @@
     const sheet = workbook.sheets[activeSheet];
     pushUndoState();
     for (let r = minRow; r <= maxRow; r++) {
-      for (let c = minCol + 1; c <= maxCol; c++) copyCellWithFormat(sheet, r, minCol, r, c);
+      if (!rowShown(r)) continue;
+      for (let c = minCol + 1; c <= maxCol; c++) if (colShown(c)) copyCellWithFormat(sheet, r, minCol, r, c);
     }
     refreshValues(recalcRange(activeSheet, minRow, maxRow, minCol + 1, maxCol));
     updateStatusMetrics();
@@ -3577,19 +3622,30 @@
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     const { minRow, maxRow } = getSelectionBounds();
-    const count = maxRow - minRow + 1;
+    // only the rows on screen: rows hidden by a filter / by hand inside the selection stay
+    const rows = shownRows(minRow, maxRow);
+    if (!rows.length) return;
+    const count = rows.length;
+    const runs = [];
+    for (const r of rows) {
+      const last = runs[runs.length - 1];
+      if (last && last[1] === r - 1) last[1] = r; else runs.push([r, r]);
+    }
 
     pushUndoState(sheetsReferencing(activeSheet));
-    applyRowOp({ sheet: activeSheet, d1: minRow, d2: maxRow });
-    const maxR = Math.max(sheet.maxRow || 100, getLastRealRow(activeSheet) + 5);
-    for (let r = minRow; r <= maxR; r++) {
-      for (let c = 1; c <= (sheet.maxCol || 20); c++) {
-        const colStr = indexToCol(c);
-        const srcCell = sheet.cells[`${colStr}${r + count}`];
-        if (srcCell) {
-          sheet.cells[`${colStr}${r}`] = JSON.parse(JSON.stringify(srcCell));
-        } else {
-          delete sheet.cells[`${colStr}${r}`];
+    for (const [d1, d2] of runs.reverse()) { // bottom first: the rows above keep their numbers
+      const n = d2 - d1 + 1;
+      applyRowOp({ sheet: activeSheet, d1, d2 });
+      const maxR = Math.max(sheet.maxRow || 100, getLastRealRow(activeSheet) + 5);
+      for (let r = d1; r <= maxR; r++) {
+        for (let c = 1; c <= (sheet.maxCol || 20); c++) {
+          const colStr = indexToCol(c);
+          const srcCell = sheet.cells[`${colStr}${r + n}`];
+          if (srcCell) {
+            sheet.cells[`${colStr}${r}`] = JSON.parse(JSON.stringify(srcCell));
+          } else {
+            delete sheet.cells[`${colStr}${r}`];
+          }
         }
       }
     }
@@ -3664,6 +3720,7 @@
     for (let r = minR; r <= maxR; r++) {
       for (let c = minC; c <= maxC; c++) {
         if (r >= bounds.minRow && r <= bounds.maxRow && c >= bounds.minCol && c <= bounds.maxCol) continue;
+        if (!rowShown(r) || !colShown(c)) continue;
         const sr = bounds.minRow + ((r - bounds.minRow) % srcRows + srcRows) % srcRows;
         const sc = bounds.minCol + ((c - bounds.minCol) % srcCols + srcCols) % srcCols;
         copyCellWithFormat(sheet, sr, sc, r, c);
