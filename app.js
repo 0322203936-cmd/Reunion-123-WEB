@@ -296,6 +296,13 @@
   function sharedView(sheet) {
     const view = { ...sheet };
     delete view.filterHiddenRows;
+    const pivotCells = window.MauriPivot && window.MauriPivot.sharedCellsFor ? window.MauriPivot.sharedCellsFor(sheet) : null;
+    if (pivotCells) {
+      view.cells = { ...(sheet.cells || {}) };
+      for (const [coord, cell] of Object.entries(pivotCells)) {
+        if (cell === null) delete view.cells[coord]; else view.cells[coord] = cell;
+      }
+    }
     if (sheet.filters) view.filters = sheet.filters.map(({ columns, ...rest }) => rest);
     return view;
   }
@@ -761,6 +768,8 @@
       for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) if (data.meta[k] !== undefined) workbook[k] = data.meta[k];
       if (data.meta.tables !== undefined) remoteFull = true;
     }
+    // a pivot this computer shows with "Corte Diario": drawn again over the weekly output that arrived
+    if (window.MauriPivot && window.MauriPivot.onRemoteCells && window.MauriPivot.onRemoteCells([...changed])) remoteRedraw = true;
     dropUndoFor(changed);
     scheduleRemoteRender();
   }
@@ -773,6 +782,7 @@
     applyPersonalFilters(key, name, sheet);
     if (sheet.filters && sheet.filters.length) recomputeFilterHidden(sheet);
     learnSent(sheet, name);
+    if (window.MauriPivot && window.MauriPivot.onRemoteCells) window.MauriPivot.onRemoteCells([name]);
     remoteFull = true;
     scheduleRemoteRender();
   }

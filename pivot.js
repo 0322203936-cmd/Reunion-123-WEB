@@ -143,7 +143,37 @@
     return weeknum16(Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(1899, 11, 30)) / 86400000));
   }
 
-  function passesFilters(p, rec) {
+  // ---- "Corte Diario" / "Corte Semanal": buttons above each pivot. Personal (this computer only, like
+  //   the filters). Corte Diario: in the current week, the requirement (and anything else that has a
+  //   date, except the inventories) only counts from today until the end of the week (Friday).
+  //   The book keeps the weekly output (what is saved and what the other computers see); the daily one
+  //   is drawn only on this page (localView) and the saves send the weekly cells (sharedCellsFor).
+  const CORTE_KEY = 'reunion123_pivot_corte';
+  const corteId = p => `${App().getWorkbookKey ? App().getWorkbookKey() : ''}:${p.id}`;
+  function cortes() { try { return JSON.parse(localStorage.getItem(CORTE_KEY) || '{}') || {}; } catch (e) { return {}; } }
+  function corteOf(p) { return cortes()[corteId(p)] === 'diario' ? 'diario' : 'semanal'; }
+  function setCorte(p, mode) {
+    const all = cortes();
+    if (mode === 'diario') all[corteId(p)] = 'diario'; else delete all[corteId(p)];
+    try { localStorage.setItem(CORTE_KEY, JSON.stringify(all)); } catch (e) { /* kept for this visit only */ }
+  }
+  function todaySerial() {
+    const n = new Date();
+    return Math.round((Date.UTC(n.getFullYear(), n.getMonth(), n.getDate()) - Date.UTC(1899, 11, 30)) / 86400000);
+  }
+  function cutByDay(rec) {
+    const status = String(rec.STATUS ?? '').trim().toLowerCase();
+    const dist = String(rec.Distribuidor ?? '').trim().toLowerCase();
+    if (status.startsWith('inventario') || dist.startsWith('inventario')) return false; // stay as they are
+    const d = rec['Fecha Produccion'];
+    if (typeof d !== 'number' || !Number.isFinite(d)) return false; // no date: nothing to cut
+    const today = todaySerial();
+    const day = Math.floor(d);
+    return day < today && today - day < 7 && weeknum16(day) === weeknum16(today);
+  }
+
+  function passesFilters(p, rec, cut) {
+    if (cut && cutByDay(rec)) return false;
     // keep only some items of a field: { field: { values: [...] } } or { field: { prefix: 'GALLERIA' } }
     for (const [field, rule] of Object.entries(p.include || {})) {
       if (!(field in rec)) continue;
@@ -240,9 +270,9 @@
 
   // ---------------------------------------------------------------- layout
   // compact: all row fields in one indented column; outline/tabular: one column per row field
-  function computeGrid(p) {
+  function computeGrid(p, cut) {
     const { fields, records } = readSource(p);
-    const data = records.filter(r => passesFilters(p, r));
+    const data = records.filter(r => passesFilters(p, r, cut));
     const rowFields = (p.rows || []).filter(f => f !== VALUES && fields.includes(f));
     const colFields = (p.cols || []).filter(f => f !== VALUES && fields.includes(f));
     const values = (p.values || []).filter(v => fields.includes(v.field));
@@ -406,11 +436,70 @@
     return { grid, tableTop, fields };
   }
 
-  // write a pivot into its sheet; returns the area written
+  // what this page draws instead of the shared output: { [pivot id]: { sheetObj, stash, area, location, anchor, toggles } }
+  const localView = {};
+  const viewOf = p => {
+    const lv = localView[p.id];
+    if (!lv || wb().sheets[p.sheet] !== lv.sheetObj) return p;
+    return { ...p, area: lv.area, location: lv.location, anchor: lv.anchor, toggles: lv.toggles };
+  };
+  // cells as the book has them (weekly output) where this page shows its daily output: { coord: cell | null }
+  function sharedCellsFor(sheet) {
+    let out = null;
+    for (const lv of Object.values(localView)) {
+      if (lv.sheetObj !== sheet) continue;
+      out = Object.assign(out || {}, lv.stash);
+    }
+    return out;
+  }
   function renderPivot(p) {
     const sheet = wb().sheets[p.sheet];
     if (!sheet) return;
-    const { grid, tableTop } = computeGrid(p);
+    writePivot(p, false);
+    if (corteOf(p) !== 'diario') { delete localView[p.id]; return; }
+    const shared = { area: p.area, location: p.location, anchor: p.anchor, toggles: p.toggles, pivotAreas: sheet.pivotAreas };
+    const sharedArea = parseRange(p.area);
+    const before = {};
+    if (sharedArea) {
+      for (let r = sharedArea.r1; r <= sharedArea.r2; r++) {
+        for (let c = sharedArea.c1; c <= sharedArea.c2; c++) {
+          const coord = `${indexToCol(c)}${r}`;
+          if (sheet.cells[coord] !== undefined) before[coord] = sheet.cells[coord];
+        }
+      }
+    }
+    writePivot(p, true);
+    const mine = parseRange(p.area);
+    const stash = {};
+    for (const a of [sharedArea, mine]) {
+      if (!a) continue;
+      for (let r = a.r1; r <= a.r2; r++) {
+        for (let c = a.c1; c <= a.c2; c++) {
+          const coord = `${indexToCol(c)}${r}`;
+          stash[coord] = before[coord] !== undefined ? before[coord] : null;
+        }
+      }
+    }
+    localView[p.id] = { sheetObj: sheet, stash, area: p.area, location: p.location, anchor: p.anchor, toggles: p.toggles };
+    // the pivot as the book describes it stays the weekly one (it is saved with the book)
+    Object.assign(p, { area: shared.area, location: shared.location, anchor: shared.anchor, toggles: shared.toggles });
+    sheet.pivotAreas = shared.pivotAreas;
+  }
+  // another computer's weekly output arrived over this page's daily one: drawn again
+  function onRemoteCells(names) {
+    let n = 0;
+    for (const p of pivots()) {
+      if (!localView[p.id] || !names.includes(p.sheet) || !wb().sheets[p.sheet]) continue;
+      try { renderPivot(p); n++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
+    }
+    return n;
+  }
+
+  // write a pivot into its sheet (cut: Corte Diario); returns the area written
+  function writePivot(p, cut) {
+    const sheet = wb().sheets[p.sheet];
+    if (!sheet) return;
+    const { grid, tableTop } = computeGrid(p, cut);
     const anchor = p.anchor ? parseCoord(p.anchor) : null;
     const loc = parseRange(p.location);
     const top = anchor ? anchor.row : loc.r1 - ((p.filters || []).length ? (p.filters.length + 1) : 0);
@@ -463,6 +552,7 @@
   }
 
   function areaOf(p) {
+    p = viewOf(p);
     if (p.area) return parseRange(p.area);
     const loc = parseRange(p.location);
     if (!loc) return null;
@@ -978,8 +1068,16 @@
     const list = (wb() && wb().pivots) || [];
     if (!list.length) return '';
     const coord = `${indexToCol(c)}${r}`;
-    for (const p of list) {
-      if (p.sheet !== sheetName) continue;
+    for (const p0 of list) {
+      if (p0.sheet !== sheetName) continue;
+      const p = viewOf(p0);
+      if (coord === corteCoord(p)) {
+        const mode = corteOf(p);
+        return `<span class="pv-corte">`
+          + `<button type="button" class="pv-corte-btn${mode === 'diario' ? ' active' : ''}" data-pv="${escapeHtml(p.id)}" data-mode="diario" title="Semana actual: solo de hoy al viernes">Corte Diario</button>`
+          + `<button type="button" class="pv-corte-btn${mode === 'semanal' ? ' active' : ''}" data-pv="${escapeHtml(p.id)}" data-mode="semanal" title="Semana actual completa (sábado a viernes)">Corte Semanal</button>`
+          + `</span>`;
+      }
       if (p.toggles) {
         const t = p.toggles[coord];
       if (t && t.kind === 'filter') {
@@ -1002,6 +1100,17 @@
     }
     return '';
   }
+  // where the Corte buttons go: the empty row between the page filters and the table (else above it)
+  function corteCoord(p) {
+    const anchor = p.anchor ? parseCoord(p.anchor) : null;
+    const loc = p.location ? parseRange(p.location) : null;
+    if (!anchor && !loc) return null;
+    const nf = (p.filters || []).length;
+    const top = anchor ? anchor.row : loc.r1 - (nf ? nf + 1 : 0);
+    const left = anchor ? anchor.col : loc.c1;
+    const row = nf ? top + nf : top - 1;
+    return row >= 1 ? `${indexToCol(left)}${row}` : null;
+  }
   function toggleItem(p, t) {
     const listKey = (p.collapseAll && p.collapseAll[t.field]) ? 'expanded' : 'collapsed';
     const store = p[listKey] = p[listKey] || {};
@@ -1010,19 +1119,35 @@
     if (i >= 0) list.splice(i, 1); else list.push(t.value);
   }
   document.addEventListener('mousedown', e => {
+    const cbtn = e.target.closest && e.target.closest('.pv-corte-btn');
+    if (cbtn) {
+      e.preventDefault();
+      e.stopImmediatePropagation();
+      const p = pivots().find(x => x.id === cbtn.dataset.pv);
+      if (!p || corteOf(p) === cbtn.dataset.mode) return;
+      setCorte(p, cbtn.dataset.mode);
+      const vp = document.getElementById('spreadsheetViewport');
+      const { scrollTop, scrollLeft } = vp;
+      try { renderPivot(p); } catch (err) { App().toast(err.message, true); }
+      App().recalcAndRender(); // only this page: nothing is saved
+      vp.scrollTop = scrollTop;
+      vp.scrollLeft = scrollLeft;
+      return;
+    }
     const fbtn = e.target.closest && e.target.closest('.pv-filter-cell, .pv-page-filter');
     if (fbtn) {
       e.preventDefault();
       e.stopImmediatePropagation(); // no other handler may open a second menu
-      const p = pivots().find(x => x.id === fbtn.dataset.pv);
-      if (!p) return;
+      const p0 = pivots().find(x => x.id === fbtn.dataset.pv);
+      if (!p0) return;
+      const p = viewOf(p0);
       const t = p.toggles && p.toggles[fbtn.dataset.coord];
-      if (t && t.kind === 'filter') { openFieldMenu(fbtn, p, t.axis, t.axis === 'filters' ? t.field : null); return; }
+      if (t && t.kind === 'filter') { openFieldMenu(fbtn, p0, t.axis, t.axis === 'filters' ? t.field : null); return; }
       // page filter button: the field is the one written in the cell to its left
       const pc = parseCoord(fbtn.dataset.coord);
       const label = pc && ((wb().sheets[p.sheet].cells[`${indexToCol(pc.col - 1)}${pc.row}`] || {}).v);
-      const f = p.filters.find(x => x.field === label) || p.filters[0];
-      if (f) openFieldMenu(fbtn, p, 'filters', f.field);
+      const f = p0.filters.find(x => x.field === label) || p0.filters[0];
+      if (f) openFieldMenu(fbtn, p0, 'filters', f.field);
       return;
     }
     // Make the complete pivot header cell clickable as well as its small
@@ -1032,7 +1157,7 @@
     if (cell) {
       const sheetName = App().getActiveSheet();
       const p = pivots().find(x => x.sheet === sheetName);
-      const t = p && p.toggles && p.toggles[cell.dataset.coord];
+      const t = p && viewOf(p).toggles && viewOf(p).toggles[cell.dataset.coord];
       if (t && t.kind === 'filter') {
         e.preventDefault();
         e.stopImmediatePropagation();
@@ -1045,7 +1170,7 @@
     e.preventDefault();
     e.stopPropagation();
     const p = pivots().find(x => x.id === btn.dataset.pv);
-    const t = p && p.toggles && p.toggles[btn.dataset.coord];
+    const t = p && viewOf(p).toggles && viewOf(p).toggles[btn.dataset.coord];
     if (!t) return;
     toggleItem(p, t);
     const vp = document.getElementById('spreadsheetViewport');
@@ -1067,8 +1192,8 @@
     const coord = cell.dataset.coord;
     for (const p of pivots()) {
       if (p.sheet !== sheetName || !p.filters?.length) continue;
-      const anchor = p.anchor ? parseCoord(p.anchor) : null;
-      const loc = p.location ? parseRange(p.location) : null;
+      const anchor = viewOf(p).anchor ? parseCoord(viewOf(p).anchor) : null;
+      const loc = viewOf(p).location ? parseRange(viewOf(p).location) : null;
       if (!anchor && !loc) continue;
       const top = anchor ? anchor.row : loc.r1 - p.filters.length - 1;
       const left = anchor ? anchor.col : loc.c1;
@@ -1199,5 +1324,5 @@
     return n;
   }
 
-  window.MauriPivot = { onSelectionChange, onSheetRenamed, onSheetDeleted, renderPivot, computeGrid, pivotAt, openCreateDialog, cellExtra, refreshAll };
+  window.MauriPivot = { onSelectionChange, onSheetRenamed, onSheetDeleted, renderPivot, computeGrid, pivotAt, openCreateDialog, cellExtra, refreshAll, sharedCellsFor, onRemoteCells };
 })();
