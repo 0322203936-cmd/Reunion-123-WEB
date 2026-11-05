@@ -157,6 +157,45 @@
     if (mode === 'diario') all[corteId(p)] = 'diario'; else delete all[corteId(p)];
     try { localStorage.setItem(CORTE_KEY, JSON.stringify(all)); } catch (e) { /* kept for this visit only */ }
   }
+  // ---- personal view of each pivot (this computer only, like the sheet filters): page filters, items
+  //   unchecked in the filter menus and +/-. The book keeps the shared definition (what the other
+  //   computers see); this page draws its own view over it (localView), nothing of it is saved.
+  const PERSONAL_KEY = 'reunion123_pivot_personal';
+  const PERSONAL_PROPS = ['filters', 'hidden', 'collapsed', 'expanded'];
+  function personals() { try { return JSON.parse(localStorage.getItem(PERSONAL_KEY) || '{}') || {}; } catch (e) { return {}; } }
+  function personalOf(p) { return personals()[corteId(p)] || null; }
+  function savePersonal(p, view) {
+    const all = personals();
+    all[corteId(p)] = view;
+    try { localStorage.setItem(PERSONAL_KEY, JSON.stringify(all)); } catch (e) { /* kept for this visit only */ }
+  }
+  // the pivot as this computer sees it (layout from the book, filters / +/- of this computer)
+  function mineOf(p) {
+    const own = personalOf(p);
+    if (!own) return p;
+    const out = { ...p };
+    for (const k of ['hidden', 'collapsed', 'expanded']) if (own[k] !== undefined) out[k] = own[k];
+    // page filters: the fields are the book's (shared layout), the choice is this computer's
+    if (own.filters) out.filters = (p.filters || []).map(f => { const m = own.filters.find(x => x.field === f.field); return m ? { ...f, selected: m.selected } : f; });
+    return out;
+  }
+  // change this computer's view: fn gets a working copy of its filters / hidden items / +/-
+  function changePersonal(p, fn) {
+    const view = mineOf(p);
+    const w = JSON.parse(JSON.stringify(Object.fromEntries(PERSONAL_PROPS.map(k => [k, view[k] === undefined ? null : view[k]]))));
+    if (!w.filters) w.filters = [];
+    fn(w);
+    savePersonal(p, w);
+  }
+  function redrawMine(p) {
+    const vp = document.getElementById('spreadsheetViewport');
+    const { scrollTop, scrollLeft } = vp;
+    try { renderPivot(p); } catch (err) { App().toast(err.message, true); }
+    App().recalcAndRender(); // only this page: nothing is saved
+    vp.scrollTop = scrollTop;
+    vp.scrollLeft = scrollLeft;
+  }
+
   function todaySerial() {
     const n = new Date();
     return Math.round((Date.UTC(n.getFullYear(), n.getMonth(), n.getDate()) - Date.UTC(1899, 11, 30)) / 86400000);
@@ -452,7 +491,7 @@
   const viewOf = p => {
     const lv = localView[p.id];
     if (!lv || wb().sheets[p.sheet] !== lv.sheetObj) return p;
-    return { ...p, area: lv.area, location: lv.location, anchor: lv.anchor, toggles: lv.toggles };
+    return { ...mineOf(p), area: lv.area, location: lv.location, anchor: lv.anchor, toggles: lv.toggles };
   };
   // cells as the book has them (weekly output) where this page shows its daily output: { coord: cell | null }
   function sharedCellsFor(sheet) {
@@ -467,7 +506,8 @@
     const sheet = wb().sheets[p.sheet];
     if (!sheet) return;
     writePivot(p, false);
-    if (corteOf(p) !== 'diario') { delete localView[p.id]; return; }
+    const cut = corteOf(p) === 'diario';
+    if (!cut && !personalOf(p)) { delete localView[p.id]; return; }
     const shared = { area: p.area, location: p.location, anchor: p.anchor, toggles: p.toggles, pivotAreas: sheet.pivotAreas };
     const sharedArea = parseRange(p.area);
     const before = {};
@@ -479,8 +519,9 @@
         }
       }
     }
-    writePivot(p, true);
-    const mine = parseRange(p.area);
+    const eff = { ...mineOf(p) }; // this computer's filters / +/- (a copy: the book's pivot is not changed)
+    writePivot(eff, cut);
+    const mine = parseRange(eff.area);
     const stash = {};
     for (const a of [sharedArea, mine]) {
       if (!a) continue;
@@ -491,8 +532,8 @@
         }
       }
     }
-    localView[p.id] = { sheetObj: sheet, stash, area: p.area, location: p.location, anchor: p.anchor, toggles: p.toggles };
-    // the pivot as the book describes it stays the weekly one (it is saved with the book)
+    localView[p.id] = { sheetObj: sheet, stash, area: eff.area, location: eff.location, anchor: eff.anchor, toggles: eff.toggles };
+    // the pivot as the book describes it stays the shared one (it is saved with the book)
     Object.assign(p, { area: shared.area, location: shared.location, anchor: shared.anchor, toggles: shared.toggles });
     sheet.pivotAreas = shared.pivotAreas;
   }
@@ -774,7 +815,8 @@
         <div class="pv-zone-body">${items || '<div class="pv-zone-empty">Arrastrá campos aquí</div>'}</div>
       </div>`;
     const aggSelect = v => `<select class="pv-agg" data-field="${escapeHtml(v.field)}" title="Resumir valores por">${Object.entries(AGG_LABEL).map(([k, l]) => `<option value="${k}"${k === v.agg ? ' selected' : ''}>${l}</option>`).join('')}</select>`;
-    const filterBtn = (zone, f) => `<button type="button" class="pv-filter-btn${((p.hidden || {})[f] || []).length || (zone === 'filters' && (p.filters.find(x => x.field === f) || {}).selected) ? ' active' : ''}" data-filter="${escapeHtml(f)}" title="Filtrar">⏷</button>`;
+    const mv = mineOf(p); // this computer's filters
+    const filterBtn = (zone, f) => `<button type="button" class="pv-filter-btn${((mv.hidden || {})[f] || []).length || (zone === 'filters' && (mv.filters.find(x => x.field === f) || {}).selected) ? ' active' : ''}" data-filter="${escapeHtml(f)}" title="Filtrar">⏷</button>`;
 
     panel.innerHTML = `
       <button type="button" class="pv-strip" data-expand title="Mostrar campos de la tabla dinámica"><span>‹ Campos</span></button>
@@ -995,8 +1037,9 @@
     const map = new Map();
     for (const r of records) { const k = itemKey(r[field]); if (!map.has(k)) map.set(k, r[field]); }
     const items = [...map.values()].sort(compareItems);
-    const hidden = new Set(((p.hidden || {})[field] || []).map(itemKey));
-    const filterDef = zone === 'filters' ? p.filters.find(f => f.field === field) : null;
+    const view = mineOf(p); // this computer's filters
+    const hidden = new Set(((view.hidden || {})[field] || []).map(itemKey));
+    const filterDef = zone === 'filters' ? view.filters.find(f => f.field === field) : null;
     const selected = filterDef && filterDef.selected ? new Set(filterDef.selected.map(itemKey)) : null;
     const isOn = v => !hidden.has(itemKey(v)) && (!selected || selected.has(itemKey(v)));
     itemMenu = document.createElement('div');
@@ -1031,15 +1074,18 @@
       const on = boxes().filter(b => b.checked).map(b => items[Number(b.dataset.i)]);
       const off = boxes().filter(b => !b.checked).map(b => items[Number(b.dataset.i)]);
       closeItemFilter();
-      change(pv => {
+      changePersonal(p, pv => {
         pv.hidden = pv.hidden || {};
         if (zone === 'filters') {
-          const f = pv.filters.find(x => x.field === field);
+          let f = pv.filters.find(x => x.field === field);
+          if (!f) pv.filters.push(f = { field, selected: null });
           delete pv.hidden[field];
-          if (f) f.selected = off.length ? on : null;
+          f.selected = off.length ? on : null;
         } else if (off.length) pv.hidden[field] = off;
         else delete pv.hidden[field];
       });
+      redrawMine(p);
+      openPanel(p);
     });
   }
 
@@ -1191,15 +1237,12 @@
     const p = pivots().find(x => x.id === btn.dataset.pv);
     const t = p && viewOf(p).toggles && viewOf(p).toggles[btn.dataset.coord];
     if (!t) return;
-    toggleItem(p, t);
-    const vp = document.getElementById('spreadsheetViewport');
-    const { scrollTop, scrollLeft } = vp;
-    renderPivot(p);
-    App().markDirty(p.sheet);
-    App().save();
-    App().recalcAndRender();
-    vp.scrollTop = scrollTop;
-    vp.scrollLeft = scrollLeft;
+    changePersonal(p, w => {
+      w.collapseAll = p.collapseAll;
+      toggleItem(w, t);
+      delete w.collapseAll;
+    });
+    redrawMine(p);
   }, true);
 
   // Excel-style page filters: clicking the filter value itself (for example,
@@ -1238,8 +1281,9 @@
       const map = new Map();
       for (const r of records) { const k = itemKey(r[field]); if (!map.has(k)) map.set(k, r[field]); }
       const items = [...map.values()].sort(compareItems);
-      const hidden = new Set(((p.hidden || {})[field] || []).map(itemKey));
-      const filterDef = axis === 'filters' ? p.filters.find(f => f.field === field) : null;
+      const view = mineOf(p); // this computer's filters
+      const hidden = new Set(((view.hidden || {})[field] || []).map(itemKey));
+      const filterDef = axis === 'filters' ? view.filters.find(f => f.field === field) : null;
       const selected = filterDef && filterDef.selected ? new Set(filterDef.selected.map(itemKey)) : null;
       // "keep only" rules (p.include) count too, so the checklist shows what is really visible
       const inc = (p.include || {})[field];
@@ -1283,14 +1327,20 @@
         commit(p);
         if (panel && panelPivotId === p.id) openPanel(p);
       };
+      // filters: only this computer
+      const applyMine = fn => {
+        closeItemFilter();
+        changePersonal(p, fn);
+        redrawMine(p);
+        if (panel && panelPivotId === p.id) openPanel(p);
+      };
       itemMenu.querySelectorAll('[data-sort]').forEach(b => b.addEventListener('click', () => apply(() => {
         p.sort = p.sort || {};
         p.sort[field] = b.dataset.sort;
       })));
-      itemMenu.querySelector('[data-clear]').addEventListener('click', () => apply(() => {
-        if (p.hidden) delete p.hidden[field];
-        if (p.include) delete p.include[field];
-        const f = p.filters.find(x => x.field === field);
+      itemMenu.querySelector('[data-clear]').addEventListener('click', () => applyMine(w => {
+        if (w.hidden) delete w.hidden[field];
+        const f = w.filters.find(x => x.field === field);
         if (f) f.selected = null;
       }));
       itemMenu.querySelector('[data-cancel]').addEventListener('click', closeItemFilter);
@@ -1305,15 +1355,15 @@
           ? boxes().filter(b => !selectedKeys.has(itemKey(items[Number(b.dataset.i)]))).map(b => items[Number(b.dataset.i)])
           : boxes().filter(b => !b.checked).map(b => items[Number(b.dataset.i)]);
         if (!on.length) { App().toast('Elige al menos un elemento', true); return; }
-        apply(() => {
-          p.hidden = p.hidden || {};
-          if (p.include) delete p.include[field]; // from now on the checklist decides
+        applyMine(w => {
+          w.hidden = w.hidden || {};
           if (axis === 'filters') {
-            const f = p.filters.find(x => x.field === field);
-            delete p.hidden[field];
-            if (f) f.selected = off.length ? on : null;
-          } else if (off.length) p.hidden[field] = off;
-          else delete p.hidden[field];
+            let f = w.filters.find(x => x.field === field);
+            if (!f) w.filters.push(f = { field, selected: null });
+            delete w.hidden[field];
+            f.selected = off.length ? on : null;
+          } else if (off.length) w.hidden[field] = off;
+          else delete w.hidden[field];
         });
       });
     };
@@ -1351,7 +1401,15 @@
       if (!p.liveSource || !wb().sheets[p.sheet] || !wb().sheets[p.source.sheet]) continue;
       try { renderPivot(p); App().markDirty(p.sheet); n++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
     }
+    // this computer's own view (its filters / +/- / Corte Diario) over the shared output; nothing is saved
+    let own = 0;
+    for (const p of pivots()) {
+      if (p.liveSource || !wb().sheets[p.sheet] || !wb().sheets[(p.source || {}).sheet]) continue;
+      if (!personalOf(p) && corteOf(p) !== 'diario') continue;
+      try { renderPivot(p); own++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
+    }
     if (n) { App().recalcAndRender(); App().save(); }
+    else if (own) App().recalcAndRender();
   }
   (function refreshLiveOnLoad() {
     const app = App();
