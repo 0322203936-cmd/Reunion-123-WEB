@@ -311,14 +311,25 @@
     }
     const etag = shown && cached.headers.get('ETag');
     const res = await fetch(bookUrl(WB_KEY), { cache: 'no-store', headers: etag ? { 'If-None-Match': etag } : {} });
-    if (res.status === 304 && shown) { setStale(false); editsWhileStale.clear(); preloadOtherBooks(); return; }
+    if (res.status === 304 && shown) {
+      setStale(false);
+      editsWhileStale.clear();
+      const statusInfo = document.getElementById('statusFormulaInfo');
+      if (statusInfo) statusInfo.textContent = 'Cargando Reunion, Plan de cosecha y RVP…';
+      await preloadOtherBooks();
+      if (statusInfo) statusInfo.textContent = `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
+      return;
+    }
     if (!res.ok) throw new Error(`HTTP ${res.status}`);
     storeBook(WB_KEY, res.clone());
     const fresh = await res.json();
     if (shown) await replaceWithFresh(fresh);
     else activateWorkbook(fresh, WB_KEY);
     setStale(false);
-    preloadOtherBooks();
+    const statusInfo = document.getElementById('statusFormulaInfo');
+    if (statusInfo) statusInfo.textContent = 'Cargando Reunion, Plan de cosecha y RVP…';
+    await preloadOtherBooks();
+    if (statusInfo) statusInfo.textContent = `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
   }
 
   // ---- live sync: what other computers change in this book shows up here within a second or two
@@ -535,8 +546,10 @@
   // them does not have to wait for a full download. They are followed live from then on; one last
   // cheap check makes sure nothing was missed meanwhile.
   let preloadStarted = false;
+  let preloadPromise = null;
   function preloadOtherBooks() {
-    if (preloadStarted) return;
+    if (preloadPromise) return preloadPromise;
+    if (preloadStarted) return Promise.resolve();
     preloadStarted = true;
     const start = async () => {
       const keys = VALID_WB_KEYS.filter(key => key !== WB_KEY && !workbookCache.has(key));
@@ -563,8 +576,12 @@
     };
     // Let the current book paint first, then start the other downloads immediately. The old 3-second
     // delay made a quick switch wait for the entire next workbook over the public connection.
-    if (typeof queueMicrotask === 'function') queueMicrotask(start);
-    else setTimeout(start, 0);
+    preloadPromise = new Promise(resolve => {
+      const run = () => start().finally(resolve);
+      if (typeof queueMicrotask === 'function') queueMicrotask(run);
+      else setTimeout(run, 0);
+    });
+    return preloadPromise;
   }
 
   async function reloadFromServer() {
