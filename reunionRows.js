@@ -227,4 +227,50 @@ function addFlower(reunionBook, flower) {
   return { row: at, touched };
 }
 
-module.exports = { missingFlowers, addFlower, planFlowers, reunionLayout, insertRows, adjustRowRefs, shiftFormula };
+// ---------------------------------------------------------------- titles
+// flowers of Reunion named "<name> ..." with no title "<name>" above them: { children: [rows], model: title row }
+function missingTitle(reunionBook, name) {
+  const sheet = reunionBook && reunionBook.sheets && reunionBook.sheets[SHEET];
+  if (!sheet) return null;
+  const layout = reunionLayout(sheet);
+  const key = norm(name);
+  if (layout.names.has(key)) return null;
+  const children = [];
+  for (let r = 3; r <= layout.last; r++) if (norm((sheet.cells[`A${r}`] || {}).v).startsWith(`${key} `)) children.push(r);
+  if (!children.length || children[children.length - 1] - children[0] !== children.length - 1) return null; // not one block
+  // model: a title that adds plain flowers and looks its requirement up by FLOR (like LIRIO)
+  const usesFlor = r => /PegarData!\$?E/i.test(((sheet.cells[`H${r}`] || {}).f) || '');
+  const model = (layout.titles.get('LIRIO') && layout.titles.get('LIRIO').row)
+    || [...layout.titles.values()].map(t => t.row).find(usesFlor);
+  if (!model) return null;
+  return { name: key, children, model };
+}
+// insert the title row above its flowers: the title's formulas (plain sums -> its flowers, the rest as the model)
+function addTitle(reunionBook, info) {
+  const sheet = reunionBook.sheets[SHEET];
+  const at = Math.min(...info.children);
+  const touched = insertRows(reunionBook, at, 1);
+  const kids = info.children.map(r => r + 1);
+  const modelRow = info.model >= at ? info.model + 1 : info.model;
+  for (const [coord, cell] of Object.entries({ ...sheet.cells })) {
+    const m = /^([A-Z]+)(\d+)$/.exec(coord);
+    if (!m || Number(m[2]) !== modelRow) continue;
+    const copy = {};
+    if (cell.s) copy.s = JSON.parse(JSON.stringify(cell.s));
+    if (cell.f) copy.f = isPlainSum(cell.f, m[1]) ? `=+${kids.map(r => `${m[1]}${r}`).join('+')}` : shiftFormula(cell.f, at - modelRow);
+    if (m[1] === 'A') copy.v = info.name;
+    if (Object.keys(copy).length) sheet.cells[`${m[1]}${at}`] = copy;
+  }
+  if (!sheet.cells[`A${at}`]) sheet.cells[`A${at}`] = { v: info.name };
+  for (const cf of sheet.condFormats || []) {
+    const add = [];
+    for (const ref of cf.ranges || []) {
+      const m = /^([A-Z]+)(\d+)(?::([A-Z]+)(\d+))?$/.exec(ref);
+      if (m && Number(m[2]) === modelRow && (!m[4] || Number(m[4]) === modelRow)) add.push(m[3] ? `${m[1]}${at}:${m[3]}${at}` : `${m[1]}${at}`);
+    }
+    if (add.length) cf.ranges = [...cf.ranges, ...add];
+  }
+  return { row: at, touched };
+}
+
+module.exports = { missingTitle, addTitle, missingFlowers, addFlower, planFlowers, reunionLayout, insertRows, adjustRowRefs, shiftFormula };

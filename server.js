@@ -398,9 +398,12 @@ function scheduleCorSync(delay = 150) {
 // Reunion for a minute (rows move down: an edit sent meanwhile could land on the wrong row)
 let lastReunionEdit = Date.now(); // after a restart it also waits a minute
 let flowersRetry = null;
+// titles to put above their flowers when Reunion doesn't have them (requested: CRISANTEMO)
+const TITLES_TO_ADD = ['CRISANTEMO'];
 async function addNewFlowers(reunion, cosecha) {
+  const titles = TITLES_TO_ADD.map(n => ReunionRows.missingTitle(reunion, n)).filter(Boolean);
   const missing = ReunionRows.missingFlowers(reunion, cosecha);
-  if (!missing.length) return;
+  if (!missing.length && !titles.length) return;
   if (Date.now() - lastReunionEdit < 60 * 1000) {
     if (!flowersRetry) flowersRetry = setTimeout(() => { flowersRetry = null; scheduleCorSync(); }, 30 * 1000);
     return;
@@ -412,7 +415,14 @@ async function addNewFlowers(reunion, cosecha) {
   fs.writeFileSync(path.join(dir, `Reunion_antes_de_flores_${stamp}.json`), JSON.stringify(reunion.sheets.Reunion));
   const touched = new Set();
   const added = [];
-  for (const flower of missing) {
+  for (const t of titles) {
+    const info = ReunionRows.missingTitle(reunion, t.name); // again: rows may have moved
+    const res = info && ReunionRows.addTitle(reunion, info);
+    if (!res) continue;
+    res.touched.forEach(n => touched.add(n));
+    added.push(`título ${info.name} (fila ${res.row})`);
+  }
+  for (const flower of ReunionRows.missingFlowers(reunion, cosecha)) {
     const res = ReunionRows.addFlower(reunion, flower);
     if (!res) continue;
     res.touched.forEach(n => touched.add(n));
@@ -423,7 +433,7 @@ async function addNewFlowers(reunion, cosecha) {
   for (const n of touched) sheets[n] = reunion.sheets[n];
   await patchWorkbook('reunion', { sheets });
   broadcastBook('reunion', 'live', { deltas: {}, sheets: [...touched], deleted: [] });
-  console.log(` Reunion: flores nuevas del plan agregadas: ${added.join(', ')}`);
+  console.log(` Reunion: agregado: ${added.join(', ')}`);
 }
 
 async function syncCor() {
