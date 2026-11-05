@@ -91,6 +91,54 @@ const gzCache = {}; // wbKey -> promise of the gzipped JSON of the cached workbo
 const sheetJson = {}; // wbKey -> Map(sheet name -> its JSON): only the sheets that changed are converted again
 const warmTimers = {};
 
+// ---- change log: every change of a book gets a number (rev). A page that has a copy at rev N asks
+//   only for what changed after N (/api/workbook-changes) instead of downloading the whole book.
+//   Kept in memory since the server started (BOOT_ID): after a restart, or for a copy older than the
+//   log, the page downloads the whole book as before.
+const BOOT_ID = crypto.randomBytes(4).toString('hex');
+const LOG_MAX_ENTRIES = 20000;
+const changeLog = {}; // wbKey -> { rev, minRev, entries: [{ rev, deltas, sheets, deleted }] }
+function logOf(key) { return changeLog[key] || (changeLog[key] = { rev: 0, minRev: 0, entries: [] }); }
+function bookRev(key) { return `${BOOT_ID}.${logOf(key).rev}`; }
+// entry: { deltas: { sheet: delta }, sheets: [whole sheets replaced], deleted: [names] } or { full: true }
+function logChange(key, entry) {
+  const log = logOf(key);
+  log.rev++;
+  if (entry.full) { log.entries = []; log.minRev = log.rev; return; } // older copies: whole book
+  log.entries.push({ rev: log.rev, deltas: entry.deltas || {}, sheets: entry.sheets || [], deleted: entry.deleted || [] });
+  if (log.entries.length > LOG_MAX_ENTRIES) {
+    const dropped = log.entries.splice(0, LOG_MAX_ENTRIES / 4);
+    log.minRev = dropped[dropped.length - 1].rev;
+  }
+}
+// what changed after rev `since`, merged: null when the page must download the whole book
+function changesSince(key, workbook, since) {
+  const [boot, n] = String(since || '').split('.');
+  const s = Number(n);
+  const log = logOf(key);
+  if (boot !== BOOT_ID || !Number.isInteger(s) || s < log.minRev || s > log.rev) return null;
+  const deltas = {};
+  const whole = new Set();
+  const deleted = new Set();
+  for (const e of log.entries) {
+    if (e.rev <= s) continue;
+    for (const name of e.deleted) { deleted.add(name); whole.delete(name); delete deltas[name]; }
+    for (const name of e.sheets) { whole.add(name); deleted.delete(name); delete deltas[name]; }
+    for (const [name, delta] of Object.entries(e.deltas)) {
+      if (whole.has(name)) continue; // the whole sheet goes anyway, as it is now
+      deltas[name] = SheetDelta.mergeDelta(deltas[name] || {}, JSON.parse(JSON.stringify(delta)));
+    }
+  }
+  const sheetData = {};
+  for (const name of whole) {
+    if (workbook.sheets[name]) sheetData[name] = workbook.sheets[name];
+    else deleted.add(name);
+  }
+  for (const name of Object.keys(deltas)) if (!workbook.sheets[name]) { delete deltas[name]; deleted.add(name); }
+  const { workbookName, sheetOrder, tables, pivots } = workbook;
+  return { rev: bookRev(key), deltas, sheetData, deleted: [...deleted], meta: { workbookName, sheetOrder, tables, pivots } };
+}
+
 // the book changed (`names`: only those sheets, or all when omitted): the compressed copy that pages
 // download is prepared again in the background, so a reload right after typing finds it ready
 function bookChanged(key, names) {
@@ -123,8 +171,9 @@ function compressedBook(key, workbook) {
   if (!gzCache[key]) {
     // fast level: it is redone after every change. The ETag (hash of the content) lets a page that
     // already has this exact copy skip the download (304)
+    const rev = persistenceReady ? bookRev(key) : ''; // the rev of exactly this content
     const job = gzipAsync(workbookJson(key, workbook), { level: 1 })
-      .then(body => ({ body, etag: `"${crypto.createHash('md5').update(body).digest('hex')}"` }));
+      .then(body => ({ body, rev, etag: `"${crypto.createHash('md5').update(body).digest('hex')}"` }));
     gzCache[key] = job;
     job.catch(() => { if (gzCache[key] === job) delete gzCache[key]; });
   }
@@ -168,6 +217,7 @@ function publicActualizarInventarioViernesState() {
 }
 
 function resetWorkbookCache(key) {
+  logChange(key, { full: true });
   delete caches[key];
   bookChanged(key);
   delete stored[key];
@@ -327,8 +377,12 @@ async function syncAppend(reunion, cosecha) {
   const meta = order.includes('Append') ? {} : { sheetOrder: [...order, 'Append'] };
   const prev = rvp.sheets.Append;
   if (prev && prev.colWidths) sheet.colWidths = { ...sheet.colWidths, ...prev.colWidths }; // keep widths set by hand
-  appendSig = sig;
-  await patchWorkbook('rvp', { meta, sheets: { Append: sheet } });
+  // only the cells of Append that really changed (pages then download only those, not ~3 MB)
+  const diff = prev && !meta.sheetOrder ? SheetDelta.diffSheet(SheetDelta.snapshotOf(prev), sheet) : undefined;
+  if (diff === null) { appendSig = sig; return; } // same content
+  if (diff && diff.size < 20000) await patchWorkbook('rvp', { deltas: { Append: diff.delta } });
+  else await patchWorkbook('rvp', { meta, sheets: { Append: sheet } });
+  appendSig = sig; // after the patch: patchWorkbook clears it (it treats Append edits as made by hand)
   const msg = `event: append\ndata: ${JSON.stringify({ sig })}\n\n`;
   for (const res of corClients) res.write(msg);
 }
@@ -689,6 +743,7 @@ async function backupIfDue() {
 async function saveWholeWorkbook(key, workbook) {
   const before = caches[key] ? Object.keys(caches[key].sheets || {}) : [];
   caches[key] = workbook;
+  logChange(key, { full: true });
   bookChanged(key);
   broadcastBook(key, 'reload', {});
   if (!pool) return persistFileSoon(key);
@@ -716,6 +771,9 @@ async function patchWorkbook(key, patch) {
     touched[name] = Object.keys(delta.cells || {});
   }
   if (key === 'rvp' && ('Append' in changed || 'Append' in touched)) appendSig = null; // formulas edited by hand
+  const logged = {};
+  for (const [name, delta] of Object.entries(patch.deltas || {})) if (!missing.includes(name)) logged[name] = delta;
+  logChange(key, { deltas: logged, sheets: Object.keys(changed), deleted });
   bookChanged(key, [...Object.keys(changed), ...Object.keys(touched), ...deleted]);
 
   if (!pool) { persistFileSoon(key); return missing; }
@@ -730,7 +788,10 @@ function markCellsChanged(key, name, coords) {
   if (sheet && coords.length) {
     const cells = {};
     for (const c of coords) cells[c] = sheet.cells[c] || null;
+    logChange(key, { deltas: { [name]: { cells: JSON.parse(JSON.stringify(cells)) } } });
     broadcastBook(key, 'live', { deltas: { [name]: { cells } }, sheets: [], deleted: [] });
+  } else {
+    logChange(key, { sheets: [name] });
   }
   if (!pool) return persistFileSoon(key);
   queueChanges(key, [name], [], { [name]: coords });
@@ -815,6 +876,7 @@ async function handleRequest(req, res) {
   if (pathname === '/api/workbook-stream' && req.method === 'GET') {
     if (key === 'rvp' && persistenceReady) await ensureAppend();
     const workbook = await loadWorkbook(key);
+    const streamRev = persistenceReady ? bookRev(key) : '';
     const orderedNames = [
       ...(Array.isArray(workbook.sheetOrder) ? workbook.sheetOrder : []),
       ...Object.keys(workbook.sheets || {})
@@ -843,7 +905,7 @@ async function handleRequest(req, res) {
       if (!target.write(line)) await new Promise(resolve => target.once('drain', resolve));
     };
     try {
-      await writeLine({ type: 'meta', workbook: meta, totalSheets: names.length });
+      await writeLine({ type: 'meta', workbook: meta, totalSheets: names.length, rev: streamRev });
       const cellChunkSize = 3000;
       for (const name of names) {
         const source = workbook.sheets[name] || {};
@@ -935,17 +997,35 @@ async function handleRequest(req, res) {
     return sendJson(res, 202, publicActualizarInventarioState());
   }
 
+  // only what changed after the page's copy (?since=rev); { full: true } = download the whole book
+  if (pathname === '/api/workbook-changes' && req.method === 'GET') {
+    if (!persistenceReady) return sendJson(res, 200, { full: true });
+    if (key === 'rvp') await ensureAppend(); // Append up to date before it is compared
+    const workbook = await loadWorkbook(key);
+    const changes = changesSince(key, workbook, urlObj.searchParams.get('since'));
+    const json = JSON.stringify(changes || { full: true });
+    if (json.length > 2048 && String(req.headers['accept-encoding'] || '').includes('gzip')) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-store' });
+      return res.end(await gzipAsync(json, { level: 1 }));
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store' });
+    return res.end(json);
+  }
+
   if (pathname === '/api/workbook' && req.method === 'GET') {
     if (key === 'rvp' && persistenceReady) await ensureAppend(); // Append up to date before it is sent
     const workbook = await loadWorkbook(key);
     if (String(req.headers['accept-encoding'] || '').includes('gzip')) {
       // compressed off the main thread, and kept until the book changes
-      const { body, etag } = await compressedBook(key, workbook);
+      const job = await compressedBook(key, workbook);
+      const { body, etag } = job;
       if (req.headers['if-none-match'] === etag) {
         res.writeHead(304, { ETag: etag, 'Cache-Control': 'no-cache' });
         return res.end();
       }
-      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-cache', ETag: etag });
+      const head = { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-cache', ETag: etag };
+      if (job.rev) head['X-Book-Rev'] = job.rev;
+      res.writeHead(200, head);
       return res.end(body);
     }
     return sendJson(res, 200, workbook);

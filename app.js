@@ -94,6 +94,98 @@
   const workbookEngineCache = new Map();
   const workbookLoading = new Map();
 
+  // ---- only what changed: every copy of a book (in memory and the one kept in this browser) knows the
+  //   server's change number (rev) it is at. Opening / reloading asks the server only for what changed
+  //   after it (a few cells, usually a few KB) instead of downloading the whole book.
+  const bookRevs = new Map();           // key -> rev the copy in memory is at (at least)
+  const BOOK_MAX_AGE = 24 * 3600 * 1000; // older copies kept in the browser are downloaded again
+  function copyFresh(saved) {
+    const at = Number(saved.headers.get('X-Stored-At')) || Date.parse(saved.headers.get('Date') || '') || 0;
+    return Date.now() - at < BOOK_MAX_AGE;
+  }
+  function hasChanges(ch) {
+    return Object.keys(ch.deltas || {}).length || Object.keys(ch.sheetData || {}).length || (ch.deleted || []).length;
+  }
+  // null: the server can't tell (restarted, copy too old...) and the whole book must be downloaded
+  async function fetchChanges(key, rev) {
+    const res = await fetch(`/api/workbook-changes?wb=${key}&since=${encodeURIComponent(rev)}`, { cache: 'no-store' });
+    if (!res.ok) return null;
+    const ch = await res.json();
+    return ch && !ch.full && ch.rev ? ch : null;
+  }
+  // a book that is not on screen: changes applied as they are
+  function applyChangesPlain(book, ch) {
+    book.sheets = book.sheets || {};
+    for (const name of ch.deleted || []) delete book.sheets[name];
+    for (const [name, sheet] of Object.entries(ch.sheetData || {})) book.sheets[name] = sheet;
+    for (const [name, delta] of Object.entries(ch.deltas || {})) {
+      if (!book.sheets[name]) return false;
+      window.SheetDelta.applyDelta(book.sheets[name], delta);
+    }
+    for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) if (ch.meta && ch.meta[k] !== undefined) book[k] = ch.meta[k];
+    return true;
+  }
+  // the copy kept in this browser brought up to date with only what changed; null = download it whole
+  async function bookFromCache(key) {
+    const saved = await cachedBook(key);
+    const rev = saved && saved.headers.get('X-Book-Rev');
+    if (!rev || !copyFresh(saved)) return null;
+    const ch = await fetchChanges(key, rev);
+    if (!ch) return null;
+    const book = await saved.json();
+    if (!applyChangesPlain(book, ch)) return null;
+    bookRevs.set(key, ch.rev);
+    if (hasChanges(ch)) storeBookSoon(key);
+    return book;
+  }
+  // the book in memory is saved in this browser (as the server has it, without this computer's
+  // filters), quietly, so the next visit opens it at once and asks only for what changed after it
+  const storeTimers = {};
+  function storeBookSoon(key, delay = 4000) {
+    clearTimeout(storeTimers[key]);
+    storeTimers[key] = setTimeout(() => {
+      const book = workbookCache.get(key);
+      const rev = bookRevs.get(key);
+      if (!book || !rev) return;
+      if ([...progressiveSheets].some(id => id.startsWith(`${key}:`))) { storeBookSoon(key, delay); return; }
+      const run = () => {
+        try {
+          const sheets = {};
+          for (const [name, sheet] of Object.entries(book.sheets || {})) sheets[name] = sharedView(sheet);
+          const json = JSON.stringify({ ...book, sheets });
+          storeBook(key, new Response(json, { headers: { 'Content-Type': 'application/json', 'X-Book-Rev': rev, 'X-Stored-At': String(Date.now()) } }));
+        } catch (e) { /* kept for the next time */ }
+      };
+      if (window.requestIdleCallback) window.requestIdleCallback(run, { timeout: 15000 });
+      else run();
+    }, delay);
+  }
+  // the open book brought up to date with only what changed (false = it must be downloaded whole)
+  async function catchUpOpenBook(key) {
+    const rev = bookRevs.get(key);
+    if (!rev) return false;
+    const ch = await fetchChanges(key, rev);
+    if (!ch || key !== WB_KEY || !workbook) return false;
+    const meta = {};
+    for (const k of ['workbookName', 'sheetOrder', 'tables', 'pivots']) {
+      if (ch.meta && ch.meta[k] !== undefined && JSON.stringify(ch.meta[k]) !== JSON.stringify(workbook[k])) meta[k] = ch.meta[k];
+    }
+    if (hasChanges(ch) || Object.keys(meta).length) {
+      const whole = Object.keys(ch.sheetData || {});
+      for (const name of whole) {
+        const sheet = ch.sheetData[name];
+        workbook.sheets[name] = sheet;
+        applyPersonalFilters(key, name, sheet);
+        learnSent(sheet, name);
+      }
+      if (whole.length) { remoteFull = true; dropUndoFor(new Set(whole)); }
+      applyRemote({ deltas: ch.deltas || {}, sheets: [], deleted: ch.deleted || [], meta });
+      storeBookSoon(key);
+    }
+    bookRevs.set(key, ch.rev);
+    return true;
+  }
+
   function setWorkbookKey(key) {
     WB_KEY = VALID_WB_KEYS.includes(key) ? key : 'reunion';
     API_Q = `?wb=${WB_KEY}`;
@@ -107,8 +199,14 @@
   }
 
   async function fetchWorkbookForKey(key) {
+    const quick = await bookFromCache(key).catch(() => null);
+    if (quick) return quick;
     let response = await fetch(`/api/workbook?wb=${key}`, { cache: 'no-store' });
-    if (response.ok) storeBook(key, response.clone()); // its ETag lets a later visit ask "changed?" cheaply
+    if (response.ok) {
+      storeBook(key, response.clone()); // a later visit asks only for what changed after its rev
+      const rev = response.headers.get('X-Book-Rev');
+      if (rev) bookRevs.set(key, rev); else bookRevs.delete(key);
+    }
     if (!response.ok) {
       response = await fetch(initialWorkbookPath(key), { cache: 'force-cache' });
     }
@@ -130,7 +228,7 @@
         buffer = buffer.slice(newline + 1);
         if (!line) continue;
         const record = JSON.parse(line);
-        if (record.type === 'meta' && handlers.meta) await handlers.meta(record.workbook, record.totalSheets);
+        if (record.type === 'meta' && handlers.meta) await handlers.meta(record.workbook, record.totalSheets, record.rev);
         else if (record.type === 'sheet-start' && handlers.sheetStart) await handlers.sheetStart(record.name, record.sheet, record.totalCells);
         else if (record.type === 'sheet-cells' && handlers.sheetCells) await handlers.sheetCells(record.name, record.cells);
         else if (record.type === 'sheet-done' && handlers.sheetDone) await handlers.sheetDone(record.name);
@@ -349,10 +447,29 @@
     if (cached) {
       try {
         activateWorkbook(await cached.clone().json(), key);
-        setStale(true);
         shown = true;
+        // the copy of this browser knows its rev: only what changed after it is asked for. The
+        // "Actualizando datos…" notice shows only if that takes long.
+        const rev = cached.headers.get('X-Book-Rev');
+        if (rev && copyFresh(cached)) {
+          bookRevs.set(key, rev);
+          staleView = true;
+          const notice = setTimeout(() => { if (staleView) setStale(true); }, 900);
+          const caught = await catchUpOpenBook(key).catch(() => false);
+          clearTimeout(notice);
+          if (caught) {
+            setStale(false);
+            editsWhileStale.clear();
+            preloadOtherBooks();
+            return;
+          }
+        }
+        bookRevs.delete(key);
+        setStale(true);
       } catch (e) { shown = false; }
     }
+    let streamRev = '';
+    let streamNames = null;
 
     let resolveFirstSheet;
     const firstSheetReady = new Promise(resolve => { resolveFirstSheet = resolve; });
@@ -361,7 +478,9 @@
     if (statusInfo) statusInfo.textContent = 'Actualizando datos…';
 
     const stream = streamWorkbookForKey(key, {
-      meta: async (meta) => {
+      meta: async (meta, totalSheets, rev) => {
+        streamRev = rev || '';
+        streamNames = new Set(Object.keys(meta.sheets || {}));
         if (!shown) {
           activateWorkbook(meta, key);
           setStale(true);
@@ -422,6 +541,8 @@
             if (cell && cell.f) before[coord] = `${cell.v}|${cell.e || ''}`;
           }
         }
+        // sheets of the browser's old copy that the server no longer has
+        if (streamNames) for (const name of Object.keys(book.sheets || {})) if (!streamNames.has(name)) delete book.sheets[name];
         const readyEngine = new window.FormulaEngine(book);
         readyEngine.recalculateAll();
         workbookEngineCache.set(key, readyEngine);
@@ -439,6 +560,8 @@
           renderSheetTabs();
           if (statusInfo) statusInfo.textContent = `${book.workbookName || 'Reunion 123'} • Excel Engine Active`;
         }
+        if (streamRev) { bookRevs.set(key, streamRev); storeBookSoon(key, 1500); }
+        else bookRevs.delete(key);
       }
     }).catch(async error => {
       if (shown) {
@@ -674,9 +797,10 @@
   // says whether it changed (ETag: nothing is downloaded when it didn't).
   async function revalidateCurrentBook() {
     const key = WB_KEY;
-    setStale(true);
+    staleView = true; // the notice shows only if it takes long (usually only a few cells come)
+    const notice = setTimeout(() => { if (staleView && key === WB_KEY) setStale(true); }, 900);
     try { await reloadFromServer(); } catch (e) { /* the copy shown stays */ }
-    finally { if (key === WB_KEY) { setStale(false); editsWhileStale.clear(); } }
+    finally { clearTimeout(notice); if (key === WB_KEY) { setStale(false); editsWhileStale.clear(); } }
   }
 
   // once the open book is ready, the other books are downloaded quietly and in parallel, so opening
@@ -701,12 +825,10 @@
       for (let i = 0; i < 50 && !(liveSource && liveSource.readyState === 1); i++) await new Promise(r => setTimeout(r, 200));
       await Promise.all(preloaded.map(async k => {
         try {
-          const saved = await cachedBook(k);
-          const etag = saved && saved.headers.get('ETag');
-          const ctrl = new AbortController();
-          const res = await fetch(bookUrl(k), { cache: 'no-store', signal: ctrl.signal, headers: etag ? { 'If-None-Match': etag } : {} });
-          if (res.status === 304 && !staleBooks.has(k) && k !== WB_KEY) trackedBooks.add(k);
-          else { staleBooks.add(k); ctrl.abort(); }
+          const rev = bookRevs.get(k);
+          const ch = rev ? await fetchChanges(k, rev) : null;
+          if (ch && !hasChanges(ch) && !staleBooks.has(k) && k !== WB_KEY) trackedBooks.add(k);
+          else staleBooks.add(k); // brought up to date (only what changed) when opened
         } catch (e) { staleBooks.add(k); }
         checkingBooks.delete(k);
       }));
@@ -724,13 +846,17 @@
   async function reloadFromServer() {
     await flushPendingSave();
     const key = WB_KEY;
-    const cached = await cachedBook(key);
-    const etag = cached && cached.headers.get('ETag');
-    const res = await fetch(bookUrl(key), { cache: 'no-store', headers: etag ? { 'If-None-Match': etag } : {} });
-    if (key !== WB_KEY || res.status === 304 || !res.ok) return;
+    // usually only a few cells changed: only those come
+    try { if (await catchUpOpenBook(key)) return; } catch (e) { /* the whole book below */ }
+    if (key !== WB_KEY) return;
+    const res = await fetch(bookUrl(key), { cache: 'no-store' });
+    if (key !== WB_KEY || !res.ok) return;
+    const rev = res.headers.get('X-Book-Rev');
     storeBook(key, res.clone());
     const fresh = await res.json();
-    if (key === WB_KEY) await replaceWithFresh(fresh);
+    if (key !== WB_KEY) return;
+    await replaceWithFresh(fresh);
+    if (rev) bookRevs.set(key, rev); else bookRevs.delete(key);
   }
 
   async function init() {
@@ -3585,7 +3711,14 @@
       let fromBrowser = false;
       if (!nextWorkbook && !workbookLoading.has(key)) {
         const saved = await cachedBook(key); // the copy this browser kept from an earlier visit
-        if (saved) { try { nextWorkbook = await saved.clone().json(); fromBrowser = true; } catch (e) { nextWorkbook = null; } }
+        if (saved) {
+          try {
+            nextWorkbook = await saved.clone().json();
+            fromBrowser = true;
+            const rev = saved.headers.get('X-Book-Rev');
+            if (rev && copyFresh(saved)) bookRevs.set(key, rev); else bookRevs.delete(key);
+          } catch (e) { nextWorkbook = null; }
+        }
       }
       if (!nextWorkbook) nextWorkbook = await prefetchWorkbook(key);
       if (!nextWorkbook) {
