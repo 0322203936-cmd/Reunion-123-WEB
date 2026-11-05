@@ -432,10 +432,53 @@ async function ensureAppend() {
   return appendBuilding;
 }
 
+// Requerimiento Vs Proyeccion: sheet "Proyeccion-Requerimiento" (as in the Excel): two pivot tables of Append,
+// the cuts of Plan de cosecha (Total Tallos 1, Distribuidor CORTE) and the requirement (Total de tallos 2)
+// by flower and week. Created once by the server; its pivots are put back if a page with an older list drops them.
+const PR_SHEET = 'Proyeccion-Requerimiento';
+function proyReqPivots() {
+  const common = {
+    sheet: PR_SHEET, source: { sheet: 'Append', ref: 'auto' }, cols: ['Semana Prod'], hidden: {}, layout: 'compact',
+    sort: { 'Flor General (Formula)': 'ascending' }, grandRows: true, grandCols: true, weekFrom: { field: 'Semana Prod' }
+  };
+  return [
+    { ...common, id: 'pv_pr_proyeccion', name: 'Proyeccion', anchor: 'A2', location: 'A4:A4',
+      rows: ['Flor General (Formula)'], values: [{ field: 'Total Tallos 1', agg: 'sum', name: 'Suma de Total Tallos 1' }],
+      filters: [{ field: 'Distribuidor', selected: ['CORTE'] }] },
+    { ...common, id: 'pv_pr_requerimiento', name: 'Requerimiento', anchor: 'A78', location: 'A80:A80',
+      rows: ['Flor General (Formula)', 'Flor Color'], collapseAll: { 'Flor General (Formula)': true }, expanded: {},
+      values: [{ field: 'Total de tallos 2', agg: 'sum', name: 'Suma de Total de tallos 2' }],
+      filters: [{ field: 'Distribuidor', selected: null }] }
+  ];
+}
+async function ensureProyReqSheet(rvp) {
+  const pivots = Array.isArray(rvp.pivots) ? rvp.pivots : [];
+  const have = new Set(pivots.map(p => p.id));
+  const missing = proyReqPivots().filter(p => !have.has(p.id));
+  const hasSheet = !!rvp.sheets[PR_SHEET];
+  if (hasSheet && !missing.length) return;
+  const meta = {};
+  const sheets = {};
+  if (missing.length) meta.pivots = [...pivots, ...missing];
+  if (!hasSheet) {
+    sheets[PR_SHEET] = {
+      maxRow: 160, maxCol: 20, colWidths: { A: 25 }, merges: [],
+      cells: { A1: { v: 'Proyeccion', s: { bold: true, fontSize: 12 } }, A77: { v: 'Requerimiento', s: { bold: true, fontSize: 12 } } }
+    };
+    const order = rvp.sheetOrder || [];
+    if (!order.includes(PR_SHEET)) meta.sheetOrder = [...order, PR_SHEET];
+  }
+  await patchWorkbook('rvp', { meta, sheets });
+  console.log(` ${PR_SHEET}: ${hasSheet ? '' : 'hoja creada; '}${missing.length} tabla(s) dinámica(s) agregada(s)`);
+  const { workbookName, sheetOrder, tables } = rvp;
+  broadcastBook('rvp', 'live', { deltas: {}, sheets: Object.keys(sheets), deleted: [], meta: { workbookName, sheetOrder, tables, pivots: rvp.pivots } });
+}
+
 // Requerimiento Vs Proyeccion: sheet "Append" rebuilt from PegarData + Plan de cosecha
 let appendSig = null;
 async function syncAppend(reunion, cosecha) {
   const rvp = await loadWorkbook('rvp');
+  await ensureProyReqSheet(rvp);
   const { sheet } = AppendBuilder.buildAppendSheet(reunion, cosecha, rvp);
   const md5 = obj => crypto.createHash('md5').update(JSON.stringify(obj)).digest('hex');
   const sig = md5(sheet.cells);
