@@ -15,6 +15,17 @@
   const DAY_NAMES = ['Sáb', 'Dom', 'Lun', 'Mar', 'Mié', 'Jue', 'Vie'];
   const MONTHS = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic'];
   const DAY_COL_WIDTH = 12.5;
+  // which weeks show their days is personal (this computer only), like the filters: it is never saved
+  const OPEN_KEY = 'reunion123_week_open';
+  let openState = {};
+  try { openState = JSON.parse(localStorage.getItem(OPEN_KEY) || '{}') || {}; } catch (e) { openState = {}; }
+  const openId = (sheetName, colStr) => `${String(sheetName).trim()}|${colStr}`;
+  const isOpen = (sheetName, colStr) => !!openState[openId(sheetName, colStr)];
+  function setOpen(sheetName, colStr, open) {
+    if (open) openState[openId(sheetName, colStr)] = 1;
+    else delete openState[openId(sheetName, colStr)];
+    try { localStorage.setItem(OPEN_KEY, JSON.stringify(openState)); } catch (e) { /* storage unavailable */ }
+  }
 
   const isWeekSheet = name => /^\s*p\s*cosecha\s*\d{4}/i.test(name || '');
   const sheetYearWeek = name => {
@@ -107,6 +118,7 @@
   function orderColumns(sheet, cols) {
     const wd = sheet && sheet.weekDays;
     if (!wd) return cols;
+    const name = App().getActiveSheet();
     const inGroup = new Set();
     for (const g of Object.values(wd.groups)) g.cols.forEach(c => inGroup.add(colToIndex(c)));
     const out = [];
@@ -114,7 +126,7 @@
       if (inGroup.has(c)) continue;
       out.push(c);
       const g = wd.groups[indexToCol(c)];
-      if (g && g.open) g.cols.forEach(dc => out.push(colToIndex(dc)));
+      if (g && isOpen(name, indexToCol(c))) g.cols.forEach(dc => out.push(colToIndex(dc)));
     }
     return out;
   }
@@ -125,7 +137,7 @@
     const colStr = indexToCol(c);
     const g = sheet.weekDays && sheet.weekDays.groups[colStr];
     if (sheet.weekDays ? !g : !isWeekHeader(sheet, colStr)) return '';
-    const open = !!(g && g.open);
+    const open = !!g && isOpen(name, colStr);
     return `<button type="button" class="wk-toggle${open ? ' open' : ''}" data-wk="${colStr}" title="${open ? 'Ocultar días' : 'Capturar por día (sábado a viernes)'}">${open ? '−' : '+'}</button>`;
   }
 
@@ -133,13 +145,15 @@
     const app = App();
     const name = app.getActiveSheet();
     const sheet = app.getWorkbook().sheets[name];
-    if (!sheet.weekDays) app.pushUndo([name]);
+    const first = !sheet.weekDays;
+    if (first) app.pushUndo([name]);
     const wd = ensureGroups(name);
     const g = wd.groups[colStr];
     if (!g) return;
-    g.open = !g.open;
-    app.markDirty(name);
-    app.save();
+    const open = !isOpen(name, colStr);
+    setOpen(name, colStr, open);
+    // only the first time (the day columns are created) goes to the server; opening/closing is personal
+    if (first) { app.markDirty(name); app.save(); }
     // keep the view where it was (re-rendering would otherwise jump)
     const vp = document.getElementById('spreadsheetViewport');
     const { scrollTop, scrollLeft } = vp;
@@ -147,7 +161,7 @@
     vp.scrollTop = scrollTop;
     vp.scrollLeft = scrollLeft;
     setTimeout(() => { vp.scrollTop = scrollTop; vp.scrollLeft = scrollLeft; }, 0);
-    if (g.open) app.toast(`Semana ${g.week}: ${dayLabels(g.year, g.week)[0]} a ${dayLabels(g.year, g.week)[6]}`);
+    if (open) app.toast(`Semana ${g.week}: ${dayLabels(g.year, g.week)[0]} a ${dayLabels(g.year, g.week)[6]}`);
   }
 
   // ---------------------------------------------------------------- week = sum of its days
@@ -218,6 +232,11 @@
     return Math.ceil(((thursday - jan1) / 86400000 + 1) / 7);
   }
   function onSheetRenamed(oldName, newName) {
+    for (const id of Object.keys(openState)) {
+      const cut = id.lastIndexOf('|');
+      if (id.slice(0, cut) === String(oldName).trim()) { delete openState[id]; openState[openId(newName, id.slice(cut + 1))] = 1; }
+    }
+    try { localStorage.setItem(OPEN_KEY, JSON.stringify(openState)); } catch (e) { /* storage unavailable */ }
     const sheet = App().getWorkbook().sheets[newName];
     const yw = sheetYearWeek(newName);
     if (!sheet || !isWeekSheet(newName) || !yw) return false;
