@@ -531,24 +531,25 @@
     finally { if (key === WB_KEY) { setStale(false); editsWhileStale.clear(); } }
   }
 
-  // once the open book is ready, the other books are downloaded quietly, so opening them is instant
-  // (they are followed live from then on; one last cheap check makes sure nothing was missed meanwhile)
+  // once the open book is ready, the other books are downloaded quietly and in parallel, so opening
+  // them does not have to wait for a full download. They are followed live from then on; one last
+  // cheap check makes sure nothing was missed meanwhile.
   let preloadStarted = false;
   function preloadOtherBooks() {
     if (preloadStarted) return;
     preloadStarted = true;
-    setTimeout(async () => {
-      for (const key of VALID_WB_KEYS) {
-        if (key === WB_KEY || workbookCache.has(key)) continue;
+    const start = async () => {
+      const keys = VALID_WB_KEYS.filter(key => key !== WB_KEY && !workbookCache.has(key));
+      await Promise.all(keys.map(async key => {
         try { await prefetchWorkbook(key); } catch (e) { /* opened normally later */ }
-      }
+      }));
       connectLive(); // now following them too
       // changes between their download and the new connection: a cheap "changed?" (ETag) before
       // trusting them; anything arriving meanwhile also sends them to be checked when opened
       const preloaded = VALID_WB_KEYS.filter(k => k !== WB_KEY && workbookCache.has(k) && !trackedBooks.has(k));
       preloaded.forEach(k => checkingBooks.add(k));
       for (let i = 0; i < 50 && !(liveSource && liveSource.readyState === 1); i++) await new Promise(r => setTimeout(r, 200));
-      for (const k of preloaded) {
+      await Promise.all(preloaded.map(async k => {
         try {
           const saved = await cachedBook(k);
           const etag = saved && saved.headers.get('ETag');
@@ -558,8 +559,12 @@
           else { staleBooks.add(k); ctrl.abort(); }
         } catch (e) { staleBooks.add(k); }
         checkingBooks.delete(k);
-      }
-    }, 3000);
+      }));
+    };
+    // Let the current book paint first, then start the other downloads immediately. The old 3-second
+    // delay made a quick switch wait for the entire next workbook over the public connection.
+    if (typeof queueMicrotask === 'function') queueMicrotask(start);
+    else setTimeout(start, 0);
   }
 
   async function reloadFromServer() {
@@ -3454,6 +3459,7 @@
     document.querySelectorAll('.wb-switch [data-wb]').forEach(link => {
       link.addEventListener('mouseenter', () => prefetchWorkbook(link.dataset.wb));
       link.addEventListener('focus', () => prefetchWorkbook(link.dataset.wb));
+      link.addEventListener('pointerdown', () => prefetchWorkbook(link.dataset.wb));
       link.addEventListener('click', event => {
         event.preventDefault();
         switchWorkbookApartado(link.dataset.wb);
