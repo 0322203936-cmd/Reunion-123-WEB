@@ -488,7 +488,15 @@
   // another computer's weekly output arrived over this page's daily one: drawn again
   function onRemoteCells(names) {
     let n = 0;
+    // a source the server keeps (liveSource, e.g. "Datos TD" of Plan de cosecha) changed: the table is drawn again
+    let shared = 0;
     for (const p of pivots()) {
+      if (!p.liveSource || !names.includes(p.source.sheet) || !wb().sheets[p.sheet] || !wb().sheets[p.source.sheet]) continue;
+      try { renderPivot(p); App().markDirty(p.sheet); shared++; n++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
+    }
+    if (shared) setTimeout(() => App().save(), 0);
+    for (const p of pivots()) {
+      if (p.liveSource && names.includes(p.source.sheet)) continue;
       if (!localView[p.id] || !names.includes(p.sheet) || !wb().sheets[p.sheet]) continue;
       try { renderPivot(p); n++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
     }
@@ -1323,6 +1331,23 @@
     if (n) { App().recalcAndRender(); App().save(); }
     return n;
   }
+
+  // pivots whose source the server keeps (liveSource): drawn when the book is opened (the source may have
+  // changed while nobody had it open, or the server just created the sheet)
+  function refreshLive() {
+    let n = 0;
+    for (const p of pivots()) {
+      if (!p.liveSource || !wb().sheets[p.sheet] || !wb().sheets[p.source.sheet]) continue;
+      try { renderPivot(p); App().markDirty(p.sheet); n++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
+    }
+    if (n) { App().recalcAndRender(); App().save(); }
+  }
+  (function refreshLiveOnLoad() {
+    const app = App();
+    if (!app || !app.getWorkbook || !app.getWorkbook() || !app.getEngine()) { setTimeout(refreshLiveOnLoad, 500); return; }
+    refreshLive();
+  })();
+  window.addEventListener('mauri:workbook-switch', () => setTimeout(refreshLive, 0));
 
   window.MauriPivot = { onSelectionChange, onSheetRenamed, onSheetDeleted, renderPivot, computeGrid, pivotAt, openCreateDialog, cellExtra, refreshAll, sharedCellsFor, onRemoteCells };
 })();

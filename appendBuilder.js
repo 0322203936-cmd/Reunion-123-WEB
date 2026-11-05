@@ -376,4 +376,9 @@ function buildAppendSheet(reunionBook, cosechaBook, rvpBook) {
   };
 }
 
-module.exports = { buildAppendSheet, buildAppendRows, HEADERS, weeknum16 };
+// only the CORTE rows of Plan de cosecha (sheet TD<week> of Plan de cosecha, server.js)
+function buildCorteRows(reunionBook, cosechaBook, rvpBook) {
+  return proyeccionRows(cosechaBook, flagLookup(reunionBook, rvpBook));
+}
+
+module.exports = { buildAppendSheet, buildAppendRows, buildCorteRows, HEADERS, weeknum16 };

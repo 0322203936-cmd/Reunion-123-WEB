@@ -404,6 +404,7 @@ async function syncCor() {
   corFeed = feed;
   if (CosechaCor.trackChanges(loadCorHistory(), feed, new Date().toISOString())) saveCorHistorySoon();
   if (changed || feedChanged) broadcastCor();
+  try { await syncTd(cosecha, reunion); } catch (err) { console.error('TD:', err); }
   appendDirty = true;
   if (rvpViewers()) scheduleAppend();
 }
@@ -473,6 +474,84 @@ async function ensureProyReqSheet(rvp) {
   const { workbookName, sheetOrder, tables } = rvp;
   broadcastBook('rvp', 'live', { deltas: {}, sheets: Object.keys(sheets), deleted: [], meta: { workbookName, sheetOrder, tables, pivots: rvp.pivots } });
 }
+
+// Plan de cosecha: sheet "TD<week of the last P Cosecha tab>" (e.g. TD2646, becomes TD2647 when that tab
+// is created) with the "Proyeccion" pivot of Requerimiento Vs Proyeccion: the cuts (CORTE) by flower and week.
+// Its data is the hidden sheet "Datos TD" (the CORTE rows of Append), kept by the server on every change.
+// Only sheets the server made (tdAuto) are renamed; nothing typed by people is touched.
+const TD_DATA = 'Datos TD';
+const TD_PIVOT = 'pv_td_corte';
+const TD_COLS = ['STATUS', 'Distribuidor', 'Flor General (Formula)', 'Flor 123', 'Flor Color', 'Finca', 'Fecha Produccion', 'Semana Prod', 'Total Tallos 1'];
+function tdPivot(sheet) {
+  return {
+    id: TD_PIVOT, name: 'Proyeccion', sheet, source: { sheet: TD_DATA, ref: 'auto' }, liveSource: true,
+    anchor: 'A2', location: 'A5:A5', rows: ['Flor General (Formula)'], cols: ['Semana Prod'], hidden: {}, layout: 'compact',
+    values: [{ field: 'Total Tallos 1', agg: 'sum', name: 'Suma de Total Tallos 1' }],
+    filters: [{ field: 'Distribuidor', selected: ['CORTE'] }, { field: 'Finca', selected: null }],
+    sort: { 'Flor General (Formula)': 'ascending' }, grandRows: true, grandCols: true, weekFrom: { field: 'Semana Prod' }
+  };
+}
+let tdSig = null;
+async function syncTd(cosecha, reunion) {
+  const last = CosechaCor.lastCosechaSheet(cosecha);
+  const m = last && /(\d{4})\D*$/.exec(last.name.trim());
+  if (!m) return;
+  const tdName = `TD${m[1]}`;
+  if (cosecha.sheets[tdName] && !cosecha.sheets[tdName].tdAuto) return; // a sheet of theirs with that name: left alone
+  const rows = AppendBuilder.buildCorteRows(reunion, cosecha, await loadWorkbook('rvp'));
+  const H = AppendBuilder.HEADERS;
+  const idx = TD_COLS.map(h => H.indexOf(h));
+  const cells = {};
+  TD_COLS.forEach((h, i) => { cells[`${indexToColServer(i + 1)}1`] = { v: h }; });
+  rows.forEach((row, ri) => idx.forEach((k, i) => {
+    const val = row[k];
+    if (val !== null && val !== undefined && val !== '') cells[`${indexToColServer(i + 1)}${ri + 2}`] = { v: val };
+  }));
+  const pivots = Array.isArray(cosecha.pivots) ? cosecha.pivots : [];
+  const order = cosecha.sheetOrder || [];
+  const sig = crypto.createHash('md5').update(JSON.stringify([tdName, order, cells])).digest('hex');
+  if (sig === tdSig && cosecha.sheets[tdName] && cosecha.sheets[TD_DATA] && pivots.some(p => p.id === TD_PIVOT)) return;
+
+  const meta = {};
+  const sheets = {};
+  const deleted = [];
+  const deltas = {};
+  let newOrder = order;
+  let newPivots = pivots;
+  if (!cosecha.sheets[tdName]) {
+    // the week changed: the server's TD sheet is renamed (same content), or created the first time
+    const from = order.find(n => /^TD\d{4}$/.test(n) && cosecha.sheets[n] && cosecha.sheets[n].tdAuto);
+    sheets[tdName] = from ? cosecha.sheets[from]
+      : { maxRow: 60, maxCol: 20, colWidths: { A: 25 }, merges: [], tdAuto: true, cells: { A1: { v: 'Proyeccion', s: { bold: true, fontSize: 12 } } } };
+    if (from) deleted.push(from);
+    newOrder = [...order.filter(n => n !== from && n !== tdName && n !== TD_DATA), tdName, TD_DATA];
+    newPivots = pivots.map(p => (from && p.sheet === from ? { ...p, sheet: tdName } : p));
+    console.log(from ? ` ${from} -> ${tdName}` : ` ${tdName}: hoja creada`);
+  }
+  if (!newPivots.some(p => p.id === TD_PIVOT)) newPivots = [...newPivots, tdPivot(tdName)];
+  else if (newPivots.find(p => p.id === TD_PIVOT).sheet !== tdName) newPivots = newPivots.map(p => (p.id === TD_PIVOT ? { ...p, sheet: tdName } : p));
+  const dataSheet = { hidden: true, maxRow: rows.length + 5, maxCol: TD_COLS.length + 1, colWidths: {}, merges: [], cells,
+    generated: 'Se arma sola: los cortes de la última pestaña de Plan de cosecha (para la hoja TD)' };
+  const prev = cosecha.sheets[TD_DATA];
+  if (!prev) {
+    sheets[TD_DATA] = dataSheet;
+    if (!newOrder.includes(TD_DATA)) newOrder = [...newOrder, TD_DATA];
+  } else {
+    const diff = SheetDelta.diffSheet(SheetDelta.snapshotOf(prev), dataSheet);
+    if (diff && diff.size < 20000) deltas[TD_DATA] = diff.delta;
+    else if (diff) sheets[TD_DATA] = dataSheet;
+  }
+  if (newOrder !== order) meta.sheetOrder = newOrder;
+  if (newPivots !== pivots) meta.pivots = newPivots;
+  if (Object.keys(meta).length || Object.keys(sheets).length || deleted.length || Object.keys(deltas).length) {
+    await patchWorkbook('cosecha', { meta, sheets, deleted, deltas });
+    const { workbookName, sheetOrder, tables } = cosecha;
+    broadcastBook('cosecha', 'live', { deltas, sheets: Object.keys(sheets), deleted,
+      ...(Object.keys(meta).length ? { meta: { workbookName, sheetOrder, tables, pivots: cosecha.pivots } } : {}) });
+  }
+  tdSig = sig;
+}
+function indexToColServer(n) { let s = ''; while (n) { const r = (n - 1) % 26; s = String.fromCharCode(65 + r) + s; n = (n - 1 - r) / 26; } return s; }
 
 // Requerimiento Vs Proyeccion: sheet "Append" rebuilt from PegarData + Plan de cosecha
 let appendSig = null;
