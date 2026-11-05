@@ -484,14 +484,15 @@ const TD_PIVOT = 'pv_td_corte';
 // [column of Datos TD, where it comes from (Append header or extra field of Plan de cosecha)]
 const TD_COLS = [['STATUS'], ['Distribuidor'], ['Flor', 'FLOR'], ['VARIEDAD', null], ['Flor 123'], ['COLOR', 'Flor Color'], ['Grado', null],
   ['Flor General (Formula)'], ['Finca'], ['Fecha Produccion'], ['Semana Prod'], ['Total Tallos 1']];
-// rows as in Plan de cosecha (one per flower line, no subtotals)
+// rows as in Plan de cosecha; like any pivot: compact, the first field collapsed with + to open it
 const TD_ROWS = ['Flor', 'VARIEDAD', 'Flor 123', 'COLOR', 'Grado'];
-const TD_VERSION = 2;
-const TD_WIDTHS = { A: 22, B: 14, C: 32, D: 14, E: 8 };
+const TD_VERSION = 3;
+const TD_WIDTHS = { A: 34, B: 10, C: 10, D: 10, E: 10 };
 function tdPivot(sheet) {
   return {
     id: TD_PIVOT, name: 'Proyeccion', sheet, source: { sheet: TD_DATA, ref: 'auto' }, liveSource: true, v: TD_VERSION,
-    anchor: 'A2', location: 'A5:A5', rows: TD_ROWS, cols: ['Semana Prod'], hidden: {}, layout: 'tabular', flat: true,
+    anchor: 'A2', location: 'A5:A5', rows: TD_ROWS, cols: ['Semana Prod'], hidden: {}, layout: 'compact',
+    collapseAll: { [TD_ROWS[0]]: true }, expanded: {},
     values: [{ field: 'Total Tallos 1', agg: 'sum', name: 'Suma de Total Tallos 1' }],
     filters: [{ field: 'Distribuidor', selected: ['CORTE'] }, { field: 'Finca', selected: null }],
     sort: { 'Flor General (Formula)': 'ascending' }, grandRows: true, grandCols: true, weekFrom: { field: 'Semana Prod' }
@@ -537,8 +538,14 @@ async function syncTd(cosecha, reunion) {
   }
   if (!newPivots.some(p => p.id === TD_PIVOT)) newPivots = [...newPivots, tdPivot(tdName)];
   else if (newPivots.find(p => p.id === TD_PIVOT).v !== TD_VERSION) {
-    // older layout (Flor General only): rows as in Plan de cosecha; their filters stay
-    newPivots = newPivots.map(p => (p.id === TD_PIVOT ? { ...tdPivot(tdName), filters: p.filters, hidden: p.hidden || {} } : p));
+    // older layout: compact with + / − like the other pivots; the fields they chose and their filters stay
+    newPivots = newPivots.map(p => {
+      if (p.id !== TD_PIVOT) return p;
+      const rows = Array.isArray(p.rows) && p.rows.length ? p.rows : TD_ROWS;
+      const out = { ...p, rows, layout: 'compact', collapseAll: { [rows[0]]: true }, expanded: {}, v: TD_VERSION };
+      delete out.flat;
+      return out;
+    });
     const target = sheets[tdName] || cosecha.sheets[tdName];
     if (sheets[tdName]) target.colWidths = { ...(target.colWidths || {}), ...TD_WIDTHS };
     else deltas[tdName] = { props: { colWidths: { ...(target.colWidths || {}), ...TD_WIDTHS } } };
