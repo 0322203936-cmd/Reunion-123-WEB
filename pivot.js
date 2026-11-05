@@ -505,6 +505,15 @@
   function renderPivot(p) {
     const sheet = wb().sheets[p.sheet];
     if (!sheet) return;
+    // this computer's previous view goes away first (it may have been bigger than the shared output,
+    // e.g. a flower opened with + and closed again: its rows must not stay below the table)
+    const prev = localView[p.id];
+    if (prev && prev.sheetObj === sheet) {
+      for (const [coord, cell] of Object.entries(prev.stash)) {
+        if (cell === null) delete sheet.cells[coord]; else sheet.cells[coord] = cell;
+      }
+    }
+    delete localView[p.id];
     writePivot(p, false);
     const cut = corteOf(p) === 'diario';
     if (!cut && !personalOf(p)) { delete localView[p.id]; return; }
