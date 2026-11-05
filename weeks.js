@@ -4,7 +4,9 @@
 //   * sheet.weekDays = { start, lastRow, groups: { <weekCol>: { week, year, cols:[7 cols], open } } }
 //     The 7 day columns live after the used area (they never shift existing cells) and are
 //     displayed right after their week while the group is open.
-//   * Once a row has a day captured, its week cell becomes =SUM(<its 7 days>)
+//   * The week cell keeps the total they typed (what they have to spread over the days); it turns red
+//     while its days don't add up to it. Pivots / Append / Cor take the days when the row has any,
+//     otherwise the week total (appendBuilder.js). Old rows may still hold =SUM(<its 7 days>).
 // ============================================================================
 
 (function () {
@@ -164,55 +166,25 @@
     if (open) app.toast(`Semana ${g.week}: ${dayLabels(g.year, g.week)[0]} a ${dayLabels(g.year, g.week)[6]}`);
   }
 
-  // ---------------------------------------------------------------- week = sum of its days
-  // changed: null = look at every row; otherwise only the rows of the changed "Sheet!A1" keys
-  // (the week cells it turns into formulas are added to the list)
-  function syncWeekTotals(workbook, changed) {
-    for (const [name, sheet] of Object.entries(workbook.sheets || {})) {
-      const wd = sheet.weekDays;
-      if (!wd) continue;
-      let rows;
-      if (changed) {
-        rows = new Set();
-        for (const key of changed) {
-          const bang = key.lastIndexOf('!');
-          if (key.slice(0, bang) === name) rows.add(Number(key.slice(bang + 1).replace(/^[A-Z]+/, '')));
-        }
-        if (!rows.size) continue;
-      } else {
-        let last = wd.lastRow;
-        for (const coord of Object.keys(sheet.cells)) {
-          const r = Number(coord.replace(/^[A-Z]+/, ''));
-          if (r > last) last = r;
-        }
-        rows = [];
-        for (let r = FIRST_ROW; r <= last; r++) rows.push(r);
-      }
-      for (const [weekCol, g] of Object.entries(wd.groups)) {
-        for (const r of rows) {
-          if (r < FIRST_ROW) continue;
-          const has = g.cols.some(c => {
-            const e = sheet.cells[`${c}${r}`];
-            return e && ((e.v !== undefined && e.v !== null && e.v !== '') || e.f);
-          });
-          if (!has) continue;
-          const coord = `${weekCol}${r}`;
-          const formula = `=SUM(${g.cols[0]}${r}:${g.cols[6]}${r})`;
-          const cell = sheet.cells[coord] || (sheet.cells[coord] = {});
-          if (cell.f === formula) continue;
-          cell.f = formula;
-          delete cell.v;
-          if (changed) changed.push(`${name}!${coord}`);
-          if (App() && App().markDirty) App().markDirty(name);
-        }
-      }
+  // ---------------------------------------------------------------- week total vs its days
+  const numOf = v => (typeof v === 'number' ? v : Number(String(v == null ? '' : v).replace(/,/g, '')) || 0);
+  // true when the row has days captured in that week and they don't add up to the week cell
+  function weekMismatch(sheetName, r, c, sheet) {
+    const wd = sheet && sheet.weekDays;
+    if (!wd || r < FIRST_ROW || !isWeekSheet(sheetName)) return false;
+    const colStr = indexToCol(c);
+    const g = wd.groups[colStr];
+    if (!g) return false;
+    const week = sheet.cells[`${colStr}${r}`];
+    if (week && week.f) return false; // old =SUM of its days: always adds up
+    let any = false, sum = 0;
+    for (const dc of g.cols) {
+      const e = sheet.cells[`${dc}${r}`];
+      if (!e || e.v === undefined || e.v === null || e.v === '') continue;
+      any = true;
+      sum += numOf(e.v);
     }
-  }
-
-  const Engine = window.FormulaEngine;
-  if (Engine && !Engine.__weeksPatched) {
-    Engine.beforeRecalc.push(syncWeekTotals);
-    Engine.__weeksPatched = true;
+    return any && Math.abs(sum - numOf(week && week.v)) > 1e-9;
   }
 
   document.addEventListener('mousedown', (e) => {
@@ -276,5 +248,5 @@
     return true;
   }
 
-  window.MauriWeeks = { orderColumns, headerHtml, toggle, dayLabels, weekSaturday, onSheetRenamed };
+  window.MauriWeeks = { orderColumns, headerHtml, toggle, weekMismatch, dayLabels, weekSaturday, onSheetRenamed };
 })();

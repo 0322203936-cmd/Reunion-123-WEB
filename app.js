@@ -2037,6 +2037,7 @@
         + (window.MauriReq ? window.MauriReq.cellExtra(activeSheet, r, c, sheet) : '')
         + (window.MauriCorMarks ? window.MauriCorMarks.cellExtra(activeSheet, r, c, sheet) : ''); // Reunion: Cor changed in Plan de cosecha
       if (reqBadge) cls.push('has-req');
+      if (window.MauriWeeks && window.MauriWeeks.weekMismatch(activeSheet, r, c, sheet)) cls.push('wk-off'); // days don't add up to the week
       tr += `<td data-coord="${coord}"${spanAttrs}${cls.length ? ` class="${cls.join(' ')}"` : ''}${styleAttr}>${reqBadge}${escapeHtml(disp.text)}${afBtn}</td>`;
     }
     if (cw.rightPad > 0) tr += `<td class="h-spacer" style="width:${cw.rightPad}px"></td>`;

@@ -186,16 +186,15 @@
     delete cell.f;
     if (own) cell.v = own; else delete cell.v;
     cells[coord] = out[coord] = cell;
-    // the week is the sum of its days (same formula weeks.js writes); no days left: back to empty
+    // the week keeps the total they typed (it turns red if the days don't add up, weeks.js);
+    // only an old =SUM of its days gets its value refreshed
     const g = sheet.weekDays.groups[day.weekCol];
     const weekCoord = `${day.weekCol}${target}`;
-    const week = { ...(cells[weekCoord] || {}) };
-    const total = g.cols.reduce((t, c) => t + num((cells[`${c}${target}`] || {}).v), 0);
-    if (g.cols.some(c => num((cells[`${c}${target}`] || {}).v))) {
-      week.f = `=SUM(${g.cols[0]}${target}:${g.cols[6]}${target})`;
-      week.v = total;
-    } else { delete week.f; delete week.v; }
-    cells[weekCoord] = out[weekCoord] = week;
+    if (cells[weekCoord] && cells[weekCoord].f) {
+      const week = { ...cells[weekCoord] };
+      week.v = g.cols.reduce((t, c) => t + num((cells[`${c}${target}`] || {}).v), 0);
+      cells[weekCoord] = out[weekCoord] = week;
+    }
     return { sheet: found.name, cells: out };
   }
 

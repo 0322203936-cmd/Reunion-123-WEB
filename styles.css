@@ -2597,3 +2597,6 @@ body.pv-panel-open.pv-panel-min .spreadsheet-viewport {
 
 /* the copy shown is the one kept in the browser while the current one arrives: read-only */
 /* body.wb-stale (the copy shown is being brought up to date): no visible change, it happens quietly */
+
+/* Plan de cosecha: week total whose days don't add up to it (weeks.js) */
+td.wk-off { background: #fde2e2 !important; color: #c00000 !important; font-weight: 700; }
