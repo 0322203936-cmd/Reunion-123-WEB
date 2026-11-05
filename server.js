@@ -93,35 +93,101 @@ const warmTimers = {};
 
 // ---- change log: every change of a book gets a number (rev). A page that has a copy at rev N asks
 //   only for what changed after N (/api/workbook-changes) instead of downloading the whole book.
-//   Kept in memory since the server started (BOOT_ID): after a restart, or for a copy older than the
-//   log, the page downloads the whole book as before.
-const BOOT_ID = crypto.randomBytes(4).toString('hex');
-const LOG_MAX_ENTRIES = 20000;
-const changeLog = {}; // wbKey -> { rev, minRev, entries: [{ rev, deltas, sheets, deleted }] }
-function logOf(key) { return changeLog[key] || (changeLog[key] = { rev: 0, minRev: 0, entries: [] }); }
-function bookRev(key) { return `${BOOT_ID}.${logOf(key).rev}`; }
+//   The log is also kept on disk (changelog/<book>.ndjson), so a restart (updates) does not make every
+//   page download everything again. An entry is written to disk only once the database has it.
+//   After a restart, revs the old process may have given without saving them (a crash) fall in a "gap":
+//   a page that has one of those downloads the whole book. Deleting the changelog folder makes every
+//   page download the whole books once (do it after changing the database by hand).
+const LOG_DIR = path.join(ROOT_DIR, 'changelog');
+const LOG_MAX_ENTRIES = 100000;
+const LOG_KEEP_MS = 4 * 24 * 3600 * 1000; // pages keep their copy up to 4 days (app.js BOOK_MAX_AGE)
+const LOG_GAP = 1000000;
+const changeLog = {}; // wbKey -> { id, rev, minRev, savedRev, entries: [{ rev, t, deltas, sheets, deleted } | { rev, t, gapFrom }] }
+const logFile = key => path.join(LOG_DIR, `${key}.ndjson`);
+function logOf(key) {
+  if (changeLog[key]) return changeLog[key];
+  const log = { id: '', rev: 0, minRev: 0, savedRev: 0, entries: [] };
+  try {
+    const lines = fs.readFileSync(logFile(key), 'utf8').split('\n').filter(Boolean);
+    const head = JSON.parse(lines.shift());
+    log.id = String(head.id || '');
+    log.rev = log.minRev = Number(head.minRev) || 0;
+    for (const line of lines) {
+      let e;
+      try { e = JSON.parse(line); } catch (_) { break; } // a half-written last line (power cut)
+      log.rev = e.rev;
+      if (e.full) { log.entries = []; log.minRev = e.rev; } else log.entries.push(e);
+    }
+  } catch (_) { log.id = ''; }
+  if (!log.id) { log.id = crypto.randomBytes(4).toString('hex'); log.rev = log.minRev = 0; log.entries = []; }
+  // old entries (pages never keep a copy that long) and the gap of this restart
+  const cutoff = Date.now() - LOG_KEEP_MS;
+  while (log.entries.length && log.entries[0].t < cutoff) log.minRev = log.entries.shift().rev;
+  const savedUpTo = log.rev;
+  log.rev += LOG_GAP;
+  log.entries.push({ rev: log.rev, t: Date.now(), gapFrom: savedUpTo });
+  log.savedRev = log.rev;
+  changeLog[key] = log;
+  // the file is written again compact (only what is kept)
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    const tmp = `${logFile(key)}.tmp`;
+    fs.writeFileSync(tmp, [JSON.stringify({ id: log.id, minRev: log.minRev }), ...log.entries.map(e => JSON.stringify(e))].join('\n') + '\n');
+    fs.renameSync(tmp, logFile(key));
+  } catch (error) { console.error(`Registro de cambios (${key}):`, error.message); }
+  return log;
+}
+function bookRev(key) { const log = logOf(key); return `${log.id}.${log.rev}`; }
 // entry: { deltas: { sheet: delta }, sheets: [whole sheets replaced], deleted: [names] } or { full: true }
 function logChange(key, entry) {
   const log = logOf(key);
   log.rev++;
-  if (entry.full) { log.entries = []; log.minRev = log.rev; return; } // older copies: whole book
-  log.entries.push({ rev: log.rev, deltas: entry.deltas || {}, sheets: entry.sheets || [], deleted: entry.deleted || [] });
+  if (entry.full) {
+    // older copies: whole book (written to the file with the rest, once the database has it)
+    log.entries = [{ rev: log.rev, t: Date.now(), full: true }];
+    log.minRev = log.rev;
+    if (!pool) saveLog(key, log.rev);
+    return;
+  }
+  log.entries.push({ rev: log.rev, t: Date.now(), deltas: entry.deltas || {}, sheets: entry.sheets || [], deleted: entry.deleted || [] });
   if (log.entries.length > LOG_MAX_ENTRIES) {
     const dropped = log.entries.splice(0, LOG_MAX_ENTRIES / 4);
     log.minRev = dropped[dropped.length - 1].rev;
   }
+  if (!pool) saveLog(key, log.rev); // local files: written right away
 }
+// the entries up to `upto` are in the database: written to the log file too
+function saveLog(key, upto, extra) {
+  const log = logOf(key);
+  const lines = (extra || log.entries.filter(e => e.rev > log.savedRev && e.rev <= upto)).map(e => JSON.stringify(e));
+  if (upto > log.savedRev) log.savedRev = upto;
+  if (!lines.length) return;
+  try {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    fs.appendFileSync(logFile(key), lines.join('\n') + '\n');
+  } catch (error) { console.error(`Registro de cambios (${key}):`, error.message); }
+}
+// entries that never needed a database write (nothing really changed) are written once the book is idle
+setInterval(() => {
+  const cutoff = Date.now() - LOG_KEEP_MS;
+  for (const [key, log] of Object.entries(changeLog)) {
+    while (log.entries.length && log.entries[0].t < cutoff) log.minRev = log.entries.shift().rev;
+    if (!pending[key] && !flushing[key] && log.rev > log.savedRev) saveLog(key, log.rev);
+  }
+}, 15000).unref();
 // what changed after rev `since`, merged: null when the page must download the whole book
 function changesSince(key, workbook, since) {
-  const [boot, n] = String(since || '').split('.');
+  const [id, n] = String(since || '').split('.');
   const s = Number(n);
   const log = logOf(key);
-  if (boot !== BOOT_ID || !Number.isInteger(s) || s < log.minRev || s > log.rev) return null;
+  if (id !== log.id || !Number.isInteger(s) || s < log.minRev || s > log.rev) return null;
   const deltas = {};
   const whole = new Set();
   const deleted = new Set();
   for (const e of log.entries) {
     if (e.rev <= s) continue;
+    if (e.full) return null;
+    if (e.gapFrom !== undefined) { if (s > e.gapFrom) return null; continue; } // a rev the old process never saved
     for (const name of e.deleted) { deleted.add(name); whole.delete(name); delete deltas[name]; }
     for (const name of e.sheets) { whole.add(name); deleted.delete(name); delete deltas[name]; }
     for (const [name, delta] of Object.entries(e.deltas)) {
@@ -677,7 +743,8 @@ async function flushBook(key) {
   if (!pd || !pool) return;
   delete pending[key];
   clearTimeout(flushTimers[key]);
-  if (!collectChanges(key, pd)) return; // nothing really changed: Neon stays asleep
+  const upto = logOf(key).rev; // every change up to here is in pd (logged and queued together)
+  if (!collectChanges(key, pd)) { saveLog(key, upto); return; } // nothing really changed: Neon stays asleep
   const p = cfg(key).prefix;
   const st = stored[key];
   const workbook = caches[key];
@@ -712,6 +779,7 @@ async function flushBook(key) {
   } finally {
     delete flushing[key];
   }
+  saveLog(key, upto);
   for (const name of pd.deleted) delete st.deltaCounts[name];
   for (const name of pd.snapshots) { st.deltaCounts[name] = 0; learnSheet(key, name); }
   for (const name of Object.keys(pd.deltas)) st.deltaCounts[name] = (st.deltaCounts[name] || 0) + 1;
@@ -740,9 +808,44 @@ async function backupIfDue() {
   console.log(` Respaldo diario guardado en Neon (${(total / 1048576).toFixed(1)} MB comprimido)`);
 }
 
+// a whole new copy of a book (Actualizar Data / Inventario): which sheets really changed. Small changes
+// go as cells; big ones as whole sheets (fetched compressed). null = can't tell (whole book).
+const LIVE_MAX_CELLS = 3000;
+function bookDiff(key, before, after) {
+  if (!before || !before.sheets) return null;
+  const names = Object.keys(after.sheets || {});
+  const deltas = {};
+  const sheets = [];
+  const cache = sheetJson[key];
+  for (const name of names) {
+    const a = before.sheets[name];
+    const b = after.sheets[name];
+    if (!a) { sheets.push(name); continue; }
+    if (((cache && cache.get(name)) || JSON.stringify(a)) === JSON.stringify(b)) continue;
+    const diff = SheetDelta.diffSheet(SheetDelta.snapshotOf(a), b);
+    if (!diff) continue;
+    if (diff.size > LIVE_MAX_CELLS) sheets.push(name); else deltas[name] = diff.delta;
+  }
+  const deleted = Object.keys(before.sheets).filter(n => !(n in (after.sheets || {})));
+  return { deltas, sheets, deleted };
+}
+
 async function saveWholeWorkbook(key, workbook) {
-  const before = caches[key] ? Object.keys(caches[key].sheets || {}) : [];
+  const previous = caches[key];
+  const before = previous ? Object.keys(previous.sheets || {}) : [];
+  const change = persistenceReady ? bookDiff(key, previous, workbook) : null;
   caches[key] = workbook;
+  if (change) {
+    // like an edit from a page: only what changed is logged, sent live and written
+    const changedNames = [...Object.keys(change.deltas), ...change.sheets];
+    logChange(key, change);
+    bookChanged(key, [...changedNames, ...change.deleted]);
+    const { workbookName, sheetOrder, tables, pivots } = workbook;
+    broadcastBook(key, 'live', { deltas: change.deltas, sheets: change.sheets, deleted: change.deleted, meta: { workbookName, sheetOrder, tables, pivots } });
+    if (!pool) return persistFileSoon(key);
+    queueChanges(key, changedNames, change.deleted);
+    return;
+  }
   logChange(key, { full: true });
   bookChanged(key);
   broadcastBook(key, 'reload', {});
@@ -1132,7 +1235,12 @@ data: ${JSON.stringify({ sheet: sheetName, cells: changed })}
     const workbook = await loadWorkbook(key);
     const sheet = workbook.sheets[urlObj.searchParams.get('name') || ''];
     if (!sheet) return sendJson(res, 404, { error: 'Hoja no encontrada' });
-    return sendJson(res, 200, sheet);
+    const json = JSON.stringify(sheet);
+    if (json.length > 2048 && String(req.headers['accept-encoding'] || '').includes('gzip')) {
+      res.writeHead(200, { 'Content-Type': 'application/json; charset=utf-8', 'Content-Encoding': 'gzip', 'Cache-Control': 'no-store' });
+      return res.end(await gzipAsync(json, { level: 1 }));
+    }
+    return sendJson(res, 200, json);
   }
   if (pathname === '/api/events' && req.method === 'GET') {
     res.writeHead(200, { 'Content-Type': 'text/event-stream; charset=utf-8', 'Cache-Control': 'no-store', Connection: 'keep-alive' });
@@ -1232,7 +1340,9 @@ function stopCleanly() {
   stopping = true;
   const pendingSaves = Object.keys(pending).length;
   if (pendingSaves) console.log(` Guardando ${pendingSaves} libro(s) pendientes en Neon antes de salir...`);
-  Promise.race([flushAll(), new Promise(r => setTimeout(r, 8000))]).finally(() => process.exit(0));
+  Promise.race([flushAll(), new Promise(r => setTimeout(r, 8000))])
+    .then(() => { for (const key of Object.keys(changeLog)) if (!pending[key]) saveLog(key, changeLog[key].rev); })
+    .finally(() => process.exit(0));
 }
 for (const signal of ['SIGTERM', 'SIGINT']) process.on(signal, stopCleanly);
 // Windows has no SIGTERM for other programs: tools/servidor.ps1 (updates, "Apagar sistema") creates this file instead

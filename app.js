@@ -104,7 +104,7 @@
     const name = book && book.workbookName;
     return !name || !Object.values(BOOK_NAMES).includes(name) || BOOK_NAMES[key] === name;
   }
-  const BOOK_MAX_AGE = 24 * 3600 * 1000; // older copies kept in the browser are downloaded again
+  const BOOK_MAX_AGE = 4 * 24 * 3600 * 1000; // older copies are downloaded again (server.js LOG_KEEP_MS)
   function copyFresh(saved) {
     const at = Number(saved.headers.get('X-Stored-At')) || Date.parse(saved.headers.get('Date') || '') || 0;
     return Date.now() - at < BOOK_MAX_AGE;
@@ -378,7 +378,7 @@
     staleView = on;
     document.body.classList.toggle('wb-stale', on);
     const statusInfo = document.getElementById('statusFormulaInfo');
-    if (statusInfo) statusInfo.textContent = on ? 'Actualizando datos…' : `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
+    if (statusInfo) statusInfo.textContent = `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`; // no notice: it updates quietly
   }
   // While the copy shown is not confirmed with the server yet ("Actualizando datos…"): values can be
   // typed (only those cells are sent, and they are put back on top of the new copy when it arrives);
@@ -483,7 +483,6 @@
     const firstSheetReady = new Promise(resolve => { resolveFirstSheet = resolve; });
     if (shown) resolveFirstSheet();
     const statusInfo = document.getElementById('statusFormulaInfo');
-    if (statusInfo) statusInfo.textContent = 'Actualizando datos…';
 
     const stream = streamWorkbookForKey(key, {
       meta: async (meta, totalSheets, rev) => {
@@ -503,7 +502,6 @@
           }
           renderSheetTabs();
         }
-        if (statusInfo) statusInfo.textContent = 'Actualizando datos…';
       },
       sheetStart: async (name, sheet) => {
         const book = workbookCache.get(key);
@@ -537,7 +535,7 @@
           staleView = false;
           document.body.classList.remove('wb-stale');
           renderSheet();
-          if (statusInfo) statusInfo.textContent = `${book.workbookName || 'Reunion 123'} • Otras hojas cargando…`;
+          if (statusInfo) statusInfo.textContent = `${book.workbookName || 'Reunion 123'} • Excel Engine Active`;
         }
       },
       done: async () => {
@@ -1181,19 +1179,12 @@
     button.textContent = running ? 'Actualizando Data…' : 'Actualizar Data';
   }
 
-  async function reloadWorkbookAfterActualizarData() {
-    const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
-    if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro actualizado.');
-    workbook = workbookReady(await workbookResponse.json(), WB_KEY);
-    workbookCache.set(WB_KEY, workbook);
-    workbookEngineCache.delete(WB_KEY);
-    activeSheet = workbook.sheets.PegarData && !workbook.sheets.PegarData.hidden ? 'PegarData' : activeSheet;
-    engine = new window.FormulaEngine(workbook);
-    engine.recalculateAll();
-    renderSheetTabs();
-    renderSheet();
-    selectCell('A1', false);
+  // the new data already arrived live (only the sheets that changed); this asks only for anything missing
+  async function showUpdatedSheet(name) {
+    await reloadFromServer();
+    if (workbook.sheets[name] && !workbook.sheets[name].hidden && activeSheet !== name) switchSheet(name);
   }
+  function reloadWorkbookAfterActualizarData() { return showUpdatedSheet('PegarData'); }
 
   async function pollActualizarData() {
     if (WB_KEY !== 'reunion' || actualizarDataPollInFlight) return;
@@ -1260,19 +1251,7 @@
     button.textContent = running ? 'Actualizando Inventario…' : 'Actualizar Inventario';
   }
 
-  async function reloadWorkbookAfterActualizarInventario() {
-    const workbookResponse = await fetch(`/api/workbook${API_Q}`, { cache: 'no-store' });
-    if (!workbookResponse.ok) throw new Error('No se pudo recargar el libro con el inventario actualizado.');
-    workbook = workbookReady(await workbookResponse.json(), WB_KEY);
-    workbookCache.set(WB_KEY, workbook);
-    workbookEngineCache.delete(WB_KEY);
-    activeSheet = workbook.sheets.Inventario && !workbook.sheets.Inventario.hidden ? 'Inventario' : activeSheet;
-    engine = new window.FormulaEngine(workbook);
-    engine.recalculateAll();
-    renderSheetTabs();
-    renderSheet();
-    selectCell('A1', false);
-  }
+  function reloadWorkbookAfterActualizarInventario() { return showUpdatedSheet('Inventario'); }
 
   async function pollActualizarInventario() {
     if (WB_KEY !== 'reunion' || actualizarInventarioPollInFlight) return;

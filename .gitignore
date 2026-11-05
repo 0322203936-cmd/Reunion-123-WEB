@@ -24,3 +24,6 @@ data/.apagar
 
 # PC server: database backups (tools/respaldo_bd.ps1)
 respaldos/
+
+# change log of the books (server.js): kept on each server, never in git
+changelog/
