@@ -27,3 +27,4 @@ respaldos/
 
 # change log of the books (server.js): kept on each server, never in git
 changelog/
+respaldos_auto/

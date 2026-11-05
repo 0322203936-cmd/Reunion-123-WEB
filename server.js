@@ -10,6 +10,7 @@ const CosechaCor = require('./cosechaCor');
 const AppendBuilder = require('./appendBuilder');
 const NeonStore = require('./neonStore');
 const SheetDelta = require('./sheetDelta');
+const ReunionRows = require('./reunionRows');
 const gzipAsync = require('util').promisify(zlib.gzip);
 const crypto = require('crypto');
 
@@ -393,9 +394,42 @@ function scheduleCorSync(delay = 150) {
   clearTimeout(corTimer);
   corTimer = setTimeout(() => { syncCor().catch(err => console.error('Sync Cor:', err)); }, delay);
 }
+// new flowers of the plan get their row in Reunion (reunionRows.js); only while nobody has written in
+// Reunion for a minute (rows move down: an edit sent meanwhile could land on the wrong row)
+let lastReunionEdit = Date.now(); // after a restart it also waits a minute
+let flowersRetry = null;
+async function addNewFlowers(reunion, cosecha) {
+  const missing = ReunionRows.missingFlowers(reunion, cosecha);
+  if (!missing.length) return;
+  if (Date.now() - lastReunionEdit < 60 * 1000) {
+    if (!flowersRetry) flowersRetry = setTimeout(() => { flowersRetry = null; scheduleCorSync(); }, 30 * 1000);
+    return;
+  }
+  // backup of the sheet before moving rows
+  const dir = path.join(__dirname, 'respaldos_auto');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  fs.writeFileSync(path.join(dir, `Reunion_antes_de_flores_${stamp}.json`), JSON.stringify(reunion.sheets.Reunion));
+  const touched = new Set();
+  const added = [];
+  for (const flower of missing) {
+    const res = ReunionRows.addFlower(reunion, flower);
+    if (!res) continue;
+    res.touched.forEach(n => touched.add(n));
+    added.push(`${flower.name} (fila ${res.row})`);
+  }
+  if (!added.length) return;
+  const sheets = {};
+  for (const n of touched) sheets[n] = reunion.sheets[n];
+  await patchWorkbook('reunion', { sheets });
+  broadcastBook('reunion', 'live', { deltas: {}, sheets: [...touched], deleted: [] });
+  console.log(` Reunion: flores nuevas del plan agregadas: ${added.join(', ')}`);
+}
+
 async function syncCor() {
   const cosecha = await loadWorkbook('cosecha');
   const reunion = await loadWorkbook('reunion');
+  try { await addNewFlowers(reunion, cosecha); } catch (err) { console.error('Flores nuevas:', err); }
   const feed = CosechaCor.computeFeed(cosecha);
   const coords = [];
   const changed = CosechaCor.applyFeed(reunion, feed, coords);
@@ -1305,6 +1339,7 @@ async function handleRequest(req, res) {
       return sendJson(res, 409, { error: 'Libro equivocado', wrongBook: true });
     }
     const missing = await patchWorkbook(key, parsed);
+    if (key === 'reunion') lastReunionEdit = Date.now();
     scheduleCorSync();
     // the other pages get the same change: cells as deltas, whole sheets to be fetched, sheet order / pivots
     const from = String(req.headers['x-client-id'] || '');
