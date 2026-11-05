@@ -131,7 +131,9 @@
         if (!line) continue;
         const record = JSON.parse(line);
         if (record.type === 'meta' && handlers.meta) await handlers.meta(record.workbook, record.totalSheets);
-        else if (record.type === 'sheet' && handlers.sheet) await handlers.sheet(record.name, record.sheet);
+        else if (record.type === 'sheet-start' && handlers.sheetStart) await handlers.sheetStart(record.name, record.sheet, record.totalCells);
+        else if (record.type === 'sheet-cells' && handlers.sheetCells) await handlers.sheetCells(record.name, record.cells);
+        else if (record.type === 'sheet-done' && handlers.sheetDone) await handlers.sheetDone(record.name);
         else if (record.type === 'done' && handlers.done) await handlers.done();
       }
     };
@@ -278,7 +280,13 @@
   // what depends on how the whole sheet looks waits a few seconds: rows, tabs, sorting, undo, big pastes.
   const STALE_MAX_CELLS = 50;
   const editsWhileStale = new Map(); // sheet -> Set(coord) typed on the copy being confirmed
+  const progressiveSheets = new Set();
+  const progressiveSheetId = (key, name) => `${key}:${name}`;
   function waitWhileUpdating(cells = Infinity) {
+    if (progressiveSheets.has(progressiveSheetId(WB_KEY, activeSheet))) {
+      showToast('Espera unos segundos: la hoja todavía se está cargando', true);
+      return true;
+    }
     if (!staleView || cells <= STALE_MAX_CELLS) return false;
     showToast('Espera unos segundos: se está actualizando el libro', true);
     return true;
@@ -370,18 +378,31 @@
         }
         if (statusInfo) statusInfo.textContent = 'Actualizando datos…';
       },
-      sheet: async (name, sheet) => {
+      sheetStart: async (name, sheet) => {
         const book = workbookCache.get(key);
         if (!book) return;
         forgetSent([name], book);
         applyPersonalFilters(key, name, sheet);
         book.sheets[name] = sheet;
-        learnSent(sheet, name);
+        progressiveSheets.add(progressiveSheetId(key, name));
+        if (key === WB_KEY && name === activeSheet) renderSheet();
+      },
+      sheetCells: async (name, cells) => {
+        const book = workbookCache.get(key);
+        const sheet = book && book.sheets[name];
+        if (!sheet) return;
+        Object.assign(sheet.cells || (sheet.cells = {}), cells || {});
         if (key === WB_KEY && name === activeSheet) {
           renderSheet();
           selectCell('A1', false);
           resolveFirstSheet();
         }
+      },
+      sheetDone: async (name) => {
+        const book = workbookCache.get(key);
+        const sheet = book && book.sheets[name];
+        if (sheet) learnSent(sheet, name);
+        progressiveSheets.delete(progressiveSheetId(key, name));
       },
       done: async () => {
         const book = workbookCache.get(key);
@@ -401,6 +422,7 @@
       }
     }).catch(async error => {
       if (shown) {
+        for (const id of [...progressiveSheets]) if (id.startsWith(`${key}:`)) progressiveSheets.delete(id);
         setStale(false);
         if (statusInfo) statusInfo.textContent = `${(workbook && workbook.workbookName) || 'Reunion 123'} • Excel Engine Active`;
         return;

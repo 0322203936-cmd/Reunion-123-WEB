@@ -844,7 +844,17 @@ async function handleRequest(req, res) {
     };
     try {
       await writeLine({ type: 'meta', workbook: meta, totalSheets: names.length });
-      for (const name of names) await writeLine({ type: 'sheet', name, sheet: workbook.sheets[name] });
+      const cellChunkSize = 3000;
+      for (const name of names) {
+        const source = workbook.sheets[name] || {};
+        const { cells = {}, ...header } = source;
+        const entries = Object.entries(cells);
+        await writeLine({ type: 'sheet-start', name, sheet: { ...header, cells: {} }, totalCells: entries.length });
+        for (let i = 0; i < entries.length; i += cellChunkSize) {
+          await writeLine({ type: 'sheet-cells', name, cells: Object.fromEntries(entries.slice(i, i + cellChunkSize)) });
+        }
+        await writeLine({ type: 'sheet-done', name });
+      }
       await writeLine({ type: 'done' });
       if (gzip) await new Promise(resolve => { gzip.once('end', resolve); gzip.end(); });
       else res.end();
