@@ -251,7 +251,7 @@ function serialOfIso(iso) {
   return Math.round((Date.UTC(y, m - 1, d) - EPOCH) / 86400000);
 }
 
-// Inventario (Reunion): stock already cut (STATUS "Inventario", Total Tallos 1) counts in the week the inventory was taken
+// Inventario (Reunion): stock already cut (STATUS "Inventario", Total Tallos 1) counts in the week and on the day the inventory was taken
 // (the week, Sat..Fri, of the day "Actualizar Inventario" ran; today if it was never run)
 // sheetName / label: "Inventario" -> INVENTARIO, "Inventario Viernes" -> INVENTARIO VIERNES (same rules)
 function inventarioRows(reunionBook, flagOf, products, sheetName = 'Inventario', label = 'INVENTARIO') {
@@ -281,8 +281,8 @@ function inventarioRows(reunionBook, flagOf, products, sheetName = 'Inventario',
     row[COL.Descripcion] = `A${label}`;
     row[COL['Total Tallos 1']] = qty;
     row[COL['Semana Prod']] = week;
-    // the Friday inventory also carries its day, so it shows in "Weeks x FechaProduccion Dias"
-    if (label === 'INVENTARIO VIERNES') row[COL['Fecha Produccion']] = day;
+    // both inventories carry the day they were taken, so they show in "Weeks x FechaProduccion Dias"
+    row[COL['Fecha Produccion']] = day;
     row[COL['Status orden (Formula)']] = 'FIRME';
     row[COL['Flor General (Formula)']] = flagOf(flor);
     row[COL['Total de tallos 2']] = 0;
