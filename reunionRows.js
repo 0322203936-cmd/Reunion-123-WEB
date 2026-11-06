@@ -1,6 +1,6 @@
 // ============================================================================
 // REUNION: new flowers of Plan de cosecha get their own row (server.js)
-//   * A "Flor 123" of the last P Cosecha tab (or of the tab of the week in progress) that has cuts,
+//   * A "Flor 123" of the last P Cosecha tab (or of the tab of the week in progress) that has cuts or orders in PegarData,
 //     is not a flower of sheet Reunion and whose "Flor" (column A of the plan, e.g. LIRIO) is a title
 //     of Reunion, is inserted at the end of that title's block.
 //   * Rows below move down one row and every formula / filter / conditional format is adjusted
@@ -86,8 +86,23 @@ function insertRows(book, at, n = 1) {
 }
 
 // ---------------------------------------------------------------- what is missing
-// flowers of the plan with cuts: Map normalized Flor 123 -> { name, group }
-function planFlowers(cosechaBook) {
+// "FLOR Color" of the orders in PegarData (Reunion book) that have stems: Set of normalized names
+function orderedNames(reunionBook) {
+  const out = new Set();
+  const pd = reunionBook && reunionBook.sheets && reunionBook.sheets.PegarData;
+  if (!pd) return out;
+  const cells = pd.cells || {};
+  for (const [coord, cell] of Object.entries(cells)) {
+    const m = /^E(\d+)$/.exec(coord);
+    if (!m || m[1] === '1') continue;
+    if (num((cells[`N${m[1]}`] || {}).v) <= 0) continue;
+    out.add(norm(`${cell.v ?? ''} ${(cells[`F${m[1]}`] || {}).v ?? ''}`));
+  }
+  return out;
+}
+
+// flowers of the plan with cuts (or with orders in PegarData: `ordered`): Map normalized Flor 123 -> { name, group }
+function planFlowers(cosechaBook, ordered = new Set()) {
   const out = new Map();
   const main = CosechaCor.lastCosechaSheet(cosechaBook);
   if (!main) return out;
@@ -119,7 +134,7 @@ function planFlowers(cosechaBook) {
       if (!key || out.has(key)) continue;
       const group = norm((cells[`${florCol}${r}`] || {}).v);
       if (!group) continue;
-      if (!valueCols.some(col => num((cells[`${col}${r}`] || {}).v) > 0)) continue; // no cuts: no row
+      if (!ordered.has(key) && !valueCols.some(col => num((cells[`${col}${r}`] || {}).v) > 0)) continue; // no cuts nor orders: no row
       out.set(key, { name: String(raw).replace(/\s+/g, ' ').trim(), group });
     }
   }
@@ -166,7 +181,7 @@ function missingFlowers(reunionBook, cosechaBook) {
   if (!sheet || !cosechaBook) return [];
   const layout = reunionLayout(sheet);
   const out = [];
-  for (const [key, info] of planFlowers(cosechaBook)) {
+  for (const [key, info] of planFlowers(cosechaBook, orderedNames(reunionBook))) {
     if (layout.names.has(key)) continue;
     const title = layout.titles.get(info.group);
     if (title) out.push({ ...info, title: title.row });
