@@ -37,6 +37,7 @@ function weeknum16(serial) {
 
 // Flag!J:K: the first "Palabra Clave" (J) that contains the flower name gives its "Resumen" (K).
 // Requerimiento Vs Proyeccion has its own Flag (from its Excel); Reunion's is the fallback.
+const squash = v => upper(v).replace(/\s+/g, ' ').trim();
 function flagLookup(reunionBook, rvpBook) {
   const flag = (rvpBook && rvpBook.sheets && rvpBook.sheets.Flag) || reunionBook.sheets.Flag;
   const rows = [];
@@ -47,15 +48,17 @@ function flagLookup(reunionBook, rvpBook) {
       if (m && Number(m[1]) > last) last = Number(m[1]);
     }
     for (let r = 1; r <= last; r++) {
-      const key = upper((flag.cells[`J${r}`] || {}).v);
-      if (key) rows.push([key, text((flag.cells[`K${r}`] || {}).v)]);
+      const raw = upper((flag.cells[`J${r}`] || {}).v);
+      if (raw) rows.push([raw, text((flag.cells[`K${r}`] || {}).v), squash(raw)]);
     }
   }
   const cache = new Map();
   return flor => {
     const f = upper(flor);
     if (cache.has(f)) return cache.get(f);
-    const hit = rows.find(([key]) => key.includes(f));
+    // as always (the first key containing it); not found: again without the extra spaces ("SALAL " = "SALAL")
+    const s = squash(flor);
+    const hit = rows.find(([key]) => key.includes(f)) || rows.find(row => row[2] === s) || rows.find(row => row[2].includes(s));
     const out = hit ? hit[1] : 'SIN CONSOLIDAR';
     cache.set(f, out);
     return out;
