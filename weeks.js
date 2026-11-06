@@ -215,6 +215,8 @@
     const code = Number(String(yw.year).slice(2) + String(yw.week).padStart(2, '0'));
     const old = sheetYearWeek(oldName);
     const oldCode = old ? Number(String(old.year).slice(2) + String(old.week).padStart(2, '0')) : null;
+    // a later week (e.g. a copy of 2646 renamed 2647): the numbers move left with their weeks
+    const shifted = shiftForNewWeek(sheet, yw);
     // title: the YYWW number in the top rows (e.g. C2 = 2644)
     for (const [coord, cell] of Object.entries(sheet.cells)) {
       const m = /^([A-Z]+)([1-3])$/.exec(coord);
@@ -244,8 +246,79 @@
         });
       }
     }
-    App().toast(`Semanas de ${newName.trim()}: ${plan.map(p => p.week).join(', ')}`);
+    App().toast(`Semanas de ${newName.trim()}: ${plan.map(p => p.week).join(', ')}`
+      + (shifted ? ` · números recorridos ${shifted} semana(s)` : ''));
     return true;
+  }
+
+  // The sheet's first week column held week W (its header, before relabeling) and the new name starts at
+  // a later week: every week's numbers (week cell + its 7 days) move k columns to the left, so each week
+  // keeps its own numbers; the weeks that are new at the end stay empty. Returns k (0: nothing moved).
+  function shiftForNewWeek(sheet, yw) {
+    const cols = weekColumns(sheet);
+    if (!cols.length) return 0;
+    const groups = (sheet.weekDays && sheet.weekDays.groups) || {};
+    const first = cols[0];
+    let oldYear = groups[first.colStr] && groups[first.colStr].year;
+    if (!oldYear) {
+      // from the title (YYWW in the top rows), else the new name's year
+      for (const [coord, cell] of Object.entries(sheet.cells)) {
+        const v = Number(cell.v);
+        if (/^[A-Z]+[1-3]$/.test(coord) && !cell.f && Number.isInteger(v) && v >= 1000 && v <= 9999) { oldYear = 2000 + Math.floor(v / 100); break; }
+      }
+    }
+    if (!oldYear) oldYear = yw.year;
+    const k = Math.round((weekSaturday(yw.year, yw.week) - weekSaturday(oldYear, first.week)) / (7 * 86400000));
+    if (k < 1 || k >= cols.length) return 0;
+    let last = FIRST_ROW;
+    for (const coord of Object.keys(sheet.cells)) {
+      const p = parseCoord(coord);
+      if (p && p.row > last) last = p.row;
+    }
+    const take = coord => { const c = sheet.cells[coord]; return c && (c.v !== undefined || c.f) && !ownTotal(coord) ? { v: c.v, f: c.f } : null; };
+    // a column total (=SUM(R5:R830) in column R) stays where it is
+    const ownTotal = coord => {
+      const c = sheet.cells[coord];
+      if (!c || !c.f) return false;
+      const col = coord.replace(/\d+$/, '');
+      const refs = c.f.match(/\$?[A-Z]{1,3}\$?\d+/g) || [];
+      return refs.length > 0 && refs.every(x => x.replace(/[$\d]/g, '') === col);
+    };
+    const put = (coord, val) => {
+      if (ownTotal(coord)) return;
+      const cell = sheet.cells[coord] || {};
+      delete cell.v; delete cell.f; delete cell.e;
+      if (val && val.f) cell.f = val.f;
+      else if (val && val.v !== undefined) cell.v = val.v;
+      if (Object.keys(cell).length) sheet.cells[coord] = cell; else delete sheet.cells[coord];
+    };
+    // what every week has now (rows of data only)
+    const snap = cols.map(w => {
+      const g = groups[w.colStr];
+      const rows = {};
+      for (let r = FIRST_ROW; r <= last; r++) rows[r] = { week: take(`${w.colStr}${r}`), days: g ? g.cols.map(dc => take(`${dc}${r}`)) : [] };
+      return { g, rows };
+    });
+    cols.forEach((w, i) => {
+      const src = snap[i + k];
+      const g = groups[w.colStr];
+      // formulas that moved (=SUM of the week's days, column totals) point at this week's column / days
+      const map = new Map();
+      if (src) map.set(cols[i + k].colStr, w.colStr);
+      if (src && src.g && g) src.g.cols.forEach((dc, j) => map.set(dc, g.cols[j]));
+      for (let r = FIRST_ROW; r <= last; r++) {
+        const from = src ? src.rows[r] : null;
+        let week = from && from.week;
+        if (week && week.f) week = { f: week.f.replace(/(\$?)([A-Z]{1,3})(\$?\d+)/g, (m, a, col, rest) => (map.has(col) ? `${a}${map.get(col)}${rest}` : m)) };
+        put(`${w.colStr}${r}`, week);
+        if (g) g.cols.forEach((dc, j) => {
+          let day = from && from.days[j];
+          if (day && day.f) day = { f: day.f.replace(/(\$?)([A-Z]{1,3})(\$?\d+)/g, (m, a, col, rest) => (map.has(col) ? `${a}${map.get(col)}${rest}` : m)) };
+          put(`${dc}${r}`, day);
+        });
+      }
+    });
+    return k;
   }
 
   window.MauriWeeks = { orderColumns, headerHtml, toggle, weekMismatch, dayLabels, weekSaturday, onSheetRenamed };
