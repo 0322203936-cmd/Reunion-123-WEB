@@ -487,8 +487,8 @@ function proyReqPivots() {
     sort: { 'Flor General (Formula)': 'ascending' }, grandRows: true, grandCols: true, weekFrom: { field: 'Semana Prod' }
   };
   return [
-    { ...common, id: 'pv_pr_proyeccion', name: 'Proyeccion', anchor: 'A2', location: 'A4:A4',
-      rows: ['Flor General (Formula)'], values: [{ field: 'Total Tallos 1', agg: 'sum', name: 'Suma de Total Tallos 1' }],
+    { ...common, id: 'pv_pr_proyeccion', name: 'Proyeccion', anchor: 'A2', location: 'A4:A4', v: 2,
+      rows: ['FLOR', 'Flor Color'], collapseAll: { FLOR: true }, expanded: {}, values: [{ field: 'Total Tallos 1', agg: 'sum', name: 'Suma de Total Tallos 1' }],
       filters: [{ field: 'Distribuidor', selected: ['CORTE'] }] },
     { ...common, id: 'pv_pr_requerimiento', name: 'Requerimiento', anchor: 'A78', location: 'A80:A80',
       rows: ['Flor General (Formula)', 'Flor Color'], collapseAll: { 'Flor General (Formula)': true }, expanded: {},
@@ -501,10 +501,14 @@ async function ensureProyReqSheet(rvp) {
   const have = new Set(pivots.map(p => p.id));
   const missing = proyReqPivots().filter(p => !have.has(p.id));
   const hasSheet = !!rvp.sheets[PR_SHEET];
-  if (hasSheet && !missing.length) return;
+  // Proyeccion as the TD sheet of Plan de cosecha: Flor with + to open its colors (their filters stay)
+  const old = pivots.find(p => p.id === 'pv_pr_proyeccion' && p.v !== 2);
+  if (hasSheet && !missing.length && !old) return;
   const meta = {};
   const sheets = {};
-  if (missing.length) meta.pivots = [...pivots, ...missing];
+  if (missing.length || old) {
+    meta.pivots = [...pivots.map(p => (p === old ? { ...p, v: 2, rows: ['FLOR', 'Flor Color'], collapseAll: { FLOR: true }, expanded: {} } : p)), ...missing];
+  }
   if (!hasSheet) {
     sheets[PR_SHEET] = {
       maxRow: 160, maxCol: 20, colWidths: { A: 25 }, merges: [],
