@@ -263,9 +263,9 @@
     return cur;
   }
   // updates `hist` ({ source, baseline, setAt, entries }) in place; returns true when something changed.
-  //   * a number has a 2 minute grace period after it is typed: changes inside it are the same capture
+  //   * every change of a settled number counts at once (no grace period: GRACE_MS = 0)
   //   * capturing where there was nothing (0) is not a modification; changing a settled number is
-  const GRACE_MS = 2 * 60 * 1000;
+  const GRACE_MS = 0;
   function trackChanges(hist, feed, now) {
     const cur = feedValues(feed);
     if (!feed || !feed.sheet) return false;
