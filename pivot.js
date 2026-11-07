@@ -87,9 +87,43 @@
   const sourceCache = new Map();
   let ownRecalc = false; // a pivot redrawing its own output: the sources did not change
   function dropSourceCache() { sourceCache.clear(); }
-  function recalcOwn() {
+  // the cells of the sheets a pivot is about to redraw, to know afterwards which ones it changed
+  function snapCells(names) {
+    const snap = new Map();
+    for (const name of new Set(names)) {
+      const sheet = wb().sheets[name];
+      if (!sheet || !sheet.cells) continue;
+      const cells = new Map();
+      for (const [coord, cell] of Object.entries(sheet.cells)) cells.set(coord, JSON.stringify(cell));
+      snap.set(name, { sheet, cellsObj: sheet.cells, cells });
+    }
+    return snap;
+  }
+  // after a pivot redrew its output: only the formulas that read the cells it changed are recalculated
+  // (not the whole book, ~100 ms on Requerimiento Vs Proyeccion) and the sheet is drawn again as before.
+  // Without a snapshot, or when a sheet was replaced meanwhile, everything is recalculated like before.
+  function recalcOwn(snap) {
     ownRecalc = true;
-    try { App().recalcAndRender(); } finally { ownRecalc = false; }
+    try {
+      const changes = snap ? changedSince(snap) : null;
+      const engine = App().getEngine();
+      if (!changes || !engine || !engine.recalculateCells) { App().recalcAndRender(); return; }
+      if (changes.length) engine.recalculateCells(changes);
+      App().render();
+    } finally { ownRecalc = false; }
+  }
+  function changedSince(snap) {
+    const changes = [];
+    for (const [name, before] of snap) {
+      const sheet = wb().sheets[name];
+      if (sheet !== before.sheet || !sheet.cells || sheet.cells !== before.cellsObj) return null;
+      for (const [coord, cell] of Object.entries(sheet.cells)) {
+        if (before.cells.get(coord) !== JSON.stringify(cell)) changes.push([name, coord]);
+      }
+      for (const coord of before.cells.keys()) if (!(coord in sheet.cells)) changes.push([name, coord]);
+      if (changes.length > 20000) return null;
+    }
+    return changes;
   }
   // registered after every script has loaded, so it runs after the hooks that add cells (corsync)
   setTimeout(() => {
@@ -229,8 +263,9 @@
   function redrawMine(p) {
     const vp = document.getElementById('spreadsheetViewport');
     const { scrollTop, scrollLeft } = vp;
+    const snap = snapCells([p.sheet]);
     try { renderPivot(p); } catch (err) { App().toast(err.message, true); }
-    recalcOwn(); // only this page: nothing is saved
+    recalcOwn(snap); // only this page: nothing is saved
     vp.scrollTop = scrollTop;
     vp.scrollLeft = scrollLeft;
   }
@@ -683,6 +718,7 @@
   }
 
   function commit(p, message) {
+    const snap = snapCells([p.sheet]);
     try {
       renderPivot(p);
     } catch (e) {
@@ -690,7 +726,7 @@
       return;
     }
     App().markDirty(p.sheet);
-    recalcOwn();
+    recalcOwn(snap);
     App().save();
     if (message) App().toast(message);
   }
@@ -1171,10 +1207,11 @@
     if (!list.length) return App().toast('Esta hoja no tiene tablas dinámicas', true);
     dropSourceCache(); // "Actualizar" always reads the source again
     App().pushUndo([sheetName]);
+    const snap = snapCells([sheetName]);
     let ok = 0;
     for (const p of list) { try { renderPivot(p); ok++; } catch (e) { App().toast(e.message, true); } }
     App().markDirty(sheetName);
-    recalcOwn();
+    recalcOwn(snap);
     App().save();
     App().toast(`${ok} tabla(s) dinámica(s) actualizada(s)`);
     const pv = currentPivot();
@@ -1246,8 +1283,9 @@
       setCorte(p, cbtn.dataset.mode);
       const vp = document.getElementById('spreadsheetViewport');
       const { scrollTop, scrollLeft } = vp;
+      const snap = snapCells([p.sheet]);
       try { renderPivot(p); } catch (err) { App().toast(err.message, true); }
-      recalcOwn(); // only this page: nothing is saved
+      recalcOwn(snap); // only this page: nothing is saved
       vp.scrollTop = scrollTop;
       vp.scrollLeft = scrollLeft;
       return;
@@ -1450,6 +1488,7 @@
   // pivots whose source the server keeps (liveSource): drawn when the book is opened (the source may have
   // changed while nobody had it open, or the server just created the sheet)
   function refreshLive() {
+    const snap = snapCells(pivots().map(p => p.sheet));
     let n = 0;
     for (const p of pivots()) {
       if (!p.liveSource || !wb().sheets[p.sheet] || !wb().sheets[p.source.sheet]) continue;
@@ -1462,8 +1501,8 @@
       if (!personalOf(p) && corteOf(p) !== 'diario') continue;
       try { renderPivot(p); own++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
     }
-    if (n) { recalcOwn(); App().save(); }
-    else if (own) recalcOwn();
+    if (n) { recalcOwn(snap); App().save(); }
+    else if (own) recalcOwn(snap);
   }
   (function refreshLiveOnLoad() {
     const app = App();
