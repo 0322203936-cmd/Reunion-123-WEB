@@ -266,7 +266,10 @@ function inventarioRows(reunionBook, flagOf, products, sheetName = 'Inventario',
   if (!sheet) return [];
   const c = sheet.cells;
   const v = (col, r) => (c[`${col}${r}`] || {}).v;
-  const day = sheet.updatedAt ? serialOfIso(sheet.updatedAt) : todaySerial();
+  let day = sheet.updatedAt ? serialOfIso(sheet.updatedAt) : todaySerial();
+  // Inventario Viernes taken on a Friday (last day of the Sat..Fri week) is the stock to start the next
+  // week: it counts on the following Saturday. Any other day it keeps its own date. Inventario stays as is.
+  if (label === 'INVENTARIO VIERNES' && ((day % 7) + 7) % 7 === 6) day += 1; // serial % 7: 0 = Sat, 6 = Fri
   const week = weeknum16(day);
   const out = [];
   const last = lastRowOf(c, 'A');
