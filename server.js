@@ -42,6 +42,21 @@ const DATABASE_SSL = /@(localhost|127\.0\.0\.1)[:/]/.test(DATABASE_URL || '') ? 
 const GITHUB_ACTIONS_TOKEN = String(process.env.GITHUB_ACTIONS_TOKEN || '').trim();
 const GITHUB_REPOSITORY = String(process.env.GITHUB_REPOSITORY || '0322203936-cmd/Reunion-123-WEB').trim();
 const REUNION_SYNC_TOKEN = String(process.env.REUNION_SYNC_TOKEN || '').trim();
+// password asked by the buttons Actualizar Inventario / Actualizar Inventario Viernes (one for both), so they
+// are not run by mistake. It lives only in .env (INVENTARIO_PASSWORD=...); empty = the page only asks to confirm
+const INVENTARIO_PASSWORD = String(process.env.INVENTARIO_PASSWORD || '').trim();
+function inventarioPasswordOk(req) {
+  if (!INVENTARIO_PASSWORD) return true;
+  let sent = '';
+  try { sent = decodeURIComponent(String(req.headers['x-inventario-password'] || '')); } catch (e) { sent = ''; }
+  const a = crypto.createHash('sha256').update(sent).digest();
+  const b = crypto.createHash('sha256').update(INVENTARIO_PASSWORD).digest();
+  return crypto.timingSafeEqual(a, b);
+}
+async function rejectInventarioPassword(res) {
+  await new Promise(resolve => setTimeout(resolve, 1000)); // slows down guessing
+  return sendJson(res, 401, { error: 'Contraseña incorrecta', passwordRequired: true });
+}
 
 // Each workbook ("apartado") has its own files and its own database tables.
 // "reunion" keeps exactly the files/tables it always used.
@@ -274,13 +289,13 @@ function publicActualizarDataState() {
 }
 
 function publicActualizarInventarioState() {
-  return { ...actualizarInventarioState, ok: actualizarInventarioState.status === 'succeeded' };
+  return { ...actualizarInventarioState, ok: actualizarInventarioState.status === 'succeeded', passwordRequired: !!INVENTARIO_PASSWORD };
 }
 
 // "Actualizar Inventario Viernes": same report, only for the Append (INVENTARIO VIERNES)
 const actualizarInventarioViernesState = { status: 'idle', startedAt: null, finishedAt: null, rows: null, lastRow: null, error: null };
 function publicActualizarInventarioViernesState() {
-  return { ...actualizarInventarioViernesState, ok: actualizarInventarioViernesState.status === 'succeeded' };
+  return { ...actualizarInventarioViernesState, ok: actualizarInventarioViernesState.status === 'succeeded', passwordRequired: !!INVENTARIO_PASSWORD };
 }
 
 function resetWorkbookCache(key) {
@@ -1255,6 +1270,7 @@ async function handleRequest(req, res) {
 
   if (pathname === '/api/actualizar-inventario-viernes' && (req.method === 'GET' || req.method === 'POST')) {
     if (key !== 'reunion') return sendJson(res, 400, { error: 'Actualizar Inventario Viernes solo está disponible para Reunion.' });
+    if (req.method === 'POST' && !inventarioPasswordOk(req)) return rejectInventarioPassword(res);
     if (req.method === 'GET' || actualizarInventarioViernesRunning) return sendJson(res, req.method === 'GET' ? 200 : 202, publicActualizarInventarioViernesState());
     actualizarInventarioViernesRunning = true;
     Object.assign(actualizarInventarioViernesState, { status: 'running', startedAt: new Date().toISOString(), finishedAt: null, rows: null, lastRow: null, error: null });
@@ -1265,6 +1281,7 @@ async function handleRequest(req, res) {
   if (pathname === '/api/actualizar-inventario' && (req.method === 'GET' || req.method === 'POST')) {
     if (key !== 'reunion') return sendJson(res, 400, { error: 'Actualizar Inventario solo está disponible para Reunion.' });
     if (req.method === 'GET') return sendJson(res, 200, publicActualizarInventarioState());
+    if (!inventarioPasswordOk(req)) return rejectInventarioPassword(res);
     if (actualizarInventarioRunning) return sendJson(res, 202, publicActualizarInventarioState());
 
     actualizarInventarioRunning = true;

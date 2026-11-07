@@ -1297,9 +1297,46 @@
     }
   }
 
+  // Actualizar Inventario / Inventario Viernes ask for the password kept in the server's .env (one for both)
+  // so they are not run by mistake; while none is set there, they only ask to confirm.
+  // Returns the password ('' when none is needed) or null when cancelled.
+  async function askInventarioPassword(label, stateUrl) {
+    let required = true; // if the server can't be asked, the password is asked anyway
+    try {
+      const r = await fetch(stateUrl, { cache: 'no-store' });
+      const st = await r.json().catch(() => ({}));
+      if (r.ok && st.passwordRequired === false) required = false;
+    } catch (e) { /* asked anyway */ }
+    if (!required) return confirm(`¿Seguro que quieres ejecutar "${label}"?`) ? '' : null;
+    return new Promise(resolve => {
+      const back = document.createElement('div');
+      back.className = 'no-print';
+      back.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.35);z-index:100000;display:flex;align-items:center;justify-content:center;';
+      back.innerHTML = `<form style="background:#fff;border-radius:8px;padding:18px 20px;min-width:300px;box-shadow:0 10px 30px rgba(0,0,0,.25);font:14px Segoe UI,Arial,sans-serif;color:#222">
+        <div style="font-weight:700;margin-bottom:6px">${escapeHtml(label)}</div>
+        <div style="margin-bottom:10px;color:#555">Escribe la contraseña para ejecutarlo.</div>
+        <input type="password" autocomplete="off" style="width:100%;box-sizing:border-box;padding:7px 8px;border:1px solid #bbb;border-radius:4px;font-size:14px">
+        <div style="display:flex;justify-content:flex-end;gap:8px;margin-top:14px">
+          <button type="button" data-cancel style="padding:6px 14px;border:1px solid #bbb;background:#f4f4f4;border-radius:4px;cursor:pointer">Cancelar</button>
+          <button type="submit" style="padding:6px 14px;border:0;background:#217346;color:#fff;border-radius:4px;cursor:pointer">Ejecutar</button>
+        </div></form>`;
+      const form = back.querySelector('form');
+      const input = back.querySelector('input');
+      const done = value => { back.remove(); resolve(value); };
+      form.addEventListener('submit', e => { e.preventDefault(); done(input.value); });
+      back.querySelector('[data-cancel]').addEventListener('click', () => done(null));
+      back.addEventListener('mousedown', e => { if (e.target === back) done(null); });
+      input.addEventListener('keydown', e => { e.stopPropagation(); if (e.key === 'Escape') done(null); });
+      document.body.appendChild(back);
+      input.focus();
+    });
+  }
+
   async function actualizarInventarioDesdePosco() {
     const button = document.getElementById('btnActualizarInventario');
     if (!button || button.disabled) return;
+    const password = await askInventarioPassword('Actualizar Inventario', '/api/actualizar-inventario?wb=reunion');
+    if (password === null || button.disabled) return;
     setActualizarInventarioButtonState({ status: 'running' });
     showToast('Descargando POSCO y actualizando Inventario…');
     try {
@@ -1307,8 +1344,9 @@
       await new Promise(resolve => setTimeout(resolve, 500));
       await saving;
 
-      const response = await fetch('/api/actualizar-inventario?wb=reunion', { method: 'POST' });
+      const response = await fetch('/api/actualizar-inventario?wb=reunion', { method: 'POST', headers: { 'X-Inventario-Password': encodeURIComponent(password) } });
       const state = await response.json().catch(() => ({}));
+      if (response.status === 401) { setActualizarInventarioButtonState({ status: 'idle' }); showToast('Contraseña incorrecta: no se actualizó el Inventario.', true); return; }
       if (!response.ok && response.status !== 202) throw new Error(state.error || `Error ${response.status}`);
       await pollActualizarInventario();
     } catch (error) {
@@ -1350,12 +1388,15 @@
   async function actualizarInventarioViernes() {
     const button = document.getElementById('btnActualizarInventarioViernes');
     if (!button || button.disabled) return;
+    const password = await askInventarioPassword('Actualizar Inventario Viernes', '/api/actualizar-inventario-viernes?wb=reunion');
+    if (password === null || button.disabled) return;
     setInventarioViernesButtonState({ status: 'running' });
     showToast('Descargando el inventario de POSCO (Inventario Viernes)…');
     try {
       await flushPendingSave();
-      const response = await fetch('/api/actualizar-inventario-viernes?wb=reunion', { method: 'POST' });
+      const response = await fetch('/api/actualizar-inventario-viernes?wb=reunion', { method: 'POST', headers: { 'X-Inventario-Password': encodeURIComponent(password) } });
       const state = await response.json().catch(() => ({}));
+      if (response.status === 401) { setInventarioViernesButtonState({ status: 'idle' }); showToast('Contraseña incorrecta: no se actualizó Inventario Viernes.', true); return; }
       if (!response.ok && response.status !== 202) throw new Error(state.error || `Error ${response.status}`);
       await pollInventarioViernes();
     } catch (error) {
