@@ -78,7 +78,46 @@
     return rec => run(tree, rec);
   }
 
+  // ---- what was read from each source (e.g. Append: ~7,000 rows x 30 columns), kept until it changes.
+  //   Reading it cell by cell takes ~300 ms; every pivot, +/-, filter and the field panel used to read it
+  //   again. The copy is dropped on ANY change that can reach a source: a recalculation of this book that
+  //   is not only a pivot's own output (the formula engine reports every edit, undo, remote delta...),
+  //   cells arriving from the server (onRemoteCells), a sheet replaced or another book (object identity)
+  //   and the "Actualizar" button. Records are only read by the pivots, never changed.
+  const sourceCache = new Map();
+  let ownRecalc = false; // a pivot redrawing its own output: the sources did not change
+  function dropSourceCache() { sourceCache.clear(); }
+  function recalcOwn() {
+    ownRecalc = true;
+    try { App().recalcAndRender(); } finally { ownRecalc = false; }
+  }
+  // registered after every script has loaded, so it runs after the hooks that add cells (corsync)
+  setTimeout(() => {
+    const Engine = window.FormulaEngine;
+    if (!Engine || !Engine.beforeRecalc) return;
+    Engine.beforeRecalc.push((workbook, changed) => {
+      if (!sourceCache.size || !App()) return;
+      // a book being loaded or followed in the background may become this one (conservative: re-read)
+      if (workbook !== wb()) { dropSourceCache(); return; }
+      if (!changed) { if (!ownRecalc) dropSourceCache(); return; }
+      // cells changed only inside sheets that just show pivots (and are no source) cannot change a source
+      const hosts = new Set(pivots().map(p => p.sheet));
+      for (const p of pivots()) if (p.source) hosts.delete(p.source.sheet);
+      if (changed.some(key => !hosts.has(key.slice(0, key.lastIndexOf('!'))))) dropSourceCache();
+    });
+  }, 0);
+
   function readSource(p) {
+    const sheetObj = wb().sheets[p.source.sheet];
+    const key = `${p.source.sheet}\u0001${p.source.ref}\u0001${JSON.stringify(p.calcFields || [])}`;
+    const hit = sourceCache.get(key);
+    if (hit && hit.sheetObj === sheetObj && sheetObj && hit.cells === sheetObj.cells) return { fields: [...hit.fields], records: hit.records };
+    const out = readSourceNow(p);
+    if (sheetObj) sourceCache.set(key, { sheetObj, cells: sheetObj.cells, fields: out.fields, records: out.records });
+    return { fields: [...out.fields], records: out.records };
+  }
+
+  function readSourceNow(p) {
     const g = p.source.ref === 'auto' ? autoRange(p.source.sheet) : parseRange(p.source.ref);
     const engine = App().getEngine();
     if (!g || !wb().sheets[p.source.sheet]) throw new Error(`No se encontró el origen ${p.source.sheet}!${p.source.ref}`);
@@ -191,7 +230,7 @@
     const vp = document.getElementById('spreadsheetViewport');
     const { scrollTop, scrollLeft } = vp;
     try { renderPivot(p); } catch (err) { App().toast(err.message, true); }
-    App().recalcAndRender(); // only this page: nothing is saved
+    recalcOwn(); // only this page: nothing is saved
     vp.scrollTop = scrollTop;
     vp.scrollLeft = scrollLeft;
   }
@@ -549,6 +588,10 @@
   // another computer's weekly output arrived over this page's daily one: drawn again
   function onRemoteCells(names) {
     let n = 0;
+    // cells from the server: the sources are read again (only sheets that just show pivots don't count)
+    const hosts = new Set(pivots().map(p => p.sheet));
+    for (const p of pivots()) if (p.source) hosts.delete(p.source.sheet);
+    if (names.some(name => !hosts.has(name))) dropSourceCache();
     // a source the server keeps (liveSource, e.g. "Datos TD" of Plan de cosecha) changed: the table is drawn again
     let shared = 0;
     for (const p of pivots()) {
@@ -647,7 +690,7 @@
       return;
     }
     App().markDirty(p.sheet);
-    App().recalcAndRender();
+    recalcOwn();
     App().save();
     if (message) App().toast(message);
   }
@@ -757,7 +800,7 @@
       close();
       renderPivot(p);
       App().markDirty(p.sheet);
-      App().recalcAndRender();
+      recalcOwn();
       if (App().getActiveSheet() !== p.sheet) App().switchSheet(p.sheet);
       App().selectCoord(p.anchor);
       App().save();
@@ -982,7 +1025,7 @@
       if (written) { sheet.pivotAreas = { ...sheet.pivotAreas }; delete sheet.pivotAreas[pv.id]; }
       wb().pivots = pivots().filter(x => x.id !== pv.id);
       App().markDirty(pv.sheet);
-      App().recalcAndRender();
+      recalcOwn();
       App().save();
       closePanel();
     });
@@ -1126,11 +1169,12 @@
     const sheetName = App().getActiveSheet();
     const list = pivots().filter(p => p.sheet === sheetName);
     if (!list.length) return App().toast('Esta hoja no tiene tablas dinámicas', true);
+    dropSourceCache(); // "Actualizar" always reads the source again
     App().pushUndo([sheetName]);
     let ok = 0;
     for (const p of list) { try { renderPivot(p); ok++; } catch (e) { App().toast(e.message, true); } }
     App().markDirty(sheetName);
-    App().recalcAndRender();
+    recalcOwn();
     App().save();
     App().toast(`${ok} tabla(s) dinámica(s) actualizada(s)`);
     const pv = currentPivot();
@@ -1203,7 +1247,7 @@
       const vp = document.getElementById('spreadsheetViewport');
       const { scrollTop, scrollLeft } = vp;
       try { renderPivot(p); } catch (err) { App().toast(err.message, true); }
-      App().recalcAndRender(); // only this page: nothing is saved
+      recalcOwn(); // only this page: nothing is saved
       vp.scrollTop = scrollTop;
       vp.scrollLeft = scrollLeft;
       return;
@@ -1392,13 +1436,14 @@
 
   // re-render every pivot fed by `sourceSheet` (the source changed)
   function refreshAll(sourceSheet) {
+    dropSourceCache(); // the caller changed the source
     let n = 0;
     for (const p of pivots()) {
       if (sourceSheet && p.source.sheet !== sourceSheet) continue;
       if (!wb().sheets[p.sheet]) continue;
       try { renderPivot(p); App().markDirty(p.sheet); n++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
     }
-    if (n) { App().recalcAndRender(); App().save(); }
+    if (n) { recalcOwn(); App().save(); }
     return n;
   }
 
@@ -1417,8 +1462,8 @@
       if (!personalOf(p) && corteOf(p) !== 'diario') continue;
       try { renderPivot(p); own++; } catch (err) { console.error('Tabla dinámica', p.name, err); }
     }
-    if (n) { App().recalcAndRender(); App().save(); }
-    else if (own) App().recalcAndRender();
+    if (n) { recalcOwn(); App().save(); }
+    else if (own) recalcOwn();
   }
   (function refreshLiveOnLoad() {
     const app = App();
