@@ -2386,6 +2386,9 @@ body.pv-panel-open.pv-panel-min .spreadsheet-viewport {
 .hide-menu-item .chk { width: 14px; color: var(--excel-green); font-weight: 700; }
 .hide-menu-item .lbl { flex: 1; }
 .hide-menu-item .key { color: #94a3b8; font-size: 11px; }
+/* Reunion unlocked on this page (app.js REUNION BLOQUEADA): the Ocultar button turns amber so nobody forgets */
+body.sheet-unlocked #btnHideMenu { background: #fef3c7; border-color: #f59e0b; color: #92400e; }
+body.sheet-unlocked #btnHideMenu::before { content: '🔓 Desbloqueada · '; font-weight: 600; }
 
 /* horizontal virtualization: invisible cells standing in for the columns not rendered */
 .excel-grid tbody td.h-spacer,

@@ -88,6 +88,9 @@
     return VALID_WB_KEYS.includes(value) ? value : 'reunion';
   };
   let WB_KEY = wbFromUrl();
+  const LOCKED_SHEET = 'Reunion';
+  let lockedSheetOpen = false; // sheet Reunion unlocked on this page (see REUNION BLOQUEADA)
+  let lockToastAt = 0;
   let API_Q = `?wb=${WB_KEY}`;
   let BACKUP_KEY = WB_KEY === 'reunion' ? 'reunion123_workbook_backup' : `${WB_KEY}_workbook_backup`;
   const workbookCache = new Map();
@@ -194,6 +197,7 @@
 
   function setWorkbookKey(key) {
     WB_KEY = VALID_WB_KEYS.includes(key) ? key : 'reunion';
+    lockedSheetOpen = false; // another book: Reunion locked again
     API_Q = `?wb=${WB_KEY}`;
     BACKUP_KEY = WB_KEY === 'reunion' ? 'reunion123_workbook_backup' : `${WB_KEY}_workbook_backup`;
   }
@@ -999,9 +1003,42 @@
     document.getElementById('btnRedo').disabled = redoStack.length === 0;
   }
 
+  // ---- REUNION BLOQUEADA: sheet "Reunion" fills itself (Cor from Plan de cosecha, new flowers, PegarData...),
+  //   so people can look (move, select, copy, filters, +/-, hide flowers in 0, Cor marks) but not change it:
+  //   no typing, paste, delete, cut, fill, format, rows, sort, rename / delete / move the tab.
+  //   "Ocultar ▾ -> Desbloquear página" unlocks it on this page only, until it is locked again or the page reloads.
+  //   The server's own updates are not affected (they don't go through these user actions).
+  function isLockedSheet(name) { return WB_KEY === 'reunion' && name === LOCKED_SHEET && !lockedSheetOpen; }
+  // true (and a notice) when the action would change the locked sheet; quiet: no notice (previews)
+  function lockedEdit(names = [activeSheet], quiet = false) {
+    if (!names.some(isLockedSheet)) return false;
+    if (!quiet && Date.now() - lockToastAt > 1500) {
+      lockToastAt = Date.now();
+      showToast('Reunion se llena sola desde Plan de cosecha. Para editar: Ocultar ▾ → Desbloquear página', true);
+    }
+    return true;
+  }
+  function snapSheets(snap) { return Object.keys((snap && (snap.cells || snap.saved)) || {}); }
+  function updateUnlockButton() {
+    const btn = document.getElementById('btnUnlockSheet');
+    if (!btn) return;
+    const applies = WB_KEY === 'reunion' && activeSheet === LOCKED_SHEET;
+    btn.style.display = applies ? '' : 'none';
+    btn.classList.toggle('checked', lockedSheetOpen);
+    btn.querySelector('.chk').textContent = lockedSheetOpen ? '✓' : '';
+    document.body.classList.toggle('sheet-unlocked', applies && lockedSheetOpen);
+  }
+  function setLockedSheetOpen(open) {
+    if (inlineEditor) closeInlineEditor(false);
+    lockedSheetOpen = open;
+    updateUnlockButton();
+    showToast(open ? '🔓 Reunion desbloqueada en esta página (se vuelve a bloquear al recargar)' : '🔒 Reunion bloqueada');
+  }
+
   function undo() {
     if (waitWhileUpdating()) return;
     if (undoStack.length === 0) return;
+    if (lockedEdit(snapSheets(undoStack[undoStack.length - 1]))) return;
     const prev = undoStack.pop();
     redoStack.push(mirrorOf(prev));
     trimHistory(redoStack);
@@ -1029,6 +1066,7 @@
   function redo() {
     if (waitWhileUpdating()) return;
     if (redoStack.length === 0) return;
+    if (lockedEdit(snapSheets(redoStack[redoStack.length - 1]))) return;
     const next = redoStack.pop();
     undoStack.push(mirrorOf(next));
     trimHistory(undoStack);
@@ -1855,6 +1893,7 @@
 
   // Sort the visible rows of a filter range by one column (hidden rows stay where they are)
   function sortFilterRange(fi, colId, desc) {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     const f = sheet.filters[fi];
@@ -1951,6 +1990,7 @@
     const zeros = zeroRows(sheet, hiddenCols);
     if (!sheet.showZeroRows) zeros.forEach(r => hiddenRows.add(r));
     updateZeroRowsButton(sheet, zeros.length);
+    updateUnlockButton();
     const visRows = [];
     const offsets = [0];
     for (let r = 1; r <= sheet.maxRow; r++) {
@@ -2741,6 +2781,7 @@
   }
 
   function setCellContent(sheetName, coord, rawInput) {
+    if (lockedEdit([sheetName])) return; // REUNION BLOQUEADA
     const sheet = workbook.sheets[sheetName];
     if (!sheet) return;
     pushUndoCells(sheetName, [coord]);
@@ -2767,6 +2808,7 @@
   function takeShown(from, count, shown) { const out = []; for (let i = from; out.length < count && i < from + count + 100000; i++) if (shown(i)) out.push(i); return out; }
 
   function clearSelectedRange() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     { const b = getSelectionBounds(); if (waitWhileUpdating((b.maxRow - b.minRow + 1) * (b.maxCol - b.minCol + 1))) return; }
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
@@ -2789,6 +2831,7 @@
   // ============================================================================
 
   function applyStyleToSelection(mutator, bounds = getSelectionBounds(), withUndo = true) {
+    if (lockedEdit([activeSheet], !withUndo)) return; // REUNION BLOQUEADA
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     if (withUndo) pushUndoState();
@@ -2894,6 +2937,7 @@
   }
 
   function toggleMergeCenterSelection() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
@@ -2933,6 +2977,7 @@
   }
 
   function applyBorderPreset(preset) {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     pushUndoState();
@@ -2992,6 +3037,7 @@
   }
 
   function clearFormatSelection() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     pushUndoState();
@@ -3033,6 +3079,7 @@
   }
 
   function applyFormatPainterToSelection() {
+    if (lockedEdit()) { stopFormatPainter(); return; } // REUNION BLOQUEADA
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) { stopFormatPainter(); return; }
     pushUndoState();
@@ -3095,6 +3142,7 @@
   function copySelection(isCut = false) {
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
+    if (isCut && lockedEdit()) isCut = false; // REUNION BLOQUEADA: cut becomes copy
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     const grid = [];
     const tsvRows = [];
@@ -3171,6 +3219,7 @@
 
   // Excel-style paste: full cells (value, formula, format, merges), relative formula shift, tiling.
   function pasteInternalClipboard() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const clip = clipboardState;
     const sheet = workbook.sheets[activeSheet];
@@ -3252,6 +3301,7 @@
 
   // Plain text paste from outside the app: values only, destination formatting is kept.
   function pasteDataMatrix(matrix) {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (!matrix || matrix.length === 0) return;
     if (waitWhileUpdating(matrix.length * Math.max(...matrix.map(r => r.length)))) return;
     const sheet = workbook.sheets[activeSheet];
@@ -3295,6 +3345,7 @@
   }
 
   function fillSelectionDown() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     if (maxRow <= minRow) return;
@@ -3311,6 +3362,7 @@
   }
 
   function fillSelectionRight() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     if (maxCol <= minCol) return;
@@ -3418,6 +3470,7 @@
   }
 
   function startInlineEdit(coord, initialText = null) {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     const td = gridBody.querySelector(`td[data-coord="${coord}"]`);
     if (!td) return;
     closeInlineEditor(false);
@@ -3630,6 +3683,7 @@
   }
 
   function insertRowsAt(insertRow, count = 1) {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     if (!sheet || count < 1) return;
@@ -3659,6 +3713,7 @@
   }
 
   function deleteSelectedRows() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
@@ -3699,6 +3754,7 @@
   }
 
   function expandGridDimensions(extraRows = 0, extraCols = 0) {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     if (extraRows > 0) sheet.maxRow = (sheet.maxRow || 100) + extraRows;
@@ -3735,6 +3791,7 @@
   }
 
   function commitFillHandleDrag() {
+    if (lockedEdit()) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     if (!fillPreviewTargetCoord) return;
     const pHover = parseCoord(fillPreviewTargetCoord);
@@ -3887,6 +3944,7 @@
   }
 
   function renameSheet(oldName) {
+    if (lockedEdit([oldName])) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const nextName = prompt('New sheet name:', oldName);
     if (!nextName) return;
@@ -3929,6 +3987,7 @@
   }
 
   function deleteSheet(sheetName) {
+    if (lockedEdit([sheetName])) return; // REUNION BLOQUEADA
     if (waitWhileUpdating()) return;
     const order = workbook.sheetOrder || Object.keys(workbook.sheets);
     if (visibleSheets().length <= 1 && !workbook.sheets[sheetName]?.hidden) {
@@ -4200,6 +4259,7 @@
         e.preventDefault();
         e.stopPropagation();
         closeInlineEditor(true);
+        if (lockedEdit()) return; // REUNION BLOQUEADA: no fill drag
         isDraggingFillHandle = true;
         fillPreviewTargetCoord = null;
         return;
@@ -4535,6 +4595,9 @@
       } else if ((e.ctrlKey || e.metaKey) && e.key === '-') {
         e.preventDefault();
         deleteSelectedRows();
+      } else if (e.key === 'Enter' && isLockedSheet(activeSheet)) {
+        e.preventDefault();
+        moveSelection(e.shiftKey ? -1 : 1, 0);
       } else if (e.key === 'Enter' || e.key === 'F2') {
         e.preventDefault();
         startInlineEdit(selectedCoord);
@@ -4670,6 +4733,7 @@
         const targetSheet = btn.getAttribute('data-target-sheet');
         const target = workbook.sheets[targetSheet];
         if (!target) return;
+        if (lockedEdit([targetSheet])) return; // REUNION BLOQUEADA
         pushUndoState([targetSheet]);
         if (action === 'sheet-hide') {
           target.hidden = 'hidden';
@@ -4724,7 +4788,7 @@
       e.preventDefault();
       const t = tabDropTarget(e);
       const target = t && t.tab.getAttribute('data-sheet');
-      if (target && target !== draggingTab) {
+      if (target && target !== draggingTab && !lockedEdit([draggingTab])) { // REUNION BLOQUEADA: its tab stays
         const order = workbook.sheetOrder.filter(n => n !== draggingTab);
         order.splice(order.indexOf(target) + (t.after ? 1 : 0), 0, draggingTab);
         workbook.sheetOrder = order;
@@ -4980,6 +5044,8 @@
       else startFormatPainter();
     });
     btnClearFormat.addEventListener('click', clearFormatSelection);
+
+    document.getElementById('btnUnlockSheet')?.addEventListener('click', () => setLockedSheetOpen(!lockedSheetOpen));
 
     document.getElementById('btnZeroRows')?.addEventListener('click', () => {
       const sheet = workbook.sheets[activeSheet];
