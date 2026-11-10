@@ -204,16 +204,17 @@
     }
   }
 
-  // Excel WEEKNUM(date, 16): Saturday..Friday weeks
-  function weeknum16(serial) {
-    const d = new Date(Date.UTC(1899, 11, 30) + Math.floor(serial) * 86400000);
+  // week of Plan de cosecha, as Append's Semana Prod (appendBuilder.js planWeek): Saturday..Friday,
+  // = ISO week of date + 2 (2027: Fri 01-ene is week 53, week 1 = 02-ene..08-ene)
+  function planWeek(serial) {
+    const d = new Date(Date.UTC(1899, 11, 30) + (Math.floor(serial) + 2) * 86400000);
+    d.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7));
     const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
-    const offset = (new Date(jan1).getUTCDay() - 6 + 7) % 7;
-    return Math.floor((Math.round((d - jan1) / 86400000) + offset) / 7) + 1;
+    return Math.floor((d - jan1) / 86400000 / 7) + 1;
   }
   function currentWeek() {
     const now = new Date();
-    return weeknum16(Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(1899, 11, 30)) / 86400000));
+    return planWeek(Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(1899, 11, 30)) / 86400000));
   }
 
   // ---- "Corte Diario" / "Corte Semanal": buttons above each pivot. Personal (this computer only, like
@@ -295,7 +296,7 @@
     if (typeof d !== 'number' || !Number.isFinite(d)) return false; // no date: nothing to cut
     const today = todaySerial();
     const day = Math.floor(d);
-    return day < today && today - day < 7 && weeknum16(day) === weeknum16(today);
+    return day < today && today - day < 7 && planWeek(day) === planWeek(today);
   }
 
   function passesFilters(p, rec, cut) {

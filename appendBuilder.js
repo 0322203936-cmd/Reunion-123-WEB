@@ -5,7 +5,8 @@
 //     tab when the last one starts with next week (same rule as the Cor, cosechaCor.js): one row per captured day,
 //     or per week when that week has no days captured. Distribuidor / Cust Name / No. = "CORTE"
 //     ("COMPRA" for the rows whose Finca is COMPRA)
-//   * Calculated like the Excel: Semana Prod / Semana Load = WEEKNUM(date, 16) (Sat..Fri weeks),
+//   * Semana Prod / Semana Load = the week of Plan de cosecha (Sat..Fri, = WEEKNUM(date + 2, 21); e.g. 2027:
+//     Fri 01-ene is still week 53, week 1 = Sat 02-ene..Fri 08-ene),
 //     Status orden = ESTIMADO when No. contains "Est", Flor General = Flag!J:K lookup ("*FLOR*").
 //     (dif = Total Tallos 1 - Total de tallos 2 is a calculated field of the pivot tables, as in the Excel)
 // ============================================================================
@@ -26,14 +27,15 @@ const num = v => (isNum(v) ? v : (typeof v === 'string' && v.trim() !== '' && !i
 const text = v => (v === undefined || v === null ? '' : String(v));
 const upper = v => text(v).toUpperCase();
 
-// Excel WEEKNUM(date, 16): weeks start on Saturday, week 1 holds January 1
-function weeknum16(serial) {
+// Week of Plan de cosecha (weeks.js / cosechaCor.js): Saturday..Friday, the Saturday is the Monday of ISO week n minus 2,
+// so a date belongs to the ISO week of date + 2 = Excel WEEKNUM(date + 2, 21). Unlike WEEKNUM(date, 16) the year
+// boundary does not cut a week: 26-dic-2026..01-ene-2027 is all week 53 and week 1 of 2027 is 02-ene..08-ene.
+function planWeek(serial) {
   if (!isNum(serial)) return null;
-  const d = new Date(EPOCH + Math.floor(serial) * 86400000);
+  const d = new Date(EPOCH + (Math.floor(serial) + 2) * 86400000);
+  d.setUTCDate(d.getUTCDate() + 3 - ((d.getUTCDay() + 6) % 7)); // Thursday of that ISO week
   const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
-  const offset = (new Date(jan1).getUTCDay() - 6 + 7) % 7; // days from the Saturday that opens week 1
-  const doy = Math.round((d.getTime() - jan1) / 86400000);
-  return Math.floor((doy + offset) / 7) + 1;
+  return Math.floor((d.getTime() - jan1) / 86400000 / 7) + 1;
 }
 
 // Flag!J:K: the first "Palabra Clave" (J) that contains the flower name gives its "Resumen" (K).
@@ -132,10 +134,10 @@ function requerimientoRows(reunionBook, flagOf, products) {
     row[COL['Fecha Produccion']] = v('O', r) ?? null;
     row[COL.Caja] = v('P', r) ?? null;
     row[COL.prioridad] = v('Q', r) ?? null;
-    row[COL['Semana Prod']] = weeknum16(v('O', r));
+    row[COL['Semana Prod']] = planWeek(v('O', r));
     row[COL['Status orden (Formula)']] = /est/i.test(text(v('C', r))) ? 'ESTIMADO' : 'FIRME';
     row[COL['Flor General (Formula)']] = flagOf(flor);
-    row[COL['Semana Load']] = weeknum16(v('H', r));
+    row[COL['Semana Load']] = planWeek(v('H', r));
     row[COL['Total de tallos 2']] = num(v('N', r));
     // Flor 123 of the order, as Reunion's Req finds it: pack name (FLOR Color X TxR2, TxR2 = txr_orden),
     // then FLOR Color, then FLOR
@@ -273,7 +275,7 @@ function inventarioRows(reunionBook, flagOf, products, sheetName = 'Inventario',
   // Inventario Viernes taken on a Friday (last day of the Sat..Fri week) is the stock to start the next
   // week: it counts on the following Saturday. Any other day it keeps its own date. Inventario stays as is.
   if (label === 'INVENTARIO VIERNES' && ((day % 7) + 7) % 7 === 6) day += 1; // serial % 7: 0 = Sat, 6 = Fri
-  const week = weeknum16(day);
+  const week = planWeek(day);
   const out = [];
   const last = lastRowOf(c, 'A');
   for (let r = 2; r <= last; r++) {
@@ -323,12 +325,15 @@ const DATE_COLS = new Set([COL['Load Date'], COL['Fecha Produccion']]);
 // Formula columns of the order rows (like the Excel's table columns). {r} is the row.
 // If someone edits one of these formulas in the sheet, the new formula is used for the whole column.
 const DEFAULT_FORMULAS = {
-  'Semana Prod': '=WEEKNUM(P{r},16)',
+  'Semana Prod': '=WEEKNUM(P{r}+2,21)',
   'Status orden (Formula)': '=IF(ISNUMBER(SEARCH("Est***",D{r})),"ESTIMADO","FIRME")',
-  'Semana Load': '=WEEKNUM(I{r},16)'
+  'Semana Load': '=WEEKNUM(I{r}+2,21)'
 };
+// the previous defaults (Excel weeks, WEEKNUM 16): not an edit by hand, they become the new default
+const OLD_DEFAULTS = { 'Semana Prod': '=WEEKNUM(P{r},16)', 'Semana Load': '=WEEKNUM(I{r},16)' };
 function formulaTemplates(prevSheet) {
   const out = { ...DEFAULT_FORMULAS, ...((prevSheet && prevSheet.formulaTemplates) || {}) };
+  for (const h of Object.keys(OLD_DEFAULTS)) if (out[h] === OLD_DEFAULTS[h]) out[h] = DEFAULT_FORMULAS[h];
   if (!prevSheet || !prevSheet.cells) return out;
   for (const header of Object.keys(DEFAULT_FORMULAS)) {
     const col = indexToCol(COL[header] + 1);
@@ -338,6 +343,7 @@ function formulaTemplates(prevSheet) {
       if (!m || !cell.f) continue;
       const r = m[1];
       const tmpl = cell.f.replace(new RegExp(`(\\$?[A-Z]{1,3})${r}(?!\\d)`, 'g'), '$1{r}');
+      if (tmpl === OLD_DEFAULTS[header]) break; // the old default, not an edit
       if (tmpl !== out[header]) { out[header] = tmpl; break; } // edited by hand
     }
   }
@@ -414,4 +420,4 @@ function buildCorteRows(reunionBook, cosechaBook, rvpBook) {
   return rows;
 }
 
-module.exports = { buildAppendSheet, buildAppendRows, buildCorteRows, HEADERS, weeknum16 };
+module.exports = { buildAppendSheet, buildAppendRows, buildCorteRows, HEADERS, planWeek };
