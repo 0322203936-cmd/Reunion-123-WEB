@@ -327,8 +327,20 @@
   }
 
   // order of a field's items: explicit sort, else Excel's stored item order (new items at the end), else ascending
+  // week field of p.weekFrom: weeks of next year (1, 2, 3... while we are in week 46) go after 52/53,
+  // with the same rule as the weekFrom filter (more than 26 weeks behind the current one = next year)
+  function weekRank(w, cw) {
+    const n = typeof w === 'number' ? w : (/^\s*\d+\s*$/.test(String(w ?? '')) ? Number(w) : null);
+    if (n === null) return w;
+    return n < cw && cw - n >= 26 ? n + 100 : n;
+  }
   function itemSorter(p, field) {
     const dir = (p.sort || {})[field];
+    if (p.weekFrom && p.weekFrom.field === field && (!dir || dir === 'ascending' || dir === 'descending') && !(p.order || {})[field]) {
+      const cw = currentWeek();
+      const cmp = (a, b) => compareItems(weekRank(a.value, cw), weekRank(b.value, cw));
+      return dir === 'descending' ? (a, b) => cmp(b, a) : cmp;
+    }
     if (dir === 'descending') return (a, b) => compareItems(b.value, a.value);
     const order = !dir && (p.order || {})[field];
     if (!order) return (a, b) => compareItems(a.value, b.value);
