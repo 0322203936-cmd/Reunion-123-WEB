@@ -4,6 +4,7 @@
 //   * Proyeccion: Plan de cosecha's last tab (Total Tallos 1) + the week in progress from the previous
 //     tab when the last one starts with next week (same rule as the Cor, cosechaCor.js): one row per captured day,
 //     or per week when that week has no days captured. Distribuidor / Cust Name / No. = "CORTE"
+//     ("COMPRA" for the rows whose Finca is COMPRA)
 //   * Calculated like the Excel: Semana Prod / Semana Load = WEEKNUM(date, 16) (Sat..Fri weeks),
 //     Status orden = ESTIMADO when No. contains "Est", Flor General = Flag!J:K lookup ("*FLOR*").
 //     (dif = Total Tallos 1 - Total de tallos 2 is a calculated field of the pivot tables, as in the Excel)
@@ -190,15 +191,17 @@ function tabProyeccionRows(found, flagOf, onlySat) {
     const flor123 = text(v(florCol, r)).trim();
     if (!flor123) continue;
     const flor = head.flor ? v(head.flor, r) : flor123;
+    // rows of finca COMPRA (bought flower) are labeled COMPRA instead of CORTE; everything else stays the same
+    const label = head.finca && upper(v(head.finca, r)).trim() === 'COMPRA' ? 'COMPRA' : 'CORTE';
     const base = () => {
       const row = new Array(HEADERS.length).fill(null);
       row[COL.STATUS] = 'Proyeccion';
-      row[COL.Distribuidor] = 'CORTE';
-      row[COL['Cust Name']] = 'CORTE';
-      row[COL['No.']] = 'CORTE';
+      row[COL.Distribuidor] = label;
+      row[COL['Cust Name']] = label;
+      row[COL['No.']] = label;
       row[COL.FLOR] = flor;
       row[COL['Flor Color']] = head.color ? v(head.color, r) ?? null : null;
-      row[COL.Descripcion] = 'CORTE';
+      row[COL.Descripcion] = label;
       row[COL['Status orden (Formula)']] = 'FIRME';
       row[COL['Flor General (Formula)']] = flagOf(flor);
       row[COL['Total de tallos 2']] = 0;

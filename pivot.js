@@ -236,7 +236,19 @@
   const PERSONAL_KEY = 'reunion123_pivot_personal';
   const PERSONAL_PROPS = ['filters', 'hidden', 'collapsed', 'expanded'];
   function personals() { try { return JSON.parse(localStorage.getItem(PERSONAL_KEY) || '{}') || {}; } catch (e) { return {}; } }
-  function personalOf(p) { return personals()[corteId(p)] || null; }
+  function personalOf(p) {
+    const own = personals()[corteId(p)] || null;
+    // finca COMPRA now arrives as Distribuidor "COMPRA" (it used to be CORTE): a personal filter that picks
+    // CORTE also picks COMPRA, once (compraV1), so nothing disappears; unchecking it later is respected
+    if (own && !own.compraV1 && Array.isArray(own.filters)) {
+      own.compraV1 = true;
+      for (const f of own.filters) {
+        if (f && f.field === 'Distribuidor' && Array.isArray(f.selected) && f.selected.includes('CORTE') && !f.selected.includes('COMPRA')) f.selected.push('COMPRA');
+      }
+      savePersonal(p, own);
+    }
+    return own;
+  }
   function savePersonal(p, view) {
     const all = personals();
     all[corteId(p)] = view;
@@ -257,6 +269,7 @@
     const view = mineOf(p);
     const w = JSON.parse(JSON.stringify(Object.fromEntries(PERSONAL_PROPS.map(k => [k, view[k] === undefined ? null : view[k]]))));
     if (!w.filters) w.filters = [];
+    w.compraV1 = true; // personalOf already added COMPRA where it applied: keep what they choose from here on
     fn(w);
     savePersonal(p, w);
   }

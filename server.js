@@ -504,7 +504,7 @@ function proyReqPivots() {
   return [
     { ...common, id: 'pv_pr_proyeccion', name: 'Proyeccion', anchor: 'A2', location: 'A4:A4', v: 2,
       rows: ['FLOR', 'Flor Color'], collapseAll: { FLOR: true }, expanded: {}, values: [{ field: 'Total Tallos 1', agg: 'sum', name: 'Suma de Total Tallos 1' }],
-      filters: [{ field: 'Distribuidor', selected: ['CORTE'] }] },
+      filters: [{ field: 'Distribuidor', selected: ['CORTE', 'COMPRA'] }], compraV1: true },
     { ...common, id: 'pv_pr_requerimiento', name: 'Requerimiento', anchor: 'A78', location: 'A80:A80',
       rows: ['Flor General (Formula)', 'Flor Color'], collapseAll: { 'Flor General (Formula)': true }, expanded: {},
       values: [{ field: 'Total de tallos 2', agg: 'sum', name: 'Suma de Total de tallos 2' }],
@@ -538,6 +538,29 @@ async function ensureProyReqSheet(rvp) {
   broadcastBook('rvp', 'live', { deltas: {}, sheets: Object.keys(sheets), deleted: [], meta: { workbookName, sheetOrder, tables, pivots: rvp.pivots } });
 }
 
+// Finca COMPRA of Plan de cosecha arrives as Distribuidor "COMPRA" (appendBuilder.js). Pivots whose
+// Distribuidor filter picks CORTE also get COMPRA, once (compraV1): if someone later unchecks COMPRA,
+// it stays unchecked. Only the filter list changes; no data is touched.
+async function ensureCompraFilters() {
+  for (const key of ['rvp', 'cosecha']) {
+    const book = await loadWorkbook(key);
+    const pivots = Array.isArray(book.pivots) ? book.pivots : [];
+    let changed = false;
+    const next = pivots.map(p => {
+      if (p.compraV1) return p;
+      const f = (p.filters || []).find(x => x.field === 'Distribuidor');
+      if (!f || !Array.isArray(f.selected) || !f.selected.includes('CORTE') || f.selected.includes('COMPRA')) return p;
+      changed = true;
+      return { ...p, compraV1: true, filters: p.filters.map(x => (x === f ? { ...x, selected: [...x.selected, 'COMPRA'] } : x)) };
+    });
+    if (!changed) continue;
+    await patchWorkbook(key, { meta: { pivots: next } });
+    const { workbookName, sheetOrder, tables } = book;
+    broadcastBook(key, 'live', { deltas: {}, sheets: [], deleted: [], meta: { workbookName, sheetOrder, tables, pivots: book.pivots } });
+    console.log(` ${key}: COMPRA agregado al filtro Distribuidor de ${next.filter((p, i) => p !== pivots[i]).map(p => p.name).join(', ')}`);
+  }
+}
+
 // Plan de cosecha: sheet "TD<week of the last P Cosecha tab>" (e.g. TD2646, becomes TD2647 when that tab
 // is created) with the "Proyeccion" pivot of Requerimiento Vs Proyeccion: the cuts (CORTE) by flower and week.
 // Its data is the hidden sheet "Datos TD" (the CORTE rows of Append), kept by the server on every change.
@@ -557,7 +580,7 @@ function tdPivot(sheet) {
     anchor: 'A2', location: 'A5:A5', rows: TD_ROWS, cols: ['Semana Prod'], hidden: {}, layout: 'compact',
     collapseAll: { [TD_ROWS[0]]: true }, expanded: {},
     values: [{ field: 'Total Tallos 1', agg: 'sum', name: 'Suma de Total Tallos 1' }],
-    filters: [{ field: 'Distribuidor', selected: ['CORTE'] }, { field: 'Finca', selected: null }],
+    filters: [{ field: 'Distribuidor', selected: ['CORTE', 'COMPRA'] }, { field: 'Finca', selected: null }], compraV1: true,
     sort: { 'Flor General (Formula)': 'ascending' }, grandRows: true, grandCols: true, weekFrom: { field: 'Semana Prod' }
   };
 }
@@ -1534,6 +1557,7 @@ async function start() {
     await initDatabase();
     persistenceReady = true;
     for (const key of Object.keys(WORKBOOKS)) await loadWorkbook(key); // the only full read of Neon
+    try { await ensureCompraFilters(); } catch (err) { console.error('Filtros COMPRA:', err); }
     await syncCor();
     console.log(' Persistencia inicializada y sincronización lista');
   } catch (error) {
