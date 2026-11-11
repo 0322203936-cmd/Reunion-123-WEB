@@ -597,8 +597,11 @@
   function sharedCellsFor(sheet) {
     let out = null;
     for (const lv of Object.values(localView)) {
-      if (lv.sheetObj !== sheet) continue;
-      out = Object.assign(out || {}, lv.stash);
+      // same sheet even if its object was replaced (undo / redo): its personal cells must not be saved as shared
+      if (lv.sheetObj === sheet) { out = Object.assign(out || {}, lv.stash); continue; }
+      if (!(lv.sheetName && wb() && wb().sheets[lv.sheetName] === sheet)) continue;
+      // replaced object: only take away the personal-only cells (never put back older shared values)
+      for (const [coord, cell] of Object.entries(lv.stash)) if (cell === null) (out = out || {})[coord] = null;
     }
     return out;
   }
@@ -608,9 +611,13 @@
     // this computer's previous view goes away first (it may have been bigger than the shared output,
     // e.g. a flower opened with + and closed again: its rows must not stay below the table)
     const prev = localView[p.id];
-    if (prev && prev.sheetObj === sheet) {
+    // also when the sheet object was replaced (undo / redo bring back a copy taken while this page showed its
+    // own view): that copy still holds the personal rows / columns, and without this they stayed as shared
+    // cells below or beside the table. The shared output is written again right after, so nothing is lost.
+    if (prev) {
+      const same = prev.sheetObj === sheet; // replaced object: only the personal-only cells are taken away
       for (const [coord, cell] of Object.entries(prev.stash)) {
-        if (cell === null) delete sheet.cells[coord]; else sheet.cells[coord] = cell;
+        if (cell === null) delete sheet.cells[coord]; else if (same) sheet.cells[coord] = cell;
       }
     }
     delete localView[p.id];
@@ -641,7 +648,7 @@
         }
       }
     }
-    localView[p.id] = { sheetObj: sheet, stash, area: eff.area, location: eff.location, anchor: eff.anchor, toggles: eff.toggles };
+    localView[p.id] = { sheetObj: sheet, sheetName: p.sheet, stash, area: eff.area, location: eff.location, anchor: eff.anchor, toggles: eff.toggles };
     // the pivot as the book describes it stays the shared one (it is saved with the book)
     Object.assign(p, { area: shared.area, location: shared.location, anchor: shared.anchor, toggles: shared.toggles });
     sheet.pivotAreas = shared.pivotAreas;
