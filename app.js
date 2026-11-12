@@ -344,6 +344,11 @@
     const firstVisible = visibleSheets()[0] || workbook.sheetOrder[0] || 'Sheet1';
     activeSheet = workbook.activeSheet && workbook.sheets[workbook.activeSheet] && !workbook.sheets[workbook.activeSheet].hidden
       ? workbook.activeSheet : firstVisible;
+    // Plan de cosecha always opens on its newest "P Cosecha" tab (the one before TD), not on whatever tab was left active
+    if (WB_KEY === 'cosecha') {
+      const newest = visibleSheets().filter(n => /^P\s*Cosecha/i.test(String(n).trim())).pop();
+      if (newest) activeSheet = newest;
+    }
     engine = workbookEngineCache.get(WB_KEY) || new window.FormulaEngine(workbook);
     const pend = pendingBg.get(WB_KEY);
     pendingBg.delete(WB_KEY);
