@@ -1018,6 +1018,33 @@
     }
     return true;
   }
+  // ---- TOTAL PRO (Plan de cosecha, sheets "P Cosecha ..."): the column titled TOTAL PRO in row 4 is
+  //   =SUM of the days captured with + of the first week; nobody types, pastes, deletes, fills or cuts over it
+  //   (rows 5 and below; formats can still change).
+  function totalProCols(sheetName) {
+    if (WB_KEY !== 'cosecha' || !/^P\s*Cosecha/i.test(String(sheetName || '').trim())) return null;
+    const sh = workbook && workbook.sheets[sheetName];
+    if (!sh || !sh.cells) return null;
+    const cols = [];
+    const last = Math.max(sh.maxCol || 0, 60);
+    for (let c = 1; c <= last; c++) {
+      const cell = sh.cells[`${indexToCol(c)}4`];
+      if (cell && /^TOTAL\s*PRO$/i.test(String(cell.v ?? '').trim())) cols.push(c);
+    }
+    return cols.length ? cols : null;
+  }
+  const spanOf = (a, b) => Array.from({ length: Math.max(0, b - a + 1) }, (_, i) => a + i);
+  // true (and a notice) when the target rows x cols touch TOTAL PRO
+  function totalProHit(sheetName, rows, cols, quiet = false) {
+    const tp = totalProCols(sheetName);
+    if (!tp || !tp.some(c => cols.includes(c)) || !rows.some(r => r >= 5)) return false;
+    if (!quiet && Date.now() - lockToastAt > 1500) {
+      lockToastAt = Date.now();
+      showToast('TOTAL PRO se calcula solo: suma de los días capturados con +. No se puede escribir ahí', true);
+    }
+    return true;
+  }
+  function totalProHitBounds(b, quiet = false) { return totalProHit(activeSheet, spanOf(b.minRow, b.maxRow), spanOf(b.minCol, b.maxCol), quiet); }
   function snapSheets(snap) { return Object.keys((snap && (snap.cells || snap.saved)) || {}); }
   function updateUnlockButton() {
     const btn = document.getElementById('btnUnlockSheet');
@@ -2782,6 +2809,7 @@
 
   function setCellContent(sheetName, coord, rawInput) {
     if (lockedEdit([sheetName])) return; // REUNION BLOQUEADA
+    { const pc = parseCoord(coord); if (pc && totalProHit(sheetName, [pc.row], [pc.col])) return; } // TOTAL PRO
     const sheet = workbook.sheets[sheetName];
     if (!sheet) return;
     pushUndoCells(sheetName, [coord]);
@@ -2809,6 +2837,7 @@
 
   function clearSelectedRange() {
     if (lockedEdit()) return; // REUNION BLOQUEADA
+    if (totalProHitBounds(getSelectionBounds())) return; // TOTAL PRO
     { const b = getSelectionBounds(); if (waitWhileUpdating((b.maxRow - b.minRow + 1) * (b.maxCol - b.minCol + 1))) return; }
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
@@ -3143,6 +3172,7 @@
     const sheet = workbook.sheets[activeSheet];
     if (!sheet) return;
     if (isCut && lockedEdit()) isCut = false; // REUNION BLOQUEADA: cut becomes copy
+    if (isCut && totalProHitBounds(getSelectionBounds())) isCut = false; // TOTAL PRO: cut becomes copy
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     const grid = [];
     const tsvRows = [];
@@ -3239,6 +3269,7 @@
     const tile = selR.length && selC.length && selR.length % srcRows === 0 && selC.length % srcCols === 0;
     const destRows = tile ? selR : takeShown(bounds.minRow, srcRows, rowShown);
     const destCols = tile ? selC : takeShown(bounds.minCol, srcCols, colShown);
+    if (totalProHit(activeSheet, destRows, destCols)) return; // TOTAL PRO
     const targetRows = destRows.length;
     const targetCols = destCols.length;
     const endR = destRows[targetRows - 1];
@@ -3319,6 +3350,7 @@
     const destRows = fill ? shownRows(bounds.minRow, bounds.maxRow) : takeShown(bounds.minRow, srcRows, rowShown);
     const destCols = fill ? shownCols(bounds.minCol, bounds.maxCol) : takeShown(bounds.minCol, srcCols, colShown);
     if (!destRows.length || !destCols.length) return;
+    if (totalProHit(activeSheet, destRows, destCols)) return; // TOTAL PRO
     const targetRows = destRows.length;
     const targetCols = destCols.length;
 
@@ -3346,6 +3378,7 @@
 
   function fillSelectionDown() {
     if (lockedEdit()) return; // REUNION BLOQUEADA
+    if (totalProHitBounds(getSelectionBounds())) return; // TOTAL PRO
     if (waitWhileUpdating()) return;
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     if (maxRow <= minRow) return;
@@ -3363,6 +3396,7 @@
 
   function fillSelectionRight() {
     if (lockedEdit()) return; // REUNION BLOQUEADA
+    if (totalProHitBounds(getSelectionBounds())) return; // TOTAL PRO
     if (waitWhileUpdating()) return;
     const { minRow, maxRow, minCol, maxCol } = getSelectionBounds();
     if (maxCol <= minCol) return;
@@ -3471,6 +3505,7 @@
 
   function startInlineEdit(coord, initialText = null) {
     if (lockedEdit()) return; // REUNION BLOQUEADA
+    { const pc = parseCoord(coord); if (pc && totalProHit(activeSheet, [pc.row], [pc.col])) return; } // TOTAL PRO
     const td = gridBody.querySelector(`td[data-coord="${coord}"]`);
     if (!td) return;
     closeInlineEditor(false);
@@ -3809,6 +3844,7 @@
     const maxR = Math.max(bounds.maxRow, pHover.row);
     const minC = Math.min(bounds.minCol, pHover.col);
     const maxC = Math.max(bounds.maxCol, pHover.col);
+    if (totalProHit(activeSheet, spanOf(minR, maxR), spanOf(minC, maxC))) return; // TOTAL PRO
 
     if (minR === bounds.minRow && maxR === bounds.maxRow && minC === bounds.minCol && maxC === bounds.maxCol) {
       return;
@@ -4260,6 +4296,7 @@
         e.stopPropagation();
         closeInlineEditor(true);
         if (lockedEdit()) return; // REUNION BLOQUEADA: no fill drag
+        if (totalProHitBounds(getSelectionBounds())) return; // TOTAL PRO: no fill drag from it
         isDraggingFillHandle = true;
         fillPreviewTargetCoord = null;
         return;
