@@ -1033,6 +1033,16 @@
     }
     return cols.length ? cols : null;
   }
+  // same, remembered per sheet while drawing (checked again only if row 4 of that column changed)
+  const totalProCache = new WeakMap();
+  function totalProColsFast(sheetName, sh) {
+    if (WB_KEY !== 'cosecha' || !sh) return [];
+    const hit = totalProCache.get(sh);
+    if (hit && hit.name === sheetName && hit.cols.every(c => /^TOTAL\s*PRO$/i.test(String((sh.cells[`${indexToCol(c)}4`] || {}).v ?? '').trim()))) return hit.cols;
+    const cols = totalProCols(sheetName) || [];
+    totalProCache.set(sh, { name: sheetName, cols });
+    return cols;
+  }
   const spanOf = (a, b) => Array.from({ length: Math.max(0, b - a + 1) }, (_, i) => a + i);
   // true (and a notice) when the target rows x cols touch TOTAL PRO
   function totalProHit(sheetName, rows, cols, quiet = false) {
@@ -2097,6 +2107,11 @@
       // Plan de cosecha: Flor in light red while its combination is not homologated (homolog.js)
       const hm = window.MauriHomolog && window.MauriHomolog.cellStyle(activeSheet, r, colStr, sheet);
       if (hm) cond = { ...(cond || {}), ...hm };
+      // Plan de cosecha: TOTAL PRO in light blue when it has a number (days captured with +); not its column total
+      if (r >= 5 && cellObj && typeof cellObj.v === 'number' && cellObj.v !== 0 && totalProColsFast(activeSheet, sheet).includes(c)
+        && !(cellObj.f && new RegExp(`SUM\\(\\$?${colStr}\\$?\\d+:\\$?${colStr}\\$?\\d+\\)`, 'i').test(cellObj.f))) {
+        cond = { ...(cond || {}), bg: '#dbeafe' };
+      }
       // Requerimiento Vs Proyeccion: highlight negative pivot values only in
       // the Weeks x FechaProduccion table. Keep the warning local to the cell.
       if (
