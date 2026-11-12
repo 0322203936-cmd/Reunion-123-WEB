@@ -3760,6 +3760,26 @@
     }
 
     sheet.maxRow = Math.max(sheet.maxRow || 100, maxR + count + 20);
+    // Plan de cosecha: the new rows get TOTAL PRO and DIF (row 4 titles) like the row above (or below), with format
+    const tp = totalProCols(activeSheet);
+    if (tp && insertRow >= 5) {
+      const cols = [...tp];
+      for (let c = 1; c <= (sheet.maxCol || 60); c++) {
+        if (/^DIF$/i.test(String((sheet.cells[`${indexToCol(c)}4`] || {}).v ?? '').trim())) cols.push(c);
+      }
+      for (const c of cols) {
+        const col = indexToCol(c);
+        const tplRow = [insertRow - 1, insertRow + count].find(r => r >= 5 && sheet.cells[`${col}${r}`] && sheet.cells[`${col}${r}`].f
+          && !new RegExp(`SUM\\(\\$?${col}\\$?\\d+:`, 'i').test(sheet.cells[`${col}${r}`].f)); // not the column total
+        if (!tplRow) continue;
+        const tpl = sheet.cells[`${col}${tplRow}`];
+        for (let r = insertRow; r < insertRow + count; r++) {
+          const cell = { f: shiftFormula(tpl.f, r - tplRow, 0) };
+          if (tpl.s) cell.s = JSON.parse(JSON.stringify(tpl.s));
+          sheet.cells[`${col}${r}`] = cell;
+        }
+      }
+    }
     engine.recalculateAll();
     renderSheet();
     selectCell(`A${insertRow}`, false, false); // keep the view where it is
