@@ -191,12 +191,43 @@ function missingFlowers(reunionBook, cosechaBook) {
 
 // ---------------------------------------------------------------- add one flower
 // returns { row, touched: Set(sheet names) } or null
+// titles with subtitles (SNAPDRAGON -> SNAPDRAGON X 10 / SNAPDRAGON X 5): the flower goes into the subtitle whose
+// name ends like it (SNAPDRAGON VIOLET X5 -> SNAPDRAGON X 5), never into the top title as one more "child".
+// null when it can't tell (no subtitle or more than one fits and there are no plain flowers): nothing is added.
+const warnedFlowers = new Set();
+function blockFor(layout, cells, flower) {
+  const compact = v => norm(v).replace(/\s+/g, '');
+  const isTitleRow = r => { const t = layout.titles.get(norm((cells[`A${r}`] || {}).v)); return !!t && t.row === r; };
+  let title = layout.titles.get(flower.group);
+  for (let depth = 0; title && depth < 4; depth++) {
+    const subs = title.children.filter(isTitleRow);
+    if (!subs.length) return title;
+    const plain = title.children.filter(r => !isTitleRow(r));
+    const head = compact((cells[`A${title.row}`] || {}).v);
+    const name = compact(flower.name);
+    const fits = subs.filter(r => {
+      const sub = compact((cells[`A${r}`] || {}).v);
+      const suffix = sub.startsWith(head) ? sub.slice(head.length) : sub;
+      return suffix && name.endsWith(suffix);
+    });
+    if (fits.length === 1) { title = layout.titles.get(norm((cells[`A${fits[0]}`] || {}).v)); continue; }
+    if (!fits.length && plain.length) return title; // a plain flower of the top title
+    if (!warnedFlowers.has(flower.name)) {
+      warnedFlowers.add(flower.name);
+      console.warn(` Reunion: "${flower.name}" no se agregó sola: no se sabe en qué subtítulo de ${flower.group} va`);
+    }
+    return null;
+  }
+  return title || null;
+}
+
 function addFlower(reunionBook, flower) {
   const sheet = reunionBook.sheets[SHEET];
   const layout = reunionLayout(sheet);
-  const title = layout.titles.get(flower.group);
-  if (!title || layout.names.has(norm(flower.name))) return null;
+  if (!layout.titles.get(flower.group) || layout.names.has(norm(flower.name))) return null;
   const cells = sheet.cells;
+  const title = blockFor(layout, cells, flower);
+  if (!title) return null;
   const at = Math.max(...title.children) + 1;
   // the sibling to copy: a flower of the block whose Req looks for its color (PegarData column U), else the last one
   const usesColor = r => Object.entries(cells).some(([coord, c]) => c.f && new RegExp(`^[A-Z]+${r}$`).test(coord) && /PegarData!\$?U/i.test(c.f));
@@ -233,7 +264,7 @@ function addFlower(reunionBook, flower) {
     if (!m || Number(m[2]) !== titleRow || !cell.f || !isPlainSum(cell.f, m[1])) continue;
     const refRows = refsOf(cell.f).map(x => x.row);
     if (!refRows.some(r => r > titleRow && r < at)) continue; // not a sum of this block
-    const range = /^(=\s*SUM\(\s*\$?[A-Z]+\$?\d+:\$?[A-Z]+\$?)(\d+)(\s*\)\s*)$/i.exec(cell.f);
+    const range = /^(=\s*\+?\s*SUM\(\s*\$?[A-Z]+\$?\d+:\$?[A-Z]+\$?)(\d+)(\s*\)\s*)$/i.exec(cell.f); // =SUM(E4:E9) or =+SUM(E4:E9)
     if (range && Number(range[2]) === at - 1) cell.f = `${range[1]}${at}${range[3]}`;
     else if (/\)\s*$/.test(cell.f)) cell.f = cell.f.replace(/\)\s*$/, `+${m[1]}${at})`);
     else cell.f = `${cell.f}+${m[1]}${at}`;
