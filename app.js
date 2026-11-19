@@ -2024,6 +2024,25 @@
     btn.querySelector('.lbl').textContent = `Ocultar flores en 0 (${count})`;
   }
 
+  // Requerimiento Vs Proyeccion, the 3 "Weeks x FechaProduccion" sheets: the flower column and the week
+  // header rows of their pivot stay fixed while scrolling (only on screen; nothing is saved in the sheet,
+  // and a freeze the sheet already has wins). Rows: down to the last header row of the table
+  // (one per column field, plus one for the values' names when there are several), columns: the
+  // row labels (A in compact layout)
+  const PIVOT_FREEZE_SHEETS = new Set(['Weeks x FechaProduccion', 'Weeks x FechaProduccion Dias', 'Weeks x FechaProduccion Orders']);
+  function pivotHeaderFreeze(sheetName) {
+    if (!PIVOT_FREEZE_SHEETS.has(sheetName)) return null;
+    const p = (workbook.pivots || []).find(pv => pv.sheet === sheetName);
+    const m = p && /^([A-Z]+)(\d+)/.exec(String(p.location || ''));
+    if (!m) return null;
+    const colFields = (p.cols || []).length;
+    const valuesInRows = (p.rows || []).includes('__values') && p.layout === 'compact';
+    const multiValues = (p.values || []).length > 1 && !valuesInRows;
+    const rows = Number(m[2]) + colFields + (multiValues && colFields ? 1 : 0);
+    const cols = colToIndex(m[1]) - 1 + (p.layout === 'compact' ? 1 : Math.max(1, (p.rows || []).length));
+    return { rows, cols };
+  }
+
   // keepRows: the rows already built stay cached (refreshValues decides which ones to drop)
   function computeLayout(sheet, keepRows = false) {
     const hiddenRows = new Set([...(sheet.hiddenRows || []), ...(sheet.filterHiddenRows || [])]);
@@ -2057,8 +2076,9 @@
       if (window.MauriReq) colPx[c] = Math.max(colPx[c], window.MauriReq.minColPx(activeSheet, sheet, c));
       left += colPx[c];
     }
-    const fr = sheet.freeze ? sheet.freeze.rows || 0 : 0;
-    const fc = sheet.freeze ? sheet.freeze.cols || 0 : 0;
+    const pinned = (sheet.freeze && (sheet.freeze.rows || sheet.freeze.cols)) ? null : pivotHeaderFreeze(activeSheet);
+    const fr = pinned ? pinned.rows : sheet.freeze ? sheet.freeze.rows || 0 : 0;
+    const fc = pinned ? pinned.cols : sheet.freeze ? sheet.freeze.cols || 0 : 0;
     const colIdx = new Map(visCols.map((c, i) => [c, i]));
     const rowIdx = new Map(visRows.map((r, i) => [r, i]));
     const nFrozenCols = visCols.filter(c => c <= fc).length;
