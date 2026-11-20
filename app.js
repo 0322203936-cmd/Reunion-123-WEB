@@ -2043,6 +2043,42 @@
     return { rows, cols };
   }
 
+  // on those same sheets the row-label column (A) takes the width of its longest visible text
+  // (flowers, and their colors when a + is open) instead of the wide width saved from Excel.
+  // Only on screen; the saved width is not changed
+  let measureCtx = null;
+  function textPx(text, style, baseFont) {
+    if (!measureCtx) measureCtx = document.createElement('canvas').getContext('2d');
+    const size = style && style.fontSize ? `${Math.max(6, Math.min(72, Number(style.fontSize) || 11))}pt` : baseFont.size;
+    const family = style && style.fontFamily && FONT_FAMILY_WHITELIST.has(style.fontFamily) ? `'${style.fontFamily}',sans-serif` : baseFont.family;
+    measureCtx.font = `${style && style.italic ? 'italic ' : ''}${style && style.bold ? 700 : baseFont.weight} ${size} ${family}`;
+    return measureCtx.measureText(text).width;
+  }
+  function pivotLabelColPx(sheet, sheetName, hiddenRows) {
+    if (!PIVOT_FREEZE_SHEETS.has(sheetName)) return null;
+    const p = (workbook.pivots || []).find(pv => pv.sheet === sheetName);
+    const m = p && p.layout === 'compact' && /^([A-Z]+)(\d+)/.exec(String(p.location || ''));
+    if (!m) return null;
+    const col = colToIndex(m[1]);
+    const gridEl = document.getElementById('excelGrid');
+    const cs = gridEl ? getComputedStyle(gridEl) : null;
+    const baseFont = { size: cs ? cs.fontSize : '13px', family: cs ? cs.fontFamily : 'sans-serif', weight: cs ? cs.fontWeight : 400 };
+    // the Corte Diario / Corte Semanal buttons sit in this column too
+    measureCtx = measureCtx || document.createElement('canvas').getContext('2d');
+    measureCtx.font = `600 11px ${baseFont.family}`;
+    let px = measureCtx.measureText('Corte Diario').width + measureCtx.measureText('Corte Semanal').width + 2 * 18 + 4;
+    for (let r = 1; r <= sheet.maxRow; r++) {
+      if (hiddenRows.has(r)) continue;
+      const text = cellText(sheet, r, col);
+      if (!text) continue;
+      const style = styleAt(sheet, r, col);
+      const indent = style && style.indent ? Math.min(15, Number(style.indent) || 0) * 12 : 0;
+      // + / - (16px) or the filter arrow (20px) beside the text
+      px = Math.max(px, textPx(text, style, baseFont) + indent + 22);
+    }
+    return Math.ceil(px + 12);
+  }
+
   // keepRows: the rows already built stay cached (refreshValues decides which ones to drop)
   function computeLayout(sheet, keepRows = false) {
     const hiddenRows = new Set([...(sheet.hiddenRows || []), ...(sheet.filterHiddenRows || [])]);
@@ -2067,12 +2103,14 @@
     for (let c = 1; c <= sheet.maxCol; c++) colOrder.push(c);
     // expandable day columns (weeks.js) are shown next to their week, not at their real position
     if (window.MauriWeeks) colOrder = window.MauriWeeks.orderColumns(sheet, colOrder);
+    const labelPx = pivotLabelColPx(sheet, activeSheet, hiddenRows);
+    const labelCol = labelPx ? colToIndex(/^([A-Z]+)/.exec((workbook.pivots || []).find(pv => pv.sheet === activeSheet).location)[1]) : 0;
     for (const c of colOrder) {
       const colStr = indexToCol(c);
       if (hiddenCols.has(colStr)) continue;
       visCols.push(c);
       colLeft[c] = left;
-      colPx[c] = colWidthPx(sheet, colStr);
+      colPx[c] = c === labelCol ? Math.min(colWidthPx(sheet, colStr), labelPx) : colWidthPx(sheet, colStr);
       if (window.MauriReq) colPx[c] = Math.max(colPx[c], window.MauriReq.minColPx(activeSheet, sheet, c));
       left += colPx[c];
     }
