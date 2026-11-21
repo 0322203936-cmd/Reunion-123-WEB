@@ -683,12 +683,19 @@ async function syncAppend(reunion, cosecha) {
   for (const res of corClients) res.write(msg);
 }
 
+// the three POSCO buttons (Data, Inventario, Inventario Viernes) take their copy of Reunion only when
+// their report is downloaded and save it right away (commit), not the copy they had when they started:
+// if two of them run at the same time (or a page saves meanwhile), the last one no longer puts the old
+// book back over what the other saved
+async function latestReunion() {
+  const loaded = await loadWorkbook('reunion');
+  return () => caches.reunion || loaded;
+}
+
 async function runActualizarDataInBackground() {
   try {
     console.log(' Iniciando Actualizar Data local: POSCO -> PegarData...');
-    const currentWorkbook = await loadWorkbook('reunion');
-    const result = await runActualizarData(currentWorkbook);
-    await saveWholeWorkbook('reunion', result.workbook);
+    const result = await runActualizarData(await latestReunion(), { commit: wb => saveWholeWorkbook('reunion', wb) });
     scheduleCorSync();
     actualizarDataState.status = 'succeeded';
     actualizarDataState.finishedAt = new Date().toISOString();
@@ -715,10 +722,13 @@ async function runActualizarInventarioViernesInBackground() {
   const state = actualizarInventarioViernesState;
   try {
     console.log(' Iniciando Actualizar Inventario Viernes: POSCO -> Inventario Viernes (solo Append)...');
-    const result = await runActualizarInventarioViernes(await loadWorkbook('reunion'));
-    // its week (Sat..Fri) is the week of the day it ran, like Actualizar Inventario
-    result.workbook.sheets[FRIDAY_SHEET_NAME].updatedAt = new Date().toISOString();
-    await saveWholeWorkbook('reunion', result.workbook);
+    const result = await runActualizarInventarioViernes(await latestReunion(), {
+      commit: wb => {
+        // its week (Sat..Fri) is the week of the day it ran, like Actualizar Inventario
+        wb.sheets[FRIDAY_SHEET_NAME].updatedAt = new Date().toISOString();
+        return saveWholeWorkbook('reunion', wb);
+      }
+    });
     scheduleCorSync(); // marks the Append to be rebuilt
     Object.assign(state, { status: 'succeeded', finishedAt: new Date().toISOString(), rows: result.rows, lastRow: result.lastRow, error: null });
     console.log(` Actualizar Inventario Viernes completado: ${result.rows} filas.`);
@@ -733,11 +743,13 @@ async function runActualizarInventarioViernesInBackground() {
 async function runActualizarInventarioInBackground() {
   try {
     console.log(' Iniciando Actualizar Inventario local: POSCO -> Inventario...');
-    const currentWorkbook = await loadWorkbook('reunion');
-    const result = await runActualizarInventario(currentWorkbook);
-    // the day the inventory was taken: its week (Sat..Fri) is the week the stock counts in Requerimiento Vs Proyeccion
-    if (result.workbook.sheets && result.workbook.sheets.Inventario) result.workbook.sheets.Inventario.updatedAt = new Date().toISOString();
-    await saveWholeWorkbook('reunion', result.workbook);
+    const result = await runActualizarInventario(await latestReunion(), {
+      commit: wb => {
+        // the day the inventory was taken: its week (Sat..Fri) is the week the stock counts in Requerimiento Vs Proyeccion
+        if (wb.sheets && wb.sheets.Inventario) wb.sheets.Inventario.updatedAt = new Date().toISOString();
+        return saveWholeWorkbook('reunion', wb);
+      }
+    });
     scheduleCorSync();
     actualizarInventarioState.status = 'succeeded';
     actualizarInventarioState.finishedAt = new Date().toISOString();

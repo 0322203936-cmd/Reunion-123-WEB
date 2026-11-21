@@ -368,12 +368,16 @@ function applyToWorkbook(workbook, rows) {
   return { rows: Math.max(newLastRow - 1, 0), lastRow: newLastRow };
 }
 
-async function runActualizarData(workbook) {
+// workbook: the book, or a function that gives the book as it is right now. With the function and
+// commit, the copy is taken only once the report is downloaded and commit (the save) starts right
+// after, with nothing in between: what other buttons or pages saved during the download is kept
+async function runActualizarData(workbook, { commit } = {}) {
   const report = await downloadPoscoReport();
   try {
     const rows = formatReport(report.path);
-    const updatedWorkbook = clone(workbook);
+    const updatedWorkbook = clone(typeof workbook === 'function' ? workbook() : workbook);
     const stats = applyToWorkbook(updatedWorkbook, rows);
+    if (commit) await commit(updatedWorkbook);
     return { workbook: updatedWorkbook, ...stats, dateRange: { start: report.start, end: report.end } };
   } finally {
     fs.rmSync(report.temporaryDirectory, { recursive: true, force: true });

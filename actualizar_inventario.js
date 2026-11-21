@@ -183,12 +183,16 @@ function applyToInventory(workbook, rows, sheetName = SHEET_NAME) {
   return { rows: rows.length, lastRow: newLastRow };
 }
 
-async function runActualizarInventario(workbook) {
+// workbook: the book, or a function that gives the book as it is right now. With the function and
+// commit, the copy is taken only once the report is downloaded and commit (the save) starts right
+// after, with nothing in between: what other buttons or pages saved during the download is kept
+async function runActualizarInventario(workbook, { commit } = {}) {
   const report = await downloadInventoryReport();
   try {
     const rows = readInventoryRows(report.path);
-    const updatedWorkbook = clone(workbook);
+    const updatedWorkbook = clone(typeof workbook === 'function' ? workbook() : workbook);
     const stats = applyToInventory(updatedWorkbook, rows);
+    if (commit) await commit(updatedWorkbook);
     return { workbook: updatedWorkbook, ...stats };
   } finally {
     fs.rmSync(report.temporaryDirectory, { recursive: true, force: true });
@@ -208,13 +212,14 @@ function fridaySheet(workbook) {
   return workbook.sheets[FRIDAY_SHEET_NAME];
 }
 
-async function runActualizarInventarioViernes(workbook) {
+async function runActualizarInventarioViernes(workbook, { commit } = {}) {
   const report = await downloadInventoryReport();
   try {
     const rows = readInventoryRows(report.path);
-    const updatedWorkbook = clone(workbook);
+    const updatedWorkbook = clone(typeof workbook === 'function' ? workbook() : workbook);
     fridaySheet(updatedWorkbook);
     const stats = applyToInventory(updatedWorkbook, rows, FRIDAY_SHEET_NAME);
+    if (commit) await commit(updatedWorkbook);
     return { workbook: updatedWorkbook, ...stats };
   } finally {
     fs.rmSync(report.temporaryDirectory, { recursive: true, force: true });
