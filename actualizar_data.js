@@ -164,6 +164,17 @@ async function dateInput(page, label, fallbackIndex) {
   throw new Error(`No se encontró el campo ${label}.`);
 }
 
+async function waitForOrdersScreen(page) {
+  const deadline = Date.now() + Number(process.env.POSCO_ORDERS_EXTRA_WAIT_MS || 120000);
+  do {
+    const fields = page.locator('.input-group:has-text("Load Date Menor") input, input[type="date"]');
+    if (await fields.count() && await fields.first().isVisible().catch(() => false)) return;
+    await page.waitForTimeout(5000);
+  } while (Date.now() < deadline);
+  await savePoscoDiagnostics(page, []);
+  throw new Error('La pantalla de Ordenes de POSCO no terminó de cargar.');
+}
+
 async function fillDateInput(locator, value) {
   const type = String(await locator.getAttribute('type') || 'text').toLowerCase();
   await locator.fill(type === 'date' ? `${value.getFullYear()}-${String(value.getMonth() + 1).padStart(2, '0')}-${String(value.getDate()).padStart(2, '0')}` : poscoDate(value));
@@ -242,7 +253,10 @@ async function downloadPoscoReport() {
     await page.waitForTimeout(800);
     await selectOrders(page);
     await page.waitForURL('**/#/list-orden-detalle', { timeout: 30000 }).catch(() => {});
-    await page.waitForTimeout(3000);
+    // POSCO tarda en cargar la pantalla de Ordenes: se esperan 2 minutos (POSCO_ORDERS_WAIT_MS) y luego,
+    // si el campo de fecha todavia no aparece, hasta 2 minutos mas antes de darse por vencido
+    await page.waitForTimeout(Number(process.env.POSCO_ORDERS_WAIT_MS || 120000));
+    await waitForOrdersScreen(page);
 
     const { start, end } = dateRange();
     await fillDateInput(await dateInput(page, 'Load Date Menor', 0), start);
