@@ -170,17 +170,39 @@ async function fillDateInput(locator, value) {
   await locator.press('Tab');
 }
 
+// The ACTIVO status filter only appears once POSCO finished loading the orders, and the load keeps getting
+// slower: look for it repeatedly (up to POSCO_ACTIVE_WAIT_MS, 3 min by default) and accept "Activo"/"ACTIVO".
+// If it never shows up, save a screenshot and the options that were there (logs/posco-*) to see what changed.
 async function selectActive(page) {
-  const selects = page.locator('select');
-  for (let index = 0; index < await selects.count(); index += 1) {
-    const select = selects.nth(index);
-    const options = await select.locator('option').allTextContents();
-    if (options.map(item => item.trim()).includes('ACTIVO')) {
-      await select.selectOption({ label: 'ACTIVO' });
-      return;
+  const deadline = Date.now() + Number(process.env.POSCO_ACTIVE_WAIT_MS || 180000);
+  const seen = [];
+  do {
+    seen.length = 0;
+    const selects = page.locator('select');
+    for (let index = 0; index < await selects.count(); index += 1) {
+      const select = selects.nth(index);
+      const options = (await select.locator('option').allTextContents()).map(item => item.trim());
+      seen.push(options);
+      const active = options.find(item => item.toUpperCase() === 'ACTIVO');
+      if (active) {
+        await select.selectOption({ label: active });
+        return;
+      }
     }
-  }
+    await page.waitForTimeout(5000);
+  } while (Date.now() < deadline);
+  await savePoscoDiagnostics(page, seen);
   throw new Error('No se encontró el filtro ACTIVO de POSCO.');
+}
+
+async function savePoscoDiagnostics(page, selectOptions) {
+  try {
+    const dir = path.join(__dirname, 'logs');
+    fs.mkdirSync(dir, { recursive: true });
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    await page.screenshot({ path: path.join(dir, `posco-${stamp}.png`), fullPage: true });
+    fs.writeFileSync(path.join(dir, `posco-${stamp}.json`), JSON.stringify({ url: page.url(), selects: selectOptions }, null, 2));
+  } catch { /* the diagnostics must never hide the real error */ }
 }
 
 async function clickSearch(page) {
