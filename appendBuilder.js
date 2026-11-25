@@ -5,8 +5,10 @@
 //     tab when the last one starts with next week (same rule as the Cor, cosechaCor.js): one row per captured day,
 //     or per week when that week has no days captured. Distribuidor / Cust Name / No. = "CORTE"
 //     ("COMPRA" for the rows whose Finca is COMPRA)
-//   * Semana Prod / Semana Load = the week of Plan de cosecha (Sat..Fri, = WEEKNUM(date + 2, 21); e.g. 2027:
+//   * Semana Prod = the week of Plan de cosecha (Sat..Fri, = WEEKNUM(date + 2, 21); e.g. 2027:
 //     Fri 01-ene is still week 53, week 1 = Sat 02-ene..Fri 08-ene),
+//     Semana Load = the ISO week of the Load Date (Mon..Sun, = WEEKNUM(date, 21)), the week the customers
+//     (Galleria) use; pivot "Table Galleria" (server.js),
 //     Status orden = ESTIMADO when No. contains "Est", Flor General = Flag!J:K lookup ("*FLOR*").
 //     (dif = Total Tallos 1 - Total de tallos 2 is a calculated field of the pivot tables, as in the Excel)
 // ============================================================================
@@ -37,6 +39,8 @@ function planWeek(serial) {
   const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
   return Math.floor((d.getTime() - jan1) / 86400000 / 7) + 1;
 }
+// ISO week (Monday..Sunday) = Excel WEEKNUM(date, 21): the Load Date week of the customers
+function isoWeek(serial) { return isNum(serial) ? planWeek(serial - 2) : null; }
 
 // Flag!J:K: the first "Palabra Clave" (J) that contains the flower name gives its "Resumen" (K).
 // Requerimiento Vs Proyeccion has its own Flag (from its Excel); Reunion's is the fallback.
@@ -137,7 +141,7 @@ function requerimientoRows(reunionBook, flagOf, products) {
     row[COL['Semana Prod']] = planWeek(v('O', r));
     row[COL['Status orden (Formula)']] = /est/i.test(text(v('C', r))) ? 'ESTIMADO' : 'FIRME';
     row[COL['Flor General (Formula)']] = flagOf(flor);
-    row[COL['Semana Load']] = planWeek(v('H', r));
+    row[COL['Semana Load']] = isoWeek(v('H', r));
     row[COL['Total de tallos 2']] = num(v('N', r));
     // Flor 123 of the order, as Reunion's Req finds it: pack name (FLOR Color X TxR2, TxR2 = txr_orden),
     // then FLOR Color, then FLOR
@@ -327,13 +331,15 @@ const DATE_COLS = new Set([COL['Load Date'], COL['Fecha Produccion']]);
 const DEFAULT_FORMULAS = {
   'Semana Prod': '=WEEKNUM(P{r}+2,21)',
   'Status orden (Formula)': '=IF(ISNUMBER(SEARCH("Est***",D{r})),"ESTIMADO","FIRME")',
-  'Semana Load': '=WEEKNUM(I{r}+2,21)'
+  'Semana Load': '=WEEKNUM(I{r},21)'
 };
-// the previous defaults (Excel weeks, WEEKNUM 16): not an edit by hand, they become the new default
-const OLD_DEFAULTS = { 'Semana Prod': '=WEEKNUM(P{r},16)', 'Semana Load': '=WEEKNUM(I{r},16)' };
+// the previous defaults (Excel weeks WEEKNUM 16; Semana Load Sat..Fri until 2026-11-25): not an edit by hand,
+// they become the new default
+const OLD_DEFAULTS = { 'Semana Prod': ['=WEEKNUM(P{r},16)'], 'Semana Load': ['=WEEKNUM(I{r},16)', '=WEEKNUM(I{r}+2,21)'] };
+const isOldDefault = (h, f) => (OLD_DEFAULTS[h] || []).includes(f);
 function formulaTemplates(prevSheet) {
   const out = { ...DEFAULT_FORMULAS, ...((prevSheet && prevSheet.formulaTemplates) || {}) };
-  for (const h of Object.keys(OLD_DEFAULTS)) if (out[h] === OLD_DEFAULTS[h]) out[h] = DEFAULT_FORMULAS[h];
+  for (const h of Object.keys(OLD_DEFAULTS)) if (isOldDefault(h, out[h])) out[h] = DEFAULT_FORMULAS[h];
   if (!prevSheet || !prevSheet.cells) return out;
   for (const header of Object.keys(DEFAULT_FORMULAS)) {
     const col = indexToCol(COL[header] + 1);
@@ -343,7 +349,7 @@ function formulaTemplates(prevSheet) {
       if (!m || !cell.f) continue;
       const r = m[1];
       const tmpl = cell.f.replace(new RegExp(`(\\$?[A-Z]{1,3})${r}(?!\\d)`, 'g'), '$1{r}');
-      if (tmpl === OLD_DEFAULTS[header]) break; // the old default, not an edit
+      if (isOldDefault(header, tmpl)) break; // an old default, not an edit
       if (tmpl !== out[header]) { out[header] = tmpl; break; } // edited by hand
     }
   }
@@ -420,4 +426,4 @@ function buildCorteRows(reunionBook, cosechaBook, rvpBook) {
   return rows;
 }
 
-module.exports = { buildAppendSheet, buildAppendRows, buildCorteRows, HEADERS, planWeek };
+module.exports = { buildAppendSheet, buildAppendRows, buildCorteRows, HEADERS, planWeek, isoWeek };

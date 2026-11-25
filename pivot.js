@@ -212,9 +212,11 @@
     const jan1 = Date.UTC(d.getUTCFullYear(), 0, 1);
     return Math.floor((d - jan1) / 86400000 / 7) + 1;
   }
-  function currentWeek() {
+  // current week: of Plan de cosecha (Sat..Fri), or ISO (Mon..Sun) for a pivot whose weekFrom says iso (Table Galleria)
+  function currentWeek(p) {
     const now = new Date();
-    return planWeek(Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(1899, 11, 30)) / 86400000));
+    const serial = Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - Date.UTC(1899, 11, 30)) / 86400000);
+    return planWeek(p && p.weekFrom && p.weekFrom.iso ? serial - 2 : serial);
   }
 
   // ---- "Corte Diario" / "Corte Semanal": buttons above each pivot. Personal (this computer only, like
@@ -311,7 +313,7 @@
     if (p.weekFrom && p.weekFrom.field in rec) {
       // only the current week and the next ones (small numbers right after week 52/53 belong to next year)
       const w = Number(rec[p.weekFrom.field]);
-      const cw = currentWeek();
+      const cw = currentWeek(p);
       if (Number.isFinite(w) && w < cw && cw - w < 26) return false;
     }
     for (const [field, list] of Object.entries(p.hidden || {})) {
@@ -338,7 +340,7 @@
   function itemSorter(p, field) {
     const dir = (p.sort || {})[field];
     if (p.weekFrom && p.weekFrom.field === field && (!dir || dir === 'ascending' || dir === 'descending') && !(p.order || {})[field]) {
-      const cw = currentWeek();
+      const cw = currentWeek(p);
       const cmp = (a, b) => compareItems(weekRank(a.value, cw), weekRank(b.value, cw));
       return dir === 'descending' ? (a, b) => cmp(b, a) : cmp;
     }

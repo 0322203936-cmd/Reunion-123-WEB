@@ -538,6 +538,42 @@ async function ensureProyReqSheet(rvp) {
   broadcastBook('rvp', 'live', { deltas: {}, sheets: Object.keys(sheets), deleted: [], meta: { workbookName, sheetOrder, tables, pivots: rvp.pivots } });
 }
 
+// Requerimiento Vs Proyeccion: sheet "Table Galleria" next to "Weeks x FechaProduccion Orders": the requirement
+// of Galleria Farms by Semana Load (ISO week of the Load Date, Monday..Sunday: the week Galleria's system uses),
+// to compare with Galleria's export. Created once by the server (put back like the Proyeccion-Requerimiento ones).
+const GALLERIA_SHEET = 'Table Galleria';
+function galleriaPivot() {
+  return {
+    id: 'pv_table_galleria', name: GALLERIA_SHEET, sheet: GALLERIA_SHEET, source: { sheet: 'Append', ref: 'auto' },
+    anchor: 'A1', location: 'A3:A3', layout: 'compact', hidden: {},
+    rows: ['Flor General (Formula)', 'Cust Name', 'Descripcion'], cols: ['Semana Load'],
+    collapseAll: { 'Flor General (Formula)': true, 'Cust Name': true }, expanded: {},
+    values: [{ field: 'Total de tallos 2', agg: 'sum', name: 'Suma de Total de tallos 2' }],
+    filters: [{ field: 'Distribuidor', selected: ['Galleria Farms '] }],
+    sort: { 'Flor General (Formula)': 'ascending' }, grandRows: true, grandCols: true, weekFrom: { field: 'Semana Load', iso: true }
+  };
+}
+async function ensureGalleriaSheet(rvp) {
+  const pivots = Array.isArray(rvp.pivots) ? rvp.pivots : [];
+  const hasPivot = pivots.some(p => p.id === 'pv_table_galleria');
+  const hasSheet = !!rvp.sheets[GALLERIA_SHEET];
+  if (hasPivot && hasSheet) return;
+  const meta = {};
+  const sheets = {};
+  if (!hasPivot) meta.pivots = [...pivots, galleriaPivot()];
+  if (!hasSheet) {
+    sheets[GALLERIA_SHEET] = { maxRow: 200, maxCol: 30, colWidths: { A: 34 }, merges: [], cells: {} };
+    const order = (rvp.sheetOrder || []).filter(n => n !== GALLERIA_SHEET);
+    const at = order.indexOf('Weeks x FechaProduccion Orders');
+    if (at >= 0) order.splice(at + 1, 0, GALLERIA_SHEET); else order.push(GALLERIA_SHEET);
+    meta.sheetOrder = order;
+  }
+  await patchWorkbook('rvp', { meta, sheets });
+  console.log(` ${GALLERIA_SHEET}: ${hasSheet ? '' : 'hoja creada; '}${hasPivot ? '' : 'tabla dinámica agregada'}`);
+  const { workbookName, sheetOrder, tables } = rvp;
+  broadcastBook('rvp', 'live', { deltas: {}, sheets: Object.keys(sheets), deleted: [], meta: { workbookName, sheetOrder, tables, pivots: rvp.pivots } });
+}
+
 // Finca COMPRA of Plan de cosecha arrives as Distribuidor "COMPRA" (appendBuilder.js). Pivots whose
 // Distribuidor filter picks CORTE also get COMPRA, once (compraV1): if someone later unchecks COMPRA,
 // it stays unchecked. Only the filter list changes; no data is touched.
@@ -665,6 +701,7 @@ let appendSig = null;
 async function syncAppend(reunion, cosecha) {
   const rvp = await loadWorkbook('rvp');
   await ensureProyReqSheet(rvp);
+  await ensureGalleriaSheet(rvp);
   const { sheet } = AppendBuilder.buildAppendSheet(reunion, cosecha, rvp);
   const md5 = obj => crypto.createHash('md5').update(JSON.stringify(obj)).digest('hex');
   const sig = md5(sheet.cells);

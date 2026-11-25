@@ -2029,7 +2029,7 @@
   // and a freeze the sheet already has wins). Rows: down to the last header row of the table
   // (one per column field, plus one for the values' names when there are several), columns: the
   // row labels (A in compact layout)
-  const PIVOT_FREEZE_SHEETS = new Set(['Weeks x FechaProduccion', 'Weeks x FechaProduccion Dias', 'Weeks x FechaProduccion Orders']);
+  const PIVOT_FREEZE_SHEETS = new Set(['Weeks x FechaProduccion', 'Weeks x FechaProduccion Dias', 'Weeks x FechaProduccion Orders', 'Table Galleria']);
   function pivotHeaderFreeze(sheetName) {
     if (!PIVOT_FREEZE_SHEETS.has(sheetName)) return null;
     const p = (workbook.pivots || []).find(pv => pv.sheet === sheetName);
