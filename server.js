@@ -539,7 +539,7 @@ async function ensureProyReqSheet(rvp) {
 }
 
 // Requerimiento Vs Proyeccion: sheet "Table Galleria" next to "Weeks x FechaProduccion Orders": the requirement
-// of Galleria Farms by Semana Load (ISO week of the Load Date, Monday..Sunday: the week Galleria's system uses),
+// of every customer (Distribuidor filter, each computer picks e.g. Galleria Farms) by Semana Load (ISO week of the Load Date, Monday..Sunday: the week Galleria's system uses),
 // to compare with Galleria's export. Created once by the server (put back like the Proyeccion-Requerimiento ones).
 const GALLERIA_SHEET = 'Table Galleria';
 function galleriaPivot() {
@@ -549,7 +549,8 @@ function galleriaPivot() {
     rows: ['Flor General (Formula)', 'Cust Name', 'Descripcion'], cols: ['Semana Load'],
     collapseAll: { 'Flor General (Formula)': true, 'Cust Name': true }, expanded: {},
     values: [{ field: 'Total de tallos 2', agg: 'sum', name: 'Suma de Total de tallos 2' }],
-    filters: [{ field: 'Distribuidor', selected: ['Galleria Farms '] }],
+    filters: [{ field: 'Distribuidor', selected: null }], v: 3,
+    include: { STATUS: { values: ['Requerimiento'] } }, // only the orders (the cuts and inventories have no Load Date)
     sort: { 'Flor General (Formula)': 'ascending' }, grandRows: true, grandCols: true, weekFrom: { field: 'Semana Load', iso: true }
   };
 }
@@ -557,10 +558,14 @@ async function ensureGalleriaSheet(rvp) {
   const pivots = Array.isArray(rvp.pivots) ? rvp.pivots : [];
   const hasPivot = pivots.some(p => p.id === 'pv_table_galleria');
   const hasSheet = !!rvp.sheets[GALLERIA_SHEET];
-  if (hasPivot && hasSheet) return;
+  // v1 had the Distribuidor filter fixed on Galleria Farms: v3 takes every customer (once; later choices stay),
+  // only the Requerimiento rows
+  const old = pivots.find(p => p.id === 'pv_table_galleria' && p.v !== 3);
+  if (hasPivot && hasSheet && !old) return;
   const meta = {};
   const sheets = {};
   if (!hasPivot) meta.pivots = [...pivots, galleriaPivot()];
+  else if (old) meta.pivots = pivots.map(p => (p === old ? { ...p, v: 3, include: { STATUS: { values: ['Requerimiento'] } }, filters: [{ field: 'Distribuidor', selected: null }] } : p));
   if (!hasSheet) {
     sheets[GALLERIA_SHEET] = { maxRow: 200, maxCol: 30, colWidths: { A: 34 }, merges: [], cells: {} };
     const order = (rvp.sheetOrder || []).filter(n => n !== GALLERIA_SHEET);
@@ -569,7 +574,7 @@ async function ensureGalleriaSheet(rvp) {
     meta.sheetOrder = order;
   }
   await patchWorkbook('rvp', { meta, sheets });
-  console.log(` ${GALLERIA_SHEET}: ${hasSheet ? '' : 'hoja creada; '}${hasPivot ? '' : 'tabla dinámica agregada'}`);
+  console.log(` ${GALLERIA_SHEET}: ${hasSheet ? '' : 'hoja creada; '}${hasPivot ? (old ? 'filtro Distribuidor: todos' : '') : 'tabla dinámica agregada'}`);
   const { workbookName, sheetOrder, tables } = rvp;
   broadcastBook('rvp', 'live', { deltas: {}, sheets: Object.keys(sheets), deleted: [], meta: { workbookName, sheetOrder, tables, pivots: rvp.pivots } });
 }
