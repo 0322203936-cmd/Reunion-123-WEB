@@ -2180,6 +2180,7 @@
       if (
         activeSheet === 'Weeks x FechaProduccion' &&
         cellObj && typeof cellObj.v === 'number' && cellObj.v < 0 &&
+        !(cellObj.s && cellObj.s.bg === '#fcd5b4') && // orange = covered by the previous week's remanente (pivot.js)
         window.MauriPivot && window.MauriPivot.pivotAt &&
         window.MauriPivot.pivotAt(activeSheet, coord)
       ) {
