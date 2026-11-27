@@ -27,10 +27,10 @@
   const wb = () => App().getWorkbook();
   const pivots = () => (wb().pivots = wb().pivots || []);
 
-  // Remanente (Requerimiento Vs Proyeccion, "Weeks x FechaProduccion Orders"): on the first row field (Flor General)
+  // Remanente (Requerimiento Vs Proyeccion, "Weeks x FechaProduccion Orders" and "Weeks x FechaProduccion"): on the first row field (Flor General)
   // a negative week whose shortage is fully covered by the surplus of the week right before (positive total of
   // that week) is painted orange instead of red. Only the colour changes; one week of carry (no shelf-life data yet).
-  const CARRY_PIVOTS = new Set(['pv_weeks_orders']);
+  const CARRY_PIVOTS = new Set(['pv_weeks_orders', 'pv_weeks_fp']);
   const ORANGE = { bg: '#fcd5b4', color: '#974706' };
 
   function escapeHtml(s) {
