@@ -27,6 +27,12 @@
   const wb = () => App().getWorkbook();
   const pivots = () => (wb().pivots = wb().pivots || []);
 
+  // Remanente (Requerimiento Vs Proyeccion, "Weeks x FechaProduccion Orders"): on the first row field (Flor General)
+  // a negative week whose shortage is fully covered by the surplus of the week right before (positive total of
+  // that week) is painted orange instead of red. Only the colour changes; one week of carry (no shelf-life data yet).
+  const CARRY_PIVOTS = new Set(['pv_weeks_orders']);
+  const ORANGE = { bg: '#fcd5b4', color: '#974706' };
+
   function escapeHtml(s) {
     return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
   }
@@ -519,6 +525,29 @@
     };
     const rowTree = buildTree(p, data, rowFields);
 
+    // remanente: weeks (first column field) of this first-level row whose negative total is covered by
+    // the previous consecutive week's positive total; its negative cells get cell.orange
+    const carry = CARRY_PIVOTS.has(p.id) && colFields.length && valueList.length === 1 && !valuesInRows;
+    const weekNum = w => (typeof w === 'number' ? w : (/^\s*\d+\s*$/.test(String(w ?? '')) ? Number(w) : null));
+    const consecutive = (a, b) => a !== null && b !== null && (b === a + 1 || (b === 1 && a >= 52));
+    const markCarry = (records, row) => {
+      if (!carry || !grid[row]) return;
+      const v = valueList[0];
+      const covered = new Set();
+      let prev = null;
+      for (const wk of colTree.list) {
+        const total = aggregate(v.agg, records.filter(rec => itemKey(rec[colFields[0]]) === itemKey(wk.value)).map(rec => rec[v.field] ?? null));
+        const n = weekNum(wk.value);
+        if (typeof total === 'number' && total < 0 && prev && consecutive(prev.n, n) && prev.total > 0 && prev.total + total >= 0) covered.add(itemKey(wk.value));
+        prev = { n, total: typeof total === 'number' ? total : 0 };
+      }
+      if (!covered.size) return;
+      columns.forEach((col, i) => {
+        const cell = grid[row][lab + i];
+        if (!col.grand && col.leaf.path && col.leaf.path.length && covered.has(itemKey(col.leaf.path[0])) && cell && typeof cell.v === 'number' && cell.v < 0) cell.orange = true;
+      });
+    };
+
     // compact / outline: the parent row carries its subtotal, children follow
     const walkTree = (node, depth) => {
       for (const ch of node.list) {
@@ -538,6 +567,7 @@
           });
         } else {
           emitValues(ch.records, style);
+          if (depth === 0) markCarry(ch.records, rr);
           rr++;
         }
         if (open) walkTree(ch, depth + 1);
@@ -717,7 +747,8 @@
         if (cell.v !== null && cell.v !== undefined && cell.v !== '') entry.v = cell.v;
         if (cell.s && Object.keys(cell.s).length) entry.s = JSON.parse(JSON.stringify(cell.s));
         // negatives: the whole cell in red (Excel's light red fill with dark red text)
-        if (typeof cell.v === 'number' && cell.v < 0) entry.s = { ...(entry.s || {}), bg: '#ffc7ce', color: '#9c0006' };
+        // (orange when the remanente of the previous week covers it, see CARRY_PIVOTS)
+        if (typeof cell.v === 'number' && cell.v < 0) entry.s = { ...(entry.s || {}), ...(cell.orange ? ORANGE : { bg: '#ffc7ce', color: '#9c0006' }) };
         if (Object.keys(entry).length) sheet.cells[coord] = entry;
       });
     });
