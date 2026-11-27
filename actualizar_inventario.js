@@ -11,6 +11,10 @@ const SHEET_NAME = 'Inventario';
 // the Append of Requerimiento Vs Proyeccion as INVENTARIO VIERNES; Inventario / Reunion's Inv stay as they are
 const FRIDAY_SHEET_NAME = 'Inventario Viernes';
 const SOURCE_HEADERS = ['flor', 'color', 'tallos_por_ramo', 'tallos_en_existencia'];
+// optional columns of the report, kept at the end of the sheet (G, H) so A..F and the formulas that read them stay as they are;
+// if the report stops bringing one, its column is left empty
+const EXTRA_HEADERS = ['grado', 'fecha_recibido'];
+const EXTRA_COLUMNS = ['G', 'H'];
 
 function requiredEnv(name) {
   const value = String(process.env[name] || '').trim();
@@ -123,8 +127,18 @@ function readInventoryRows(reportPath) {
   const missing = SOURCE_HEADERS.filter(header => !headers.includes(header));
   if (missing.length) throw new Error(`Faltan columnas en el reporte de Inventario: ${missing.join(', ')}.`);
 
-  const indexes = SOURCE_HEADERS.map(header => headers.indexOf(header));
-  return sourceRows.slice(1).map(row => indexes.map(index => cleanValue(row[index])));
+  const indexes = [...SOURCE_HEADERS, ...EXTRA_HEADERS].map(header => headers.indexOf(header));
+  return sourceRows.slice(1).map(row => indexes.map(index => (index < 0 ? '' : cleanValue(row[index]))));
+}
+
+// fecha_recibido: an Excel date stays a serial; a text date "2026-11-25" / "2026-11-25T10:30" / "2026-11-25 10:30"
+// becomes a serial too (so it can be counted in days); any other text is kept as it comes
+function dateSerial(value) {
+  if (typeof value === 'number' && Number.isFinite(value)) return value;
+  const m = /^(\d{4})-(\d{2})-(\d{2})(?:[T ](\d{2}):(\d{2})(?::(\d{2}))?)?/.exec(String(value ?? '').trim());
+  if (!m) return value;
+  const ms = Date.UTC(+m[1], +m[2] - 1, +m[3], +(m[4] || 0), +(m[5] || 0), +(m[6] || 0)) - Date.UTC(1899, 11, 30);
+  return ms / 86400000;
 }
 
 function setCell(sheet, coord, value, formula) {
@@ -164,12 +178,28 @@ function applyToInventory(workbook, rows, sheetName = SHEET_NAME) {
   const lastRowToClear = Math.max(oldLastRow, newLastRow);
 
   for (let row = 2; row <= lastRowToClear; row += 1) {
-    for (const column of ['A', 'B', 'C', 'D', 'E', 'F']) clearCell(sheet, `${column}${row}`);
+    for (const column of ['A', 'B', 'C', 'D', 'E', 'F', ...EXTRA_COLUMNS]) clearCell(sheet, `${column}${row}`);
   }
+
+  // headers of the extra columns (same style as A1)
+  EXTRA_COLUMNS.forEach((column, i) => {
+    if (!sheet.cells[`${column}1`]) sheet.cells[`${column}1`] = sheet.cells.A1?.s ? { s: clone(sheet.cells.A1.s) } : {};
+    sheet.cells[`${column}1`].v = EXTRA_HEADERS[i];
+  });
+  sheet.colWidths = { ...(sheet.colWidths || {}) };
+  if (!sheet.colWidths.G || sheet.colWidths.G < 12) sheet.colWidths.G = 12;
+  if (!sheet.colWidths.H || sheet.colWidths.H < 18) sheet.colWidths.H = 18;
 
   for (let index = 0; index < rows.length; index += 1) {
     const rowNumber = index + 2;
-    const [flor, color, tallosPorRamo, tallosEnExistencia] = rows[index];
+    const [flor, color, tallosPorRamo, tallosEnExistencia, grado, fechaRecibido] = rows[index];
+    setCell(sheet, `G${rowNumber}`, grado);
+    const fecha = dateSerial(fechaRecibido);
+    setCell(sheet, `H${rowNumber}`, fecha);
+    if (typeof fecha === 'number') {
+      const cell = sheet.cells[`H${rowNumber}`];
+      cell.s = { ...(cell.s || {}), nf: fecha % 1 ? 'm/d/yy h:mm' : 'mm-dd-yy' };
+    }
     setCell(sheet, `A${rowNumber}`, flor);
     setCell(sheet, `B${rowNumber}`, color);
     setCell(sheet, `C${rowNumber}`, '', `=+A${rowNumber} & " " & B${rowNumber}`);
@@ -179,7 +209,7 @@ function applyToInventory(workbook, rows, sheetName = SHEET_NAME) {
   }
 
   sheet.maxRow = Math.max(oldLastRow, newLastRow + 20, 100);
-  sheet.maxCol = Math.max(Number(sheet.maxCol) || 0, 6);
+  sheet.maxCol = Math.max(Number(sheet.maxCol) || 0, 8);
   return { rows: rows.length, lastRow: newLastRow };
 }
 
